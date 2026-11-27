@@ -9,7 +9,10 @@ use super::{
     Attention, CpuForward, EngError, GgufTextWeights, LayerVisit, MessageBank, PromptRow, Role,
     VisitState, attention_norm_name, bad, resident_mlp::Route,
 };
-use crate::family::inkling2::{cuda_projection::gguf::attention::prefill, switches::Switch};
+use crate::family::inkling2::{
+    cuda_projection::gguf::{PROMPT_TILES, attention::prefill},
+    switches::Switch,
+};
 use crate::kernels::cuda::{
     CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
     resident::depth_attention::{MAX_BLOCKS, MAX_STATES},
@@ -206,14 +209,13 @@ impl DevicePrompt {
 }
 
 /// Rows of the next projection launch, of `left` rows and a stage of `capacity`: the
-/// tensor-core GEMM takes all it can hold, the exact kernels a whole tile of their weight visit
-/// (256, 128 or 64 rows) or what is left. Each row's outputs do not depend on the count.
+/// tensor-core GEMM takes all it can hold, the exact kernels a whole prompt tile or what is left. Each row's outputs do not depend on the count.
 fn projection_rows(left: usize, capacity: usize, tensor_core: bool) -> usize {
     let rows = left.min(capacity);
     if tensor_core {
         return rows;
     }
-    [256, 128, 64]
+    PROMPT_TILES
         .into_iter()
         .find(|&tile| rows >= tile)
         .unwrap_or(rows)
@@ -230,7 +232,8 @@ fn exact_projections_take_whole_visit_tiles() {
         }
         runs
     };
-    assert_eq!(runs(512, 1024, false), [256, 256]);
+    assert_eq!(runs(1024, 1024, false), [512, 512]);
+    assert_eq!(runs(512, 1024, false), [512]);
     assert_eq!(runs(511, 1024, false), [256, 128, 64, 63]);
     assert_eq!(runs(512, 100, false), [64; 8]);
     assert_eq!(runs(30, 1024, false), [30]);

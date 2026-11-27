@@ -29,6 +29,7 @@ mod cache;
 mod cold_controller;
 mod controller_residency;
 mod controller_workspace;
+pub(in crate::family::inkling2) use controller_workspace::PROMPT_TILES;
 mod device_prefill;
 mod grouped_controller_arithmetic;
 mod residency;
@@ -353,8 +354,9 @@ impl AttentionControllers<'_> {
                 .controlled_attention_batch_capacity(self.shape, *weights)?
                 .unwrap_or(0);
             let desired = controller_workspace::target_rows();
-            let target = [256, 128, 64, controller_workspace::TILE_ROWS]
+            let target = PROMPT_TILES
                 .into_iter()
+                .chain([controller_workspace::TILE_ROWS])
                 .find(|&r| r <= capacity && r <= desired)
                 .unwrap_or(controller_workspace::TILE_ROWS);
             if capacity >= target && target > baseline {

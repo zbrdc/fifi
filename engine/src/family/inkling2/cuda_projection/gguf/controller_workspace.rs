@@ -6,13 +6,16 @@ use crate::family::inkling2::switches::Switch;
 pub(super) const TILE_ROWS: usize = 8;
 const MAX_BYTES: usize = 4 << 20;
 
-/// The most rows a prompt tile takes: 256 when both wide weight paths are on (the admission
-/// below steps down to 128, 64 and then 8 rows by the free memory), else the legacy 8. On a
-/// 512-token prompt 256-row tiles measured 12% faster prefill than 64-row ones on the Fast IQ4_NL
-/// model and 8.5% on UD-IQ1_M, with the same text.
+/// The prompt tile sizes, widest first: the admission below steps down them by the free memory,
+/// and the exact projection kernels take a whole tile of one of them. 512 is the most rows one
+/// relative attention snapshot serves.
+pub(in crate::family::inkling2) const PROMPT_TILES: [usize; 4] = [512, 256, 128, 64];
+
+/// The most rows a prompt tile takes: the widest prompt tile when both wide weight paths are on,
+/// else the legacy 8.
 pub(super) fn target_rows() -> usize {
     if Switch::PrefillQ8Visit.on() && Switch::PrefillWeightWide.on() {
-        256
+        PROMPT_TILES[0]
     } else {
         TILE_ROWS
     }
@@ -32,7 +35,7 @@ pub(super) fn admit(
         return Ok(None);
     };
     let free = context.memory_info()?.free as u64;
-    for rows in [256, 128, 64, TILE_ROWS] {
+    for rows in PROMPT_TILES.into_iter().chain([TILE_ROWS]) {
         if rows > target_rows() {
             continue;
         }
