@@ -11,11 +11,12 @@ mod shadow;
 use super::*;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
 use crate::family::step::depth::{self as step_depth, Depth, DepthSite};
-use crate::family::step::recipe::{Layer, Model, Walk};
+use crate::family::step::recipe::{Fuses, Layer, Model, Walk};
 use crate::family::step::rows::StepIo;
 use crate::family::step::scratch::{Core, OnDevice, Widths};
 use crate::family::step::state::{Slots, State};
 use crate::family::step::walk;
+use crate::family::step::walk::Half;
 use crate::kernels::cuda::resident::word_rows::MAX_WORD_ROWS;
 use crate::weights::GgufType;
 
@@ -239,11 +240,20 @@ impl Model for ChainStep<'_> {
     }
 
     fn own_mixer(&self, visit: usize, _n: usize, p0: usize) -> Result<(), EngError> {
-        self.execution(visit)?.mixer(self.cuda, p0, false).map(drop)
+        self.execution(visit)?.mixer(self.cuda, p0)
     }
 
     fn own_forward(&self, visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
-        self.execution(visit)?.forward(self.cuda, false)
+        self.execution(visit)?.forward(self.cuda)
+    }
+
+    /// The mixer mixes its attention input in the launch of its bank mixes, and the MLP's
+    /// convolution adds the output into the depth current row.
+    fn own_fuses(&self, _visit: usize, half: Half) -> Fuses {
+        Fuses {
+            read: half == Half::Mixer,
+            apply: half == Half::Forward,
+        }
     }
 
     fn depth_site(&self) -> Result<DepthSite<'_>, EngError> {
