@@ -14,6 +14,7 @@ use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::block_ops::{BlockOp, RowOutputs};
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
+use crate::kernels::cuda::resident::matvec_gguf_f32::DenseF32Call;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::pack_rows::{PackRowsCall, PackSegment};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
@@ -277,7 +278,7 @@ impl<'a> StepIo<'a> {
 
     /// `y[t] = W x[t]` for `n` rows into `out`. One row, and up to 8 rows written back to back,
     /// use the quantized matvec on the q8_1 rows; other chunks use the batched product on the
-    /// f32 rows. With [`Self::exact`] a Q4_K or Q6_K weight takes the decoding routes.
+    /// f32 rows. With [`Self::exact`] every weight takes a decoding route over the f32 rows.
     pub(crate) fn project_into(
         &self,
         weight: &NativeWeight,
@@ -325,6 +326,27 @@ impl<'a> StepIo<'a> {
                     x_f32: true,
                 },
             );
+        }
+        // Every other type on the exact route: its blocks decoded per value over the f32 row.
+        if exact && let Some(f32_rows) = x.f32 {
+            let row_bytes = weight.quant().weight_bytes(1, k).ok_or_else(|| {
+                EngError::MemoryPlan("the dense projection size overflows".to_owned())
+            })?;
+            for t in 0..n {
+                self.ctx.matvec_gguf_f32(
+                    self.stream,
+                    DenseF32Call {
+                        ty: weight.quant(),
+                        w: weight.buffer().range(0, rows * row_bytes)?,
+                        x: f32_rows.range(t * k * 4, k * 4)?,
+                        y: out.dst.slice((t * out.ld + out.col_off) * 4, rows * 4)?,
+                        k,
+                        rows,
+                        ncols: 1,
+                    },
+                )?;
+            }
+            return Ok(());
         }
         let packed = out.ld == rows && out.col_off == 0;
         if self.batched(weight, x, n, packed)
@@ -409,9 +431,7 @@ impl<'a> StepIo<'a> {
     /// Whether the projection of `n` rows through `weight`, written back to back, reads the
     /// q8_1 rows of its input.
     pub(crate) fn reads_q8(&self, weight: &NativeWeight, x: Rows<'_>, n: usize) -> bool {
-        let exact = self.exact
-            && matches!(weight.quant(), QuantType::Q4K | QuantType::Q6K)
-            && x.f32.is_some();
+        let exact = self.exact && x.f32.is_some();
         !exact && !self.batched(weight, x, n, true)
     }
 

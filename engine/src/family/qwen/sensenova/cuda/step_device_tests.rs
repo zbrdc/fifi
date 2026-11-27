@@ -1033,7 +1033,8 @@ fn card_reports_where_the_quantized_routes_leave_the_exact_one() {
 /// `QWEN_EXPERTS_TOKENS` tokens (default 64) in chunks of each row count of `QWEN_EXPERTS_K_ROWS`
 /// (default 1) and writes every position's logits row to `<QWEN_EXPERTS_ROWS_OUT>.k<rows>`. The
 /// stream is `<that path>.ids`, written by a greedy one-row walk from 16 hashed ids when it is
-/// not there. Not a gate: the rows are compared outside, against another engine on the same ids.
+/// not there. With `QWEN_EXPERTS_EXACT` set every product decodes its weights over f32 rows.
+/// Not a gate: the rows are compared outside, against another engine on the same ids.
 #[test]
 fn card_runs_the_routed_expert_model_of_the_lineage() {
     use crate::family::qwen::recipe::{layers, routed_experts, tensors};
@@ -1096,7 +1097,14 @@ fn card_runs_the_routed_expert_model_of_the_lineage() {
         iterations: 1,
         fixed_identity: true,
     };
-    let open = || LoopStep::open_model(ctx.clone(), &loaded, &model, routing, count + 1).unwrap();
+    // `QWEN_EXPERTS_EXACT` puts every product on its decoding route: the reference rows.
+    let exact = std::env::var_os("QWEN_EXPERTS_EXACT").is_some();
+    let open = || {
+        let mut card =
+            LoopStep::open_model(ctx.clone(), &loaded, &model, routing, count + 1).unwrap();
+        card.set_exact(exact);
+        card
+    };
     let mut feed = |card: &mut LoopStep<'_>, tokens: &[u32], pos: usize| -> Vec<Vec<f32>> {
         let embed = projector.rows(&embd, tokens).unwrap();
         card.prefill(&embed, pos).unwrap();

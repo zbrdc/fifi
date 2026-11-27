@@ -14,6 +14,7 @@ use super::scratch::Alloc;
 use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as product_q8_bytes;
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
+use crate::kernels::cuda::resident::matvec_gguf_f32::ExpertF32Call;
 use crate::kernels::cuda::resident::moe_combine::{
     CombineCall, CombineOut, CombineShape, SharedTerm,
 };
@@ -125,19 +126,49 @@ impl<B> Scratch<B> {
     }
 }
 
+/// The rows a per-token expert product reads.
+#[derive(Clone, Copy)]
+enum Input<'a> {
+    Q8(DeviceRange<'a>),
+    F32(DeviceRange<'a>),
+}
+
 /// One per-token launch through the kept experts of the stack `name`.
 #[allow(clippy::too_many_arguments)]
 fn per_token(
     io: &StepIo<'_>,
     d: Dims,
     name: &str,
-    x_q8: DeviceRange<'_>,
+    x: Input<'_>,
     x_per_slot: bool,
     ids: DeviceRange<'_>,
     y: DeviceRange<'_>,
     (stride, rows, k): (usize, usize, usize),
 ) -> Result<(), EngError> {
     let weight = io.native(name)?;
+    let x_q8 = match x {
+        Input::Q8(rows) => rows,
+        // The exact route: every weight value decoded over the f32 rows.
+        Input::F32(x) => {
+            return io.ctx.matvec_gguf_f32_expert(
+                io.stream,
+                ExpertF32Call {
+                    ty: weight.quant(),
+                    w_stack: StepIo::whole(weight.buffer())?,
+                    ids,
+                    x,
+                    x_per_slot,
+                    y,
+                    y_slot_stride: stride,
+                    k,
+                    rows,
+                    n_expert: d.experts,
+                    n_used: d.used,
+                    glu_gate: None,
+                },
+            );
+        }
+    };
     io.ctx.matvec_expert(
         io.stream,
         ExpertMatvecCall {
@@ -256,7 +287,13 @@ pub(crate) fn forward(
     let [gate, up, down] = &names.stacks;
     let gu_row = used * 2 * inner * 4;
     let stride = 2 * inner;
-    let grouped = |name: &str| n >= GROUPED_FROM && experts::serves(io, name);
+    if io.exact && !matches!(join, ffn::Join::Swiglu) {
+        return Err(EngError::BadRequest(format!(
+            "{}: the routed block has no exact route for this activation",
+            io.family
+        )));
+    }
+    let grouped = |name: &str| !io.exact && n >= GROUPED_FROM && experts::serves(io, name);
     let gate_up = grouped(gate) && grouped(up);
     let down_grouped = grouped(down);
     let picks = Picks {
@@ -289,7 +326,11 @@ pub(crate) fn forward(
         let x_stride = q8(hidden, 1);
         for t in 0..n {
             let ids = sc.ids.range(t * used * 4, used * 4)?;
-            let row = x.q8.range(t * x_stride, x_stride)?;
+            let row = if io.exact {
+                Input::F32(x_f32.range(t * hidden * 4, hidden * 4)?)
+            } else {
+                Input::Q8(x.q8.range(t * x_stride, x_stride)?)
+            };
             for (name, offset) in [(gate, 0), (up, inner * 4)] {
                 let y = sc.gate_up.range(t * gu_row + offset, gu_span)?;
                 per_token(io, d, name, row, false, ids, y, (stride, inner, hidden))?;
@@ -316,7 +357,13 @@ pub(crate) fn forward(
         },
     };
     // The grouped down product reads the f32 rows; only the per-token one reads q8_1 rows.
-    ffn::joined(io, join, (n * used, inner), scratch, !down_grouped)?;
+    ffn::joined(
+        io,
+        join,
+        (n * used, inner),
+        scratch,
+        !down_grouped && !io.exact,
+    )?;
     let e_stride = q8(inner, 1);
     if let Some(ids) = ids.as_ref().filter(|_| down_grouped) {
         let rows = experts::slot_rows(
@@ -334,7 +381,11 @@ pub(crate) fn forward(
                 io,
                 d,
                 down,
-                sc.act_q8.range(t * used * e_stride, used * e_stride)?,
+                if io.exact {
+                    Input::F32(sc.act.range(t * used * inner * 4, used * inner * 4)?)
+                } else {
+                    Input::Q8(sc.act_q8.range(t * used * e_stride, used * e_stride)?)
+                },
                 true,
                 sc.ids.range(t * used * 4, used * 4)?,
                 sc.down.range(t * used * hidden * 4, used * hidden * 4)?,
