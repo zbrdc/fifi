@@ -29,6 +29,7 @@ use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::{DeviceBuffer, DeviceRange, NativeWeight};
 
 pub(crate) mod latent;
+pub(crate) mod relative;
 
 const F32: usize = size_of::<f32>();
 

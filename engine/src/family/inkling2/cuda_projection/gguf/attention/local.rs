@@ -7,7 +7,7 @@ use super::{
 use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, upload_tensor},
-    family::step::conv::{self, Ring, Row as ConvRow, Variant},
+    family::step::attend::relative,
     kernels::cuda::resident::relative_prep::{PrepMath, PrepShape},
 };
 
@@ -662,28 +662,32 @@ impl ResidentAttention {
         } else {
             [request.weights.key_kernel, request.weights.value_kernel]
         };
-        context.relative_prep_direct(
+        relative::prep_row(
+            context,
             stream,
-            [
-                qr,
-                relative,
+            relative::PrepRow {
+                shape: prep,
+                math: request.math,
+                rows: relative::Scored {
+                    q: qr,
+                    relative,
+                    sinks,
+                    gates,
+                    k,
+                    v,
+                },
                 raw_k,
                 raw_v,
-                k,
-                v,
-                sinks,
-                gates,
-                request.weights.query_scale,
-                request.weights.relative_scale,
-                kernel_k,
-                kernel_v,
-                request.raw_history[0],
-                request.raw_history[1],
-                health.prep,
-            ],
-            prep,
-            PrepShape::TAPS - 1,
-            request.math,
+                weights: relative::PrepWeights {
+                    query_scale: request.weights.query_scale,
+                    relative_scale: request.weights.relative_scale,
+                    key_taps: kernel_k,
+                    value_taps: kernel_v,
+                },
+                key_history: request.raw_history[0],
+                value_history: request.raw_history[1],
+                status: health.prep,
+            },
         )?;
         Ok(PrepRows {
             q: qr,
@@ -721,51 +725,41 @@ impl ResidentAttention {
         } = rows;
         let visit = self.visits[request.visit.state_slot];
         let ring = |at, bytes| self.arena.range(at, bytes);
-        context.relative_attention(
-            stream,
-            RelativeAttentionCall {
-                shape: visit.shape,
-                q,
-                k,
-                v,
-                relative,
-                sinks,
-                gates,
-                out: attention_out,
-                table: ring(visit.table_at, visit.table_bytes)?,
-                pos: request.pos,
-                status,
-                k_cache: ring(visit.cache_at, visit.cache_bytes)?,
-                v_cache: ring(visit.cache_at + visit.cache_bytes, visit.cache_bytes)?,
-            },
+        let health = Health::split(
+            request.status,
+            local_status(shape, request.messages.is_some()),
         )?;
-        context.dense_gemv(
-            stream,
-            DenseGemvCall {
-                shape: DenseGemvShape::packed(1, projection.rows, shape.query_channels()),
-                dtype: projection.dtype,
-                w: projection.weight,
-                x: attention_out,
-                y: projected,
-            },
-        )?;
-        let status = local_status(shape, request.messages.is_some());
-        let health = Health::split(request.status, status)?;
-        conv::row(
+        relative::attend_row(
             context,
             stream,
-            Variant::Residual,
-            Ring::newest_first(
-                request.attn_conv.history,
-                request.out.bytes() / WORD,
-                PrepShape::TAPS,
-            ),
-            ConvRow {
-                input: projected,
-                taps: request.attn_conv.kernel,
+            relative::AttendRow {
+                rows: relative::Scored {
+                    q,
+                    relative,
+                    sinks,
+                    gates,
+                    k,
+                    v,
+                },
+                rings: relative::Rings {
+                    shape: visit.shape,
+                    table: ring(visit.table_at, visit.table_bytes)?,
+                    k: ring(visit.cache_at, visit.cache_bytes)?,
+                    v: ring(visit.cache_at + visit.cache_bytes, visit.cache_bytes)?,
+                },
+                output: relative::Output {
+                    weight: projection.weight,
+                    dtype: projection.dtype,
+                    rows: projection.rows,
+                    conv_taps: request.attn_conv.kernel,
+                    conv_history: request.attn_conv.history,
+                },
+                pos: request.pos,
+                status,
+                conv_health: health.conv,
+                attended: attention_out,
+                projected,
                 out: request.out,
-                add: None,
-                health: health.conv,
             },
         )
     }
