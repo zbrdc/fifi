@@ -4,7 +4,6 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
-#include <cstdlib>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -887,10 +886,12 @@ static std::pair<dim3, dim3> calc_launch_params(
 // idles three quarters of the block. One warp per row with a shuffle-only reduction measured 85
 // GB/s vs the generic 58 GB/s at k 2048 and 64 vs 19 GB/s at k 512 on idle silicon at ramped
 // clocks (bench-mvq.cu, every variant exact against a CPU oracle), and +8.00% on a whole decode
-// (Xavier, 2026-11-27), which reconstructs the serve's 0.455 ms/MoE-group attribution. It is the
-// launch rule on cc 7.2 for a row of at most 8 K-blocks (k <= 2048): there the lane adds the same
-// blocks in the same order as the generic shape and both end in the same warp reduction, so the
-// result is the generic kernel's bit for bit (the device test
+// with the kernel on every Q4_K expert row (Xavier, 2026-11-27), which reconstructs the serve's
+// 0.455 ms/MoE-group attribution and is an upper bound for this rule. It is the launch rule on
+// cc 7.2 for a row of at most 8 K-blocks (k <= 2048): there the lane adds the same blocks in the
+// same order as the generic shape and both end in the same warp reduction, so the result is the
+// generic kernel's bit for bit, apart from the sign of a zero sum on a row of fewer than 8 blocks
+// whose scales and minima are all zero (the device test
 // matvec_expert_wpr_arm_is_the_generic_bits_on_one_pass_rows). A longer row reassociates and
 // keeps the generic kernel. No GLU fusion (the fused launch needs the generic kernel's two-stack
 // loop); the ids poison rule of V-MV1 (A1) is replicated. rows_per_block 2 is optimal-or-tied at

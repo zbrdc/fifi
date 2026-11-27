@@ -1471,11 +1471,29 @@ fn the_expert_matvec_bandwidth_bench() {
     }
 }
 
+/// The vendored test override (`inference_cuda_test_arm_mvq_wpr`) is one process-wide global:
+/// every launch reads it, so a parallel test would see the mode set here. The device tests run
+/// with `--test-threads=1`. The guard puts the override back to the rule's state (0) when it goes
+/// out of scope, after a panic too.
+struct WprOverride;
+
+impl WprOverride {
+    fn set(mode: i32) -> Self {
+        inference_cuda_test_arm_mvq_wpr(mode);
+        Self
+    }
+}
+
+impl Drop for WprOverride {
+    fn drop(&mut self) {
+        inference_cuda_test_arm_mvq_wpr(0);
+    }
+}
+
 /// The warp-per-row Q4_K expert matvec (`mul_mat_vec_q_wpr`, the launch rule on cc 7.2 for rows
-/// of at most 8 K-blocks, forced here at every shape) reassociates the reduction on a longer row
-/// - one warp per row - so there it cannot equal the dense launch's bits; it must stay within a
-/// handful of ULPs of the dense oracle on every slot and both halves. The override is read per
-/// call, so the test sets it around its launches only.
+/// of at most 8 K-blocks, forced here at every shape) reassociates the reduction on a longer row,
+/// with one warp per row, so there it cannot equal the dense launch's bits; it must stay within a
+/// handful of ULPs of the dense oracle on every slot and both halves.
 #[test]
 fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
     const NAME: &str = "matvec_expert_wpr_mode_matches_dense_within_reassociation";
@@ -1485,7 +1503,7 @@ fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
     let ty = QuantType::Q4K;
-    inference_cuda_test_arm_mvq_wpr(1);
+    let _mode = WprOverride::set(1);
     for (si, shape) in [GATE_UP, DOWN, PADDED].iter().enumerate() {
         let (_, rows) = *shape;
         let stride = 2 * rows;
@@ -1555,7 +1573,6 @@ fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
             }
         }
     }
-    inference_cuda_test_arm_mvq_wpr(0);
 }
 
 /// The launch rule of the warp-per-row kernel, and its bits: on a row that the generic shape
@@ -1565,12 +1582,14 @@ fn matvec_expert_wpr_mode_matches_dense_within_reassociation() {
 /// holds the block `2*w + lane/16` and its warp partials are added in warp order, the kernel's
 /// lane adds the blocks `lane/16 + 2*n` in order, and both end in the same warp reduction. A Q4_K
 /// row of at most 8 K-blocks (k <= 2048) is one pass at 4 warps. A longer row takes a second pass
-/// there and reassociates; the count of differing bytes is printed for the 9-block row.
+/// there and reassociates; the count of differing bytes is printed for the 9-block row. One
+/// exception on a shorter row: the generic shape adds `0.0f` for the blocks a lane lacks, so a
+/// row of one to seven blocks whose scales and minima are all zero can come out as -0.0 from the
+/// kernel and +0.0 from the generic shape.
 ///
 /// The rule is checked on the device's capability: cc 7.2 takes the kernel for a one-pass row
 /// and the generic shape for a longer one; any other device always takes the generic shape. The
-/// test override forces each kernel for the comparison (the crate cannot set an environment
-/// variable).
+/// test override forces each kernel for the comparison.
 #[test]
 fn matvec_expert_wpr_arm_is_the_generic_bits_on_one_pass_rows() {
     use crate::kernels::cuda::native::peer_probe::device_cc;
@@ -1600,7 +1619,7 @@ fn matvec_expert_wpr_arm_is_the_generic_bits_on_one_pass_rows() {
             let bytes = stride * N_USED * 4;
             let mut results = [Vec::new(), Vec::new(), Vec::new()];
             for (mode, out) in [RULE, KERNEL, GENERIC].into_iter().zip(&mut results) {
-                inference_cuda_test_arm_mvq_wpr(mode);
+                let _mode = WprOverride::set(mode);
                 let y = testkit::upload_filled(&ctx, 0xAA, bytes);
                 expert_launch(
                     &ctx,
@@ -1618,7 +1637,6 @@ fn matvec_expert_wpr_arm_is_the_generic_bits_on_one_pass_rows() {
                 stream.synchronize().expect("drain");
                 *out = testkit::read_bytes(&ctx, &y, bytes);
             }
-            inference_cuda_test_arm_mvq_wpr(RULE);
             let [rule, kernel, generic] = &results;
             let differing = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
             println!(
