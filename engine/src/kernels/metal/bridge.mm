@@ -184,8 +184,17 @@ int inference_metal_kernel_new(void *runtime, const char *source, const char *na
         *out = nullptr;
         *max_threads = 0;
         NSError *error = nil;
+        // Safe math, as the CUDA adapter's resident kernels compile without fast math, and the
+        // default math mode follows the SDK's language version. The math mode exists from
+        // macOS 15; the Boolean before it carries the same switch.
+        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+        if (@available(macOS 15.0, *)) {
+            options.mathMode = MTLMathModeSafe;
+        } else {
+            options.fastMathEnabled = NO;
+        }
         id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:source]
-                                                      options:nil
+                                                      options:options
                                                         error:&error];
         if (library == nil) {
             // The compile log names the line and column of each error; the description alone

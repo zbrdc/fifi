@@ -18,94 +18,13 @@ use half::{bf16, f16};
 
 use super::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes};
 use crate::EngError;
-use crate::kernels::metal::testkit::Rng;
-use crate::kernels::metal::{DeviceBuffer, DeviceRange, MetalContext};
+use crate::kernels::metal::MetalContext;
+use crate::kernels::metal::testkit::{Padded, Rig, Rng, SENT_BITS, f32_bytes, floats, sentinel};
 
 /// Unit roundoff of f32.
 const U: f64 = 1.0 / 16_777_216.0;
 /// The bound is this many times the first-order rounding error.
 const SLACK: f64 = 2.0;
-const PAD: usize = 1024;
-const SENT_BITS: u32 = 0x7fc0_dead;
-const SENT: [u8; 4] = SENT_BITS.to_le_bytes();
-
-struct Rig {
-    ctx: MetalContext,
-}
-
-impl Rig {
-    fn new() -> Self {
-        Self {
-            ctx: MetalContext::new().expect("a Metal context"),
-        }
-    }
-}
-
-fn sentinel(bytes: usize) -> Vec<u8> {
-    SENT.iter().copied().cycle().take(bytes).collect()
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect()
-}
-
-/// Device bytes between two sentinels; `extra` shifts the first data byte past the allocation
-/// start to test alignments.
-struct Padded {
-    buf: DeviceBuffer,
-    lead: usize,
-    len: usize,
-}
-
-impl Padded {
-    fn new(ctx: &MetalContext, data: &[u8], extra: usize) -> Self {
-        let lead = PAD + extra;
-        let mut bytes = sentinel(lead);
-        bytes.extend_from_slice(data);
-        bytes.extend_from_slice(&sentinel(PAD));
-        Self {
-            buf: ctx.upload(&bytes).expect("an upload"),
-            lead,
-            len: data.len(),
-        }
-    }
-
-    fn range(&self, skip: usize, bytes: usize) -> DeviceRange<'_> {
-        self.buf.range(self.lead + skip, bytes).expect("a range")
-    }
-
-    fn all(&self) -> DeviceRange<'_> {
-        self.range(0, self.len)
-    }
-
-    /// The data bytes; the sentinels around them must be intact.
-    fn read(&self, what: &str) -> Vec<u8> {
-        let all = self
-            .buf
-            .read(0, self.lead + self.len + PAD)
-            .expect("a read");
-        let (lead, rest) = all.split_at(self.lead);
-        let (data, trail) = rest.split_at(self.len);
-        assert!(
-            lead == sentinel(self.lead),
-            "{what}: the sentinel before the used bytes changed"
-        );
-        assert!(
-            trail == sentinel(PAD),
-            "{what}: the sentinel after the used bytes changed"
-        );
-        data.to_vec()
-    }
-}
 
 fn narrow(dtype: DenseDtype, values: &[f32]) -> Vec<u16> {
     values

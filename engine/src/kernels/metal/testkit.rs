@@ -1,4 +1,14 @@
-//! Deterministic test data of the Metal kernels, the generator of the CUDA testkit.
+//! Deterministic test data and the shared fixtures of the Metal kernels' device tests: the
+//! generator of the CUDA testkit, a context, and the padded buffers with their sentinels.
+
+use crate::kernels::metal::{DeviceBuffer, DeviceRange, MetalContext};
+
+/// The sentinel bytes around the used bytes of every buffer of a device test.
+const PAD: usize = 1024;
+/// A NaN with a payload: an element a call must not write keeps it, and no arithmetic of a
+/// kernel turns it into another pattern by accident.
+pub(crate) const SENT_BITS: u32 = 0x7fc0_dead;
+const SENT: [u8; 4] = SENT_BITS.to_le_bytes();
 
 /// Deterministic xorshift64* generator for the test data of the kernels. The kernel test
 /// modules draw from it instead of keeping local copies; one seed always gives one sequence, so
@@ -34,5 +44,88 @@ impl Rng {
     /// sequence a pure function of the seed.
     pub(crate) fn normal(&mut self) -> f64 {
         (0..12).map(|_| self.unit()).sum::<f64>() - 6.0
+    }
+}
+
+/// A Metal context for a test. The process has two adapter leases, so the tests that hold one
+/// run one after the other (`--test-threads=1`).
+pub(crate) struct Rig {
+    pub(crate) ctx: MetalContext,
+}
+
+impl Rig {
+    pub(crate) fn new() -> Self {
+        Self {
+            ctx: MetalContext::new().expect("a Metal context"),
+        }
+    }
+}
+
+/// `bytes` bytes of the sentinel pattern.
+pub(crate) fn sentinel(bytes: usize) -> Vec<u8> {
+    SENT.iter().copied().cycle().take(bytes).collect()
+}
+
+/// The little-endian bytes of f32 values.
+pub(crate) fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// The f32 values of little-endian bytes; a partial float at the end is left out.
+pub(crate) fn floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect()
+}
+
+/// Device bytes between two sentinels; `extra` shifts the first data byte past the allocation
+/// start to test alignments.
+pub(crate) struct Padded {
+    buf: DeviceBuffer,
+    lead: usize,
+    len: usize,
+}
+
+impl Padded {
+    pub(crate) fn new(ctx: &MetalContext, data: &[u8], extra: usize) -> Self {
+        let lead = PAD + extra;
+        let mut bytes = sentinel(lead);
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(&sentinel(PAD));
+        Self {
+            buf: ctx.upload(&bytes).expect("an upload"),
+            lead,
+            len: data.len(),
+        }
+    }
+
+    pub(crate) fn range(&self, skip: usize, bytes: usize) -> DeviceRange<'_> {
+        self.buf.range(self.lead + skip, bytes).expect("a range")
+    }
+
+    pub(crate) fn all(&self) -> DeviceRange<'_> {
+        self.range(0, self.len)
+    }
+
+    /// The data bytes; the sentinels around them must be intact.
+    pub(crate) fn read(&self, what: &str) -> Vec<u8> {
+        let all = self
+            .buf
+            .read(0, self.lead + self.len + PAD)
+            .expect("a read");
+        let (lead, rest) = all.split_at(self.lead);
+        let (data, trail) = rest.split_at(self.len);
+        assert!(
+            lead == sentinel(self.lead),
+            "{what}: the sentinel before the used bytes changed"
+        );
+        assert!(
+            trail == sentinel(PAD),
+            "{what}: the sentinel after the used bytes changed"
+        );
+        data.to_vec()
     }
 }

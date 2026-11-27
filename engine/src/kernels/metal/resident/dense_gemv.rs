@@ -16,6 +16,7 @@ use super::super::context::{Grid, Shared};
 use super::super::frame::Frame;
 use super::super::native::Binding;
 use super::super::{DeviceRange, MetalContext};
+use super::{RANGE_ALIGN, overlaps, require_range};
 
 #[cfg(test)]
 mod tests;
@@ -32,8 +33,6 @@ pub(crate) const GEMV_MAX_LD: usize = 1 << 20;
 /// Weight rows a threadgroup covers: eight SIMD groups of a row each.
 const ROWS_PER_THREADGROUP: usize = 8;
 const THREADGROUP: usize = 256;
-/// The alignment Metal requires of a bound buffer range.
-const RANGE_ALIGN: usize = 4;
 /// The alignment of the vector path's 16-byte loads.
 const VECTOR_ALIGN: usize = 16;
 /// The weight element: binary16 or bfloat16.
@@ -246,23 +245,9 @@ impl Frame {
 fn plan_dense_gemv(shared: &Shared, call: &DenseGemvCall<'_>) -> Result<DenseGemvPlan, EngError> {
     let shape = call.shape;
     let need = gemv_bytes(shape, call.dtype).ok_or_else(|| invalid_shape(shape))?;
-    let ranges = [
-        ("weight", &call.w, need.w),
-        ("activation", &call.x, need.x),
-        ("result", &call.y, need.y),
-    ];
-    for (what, range, need) in ranges {
-        let same = range.owner() == shared.id();
-        let fits = range.bytes() >= need && range.offset() % RANGE_ALIGN == 0;
-        if !same || !fits {
-            let whose = if same { "" } else { " of another adapter" };
-            return Err(EngError::BadRequest(format!(
-                "the call needs {need} bytes of {what} at a multiple of {RANGE_ALIGN} in a buffer of its own Metal context; the range holds {} bytes at offset {}{whose}",
-                range.bytes(),
-                range.offset(),
-            )));
-        }
-    }
+    require_range(shared, "weight", &call.w, need.w, RANGE_ALIGN)?;
+    require_range(shared, "activation", &call.x, need.x, RANGE_ALIGN)?;
+    require_range(shared, "result", &call.y, need.y, RANGE_ALIGN)?;
     if overlaps(&call.y, &call.w) || overlaps(&call.y, &call.x) {
         return Err(EngError::BadRequest(
             "the result range overlaps the weight or the activation range".to_owned(),
@@ -298,9 +283,4 @@ fn plan_dense_gemv(shared: &Shared, call: &DenseGemvCall<'_>) -> Result<DenseGem
         rows,
         m,
     })
-}
-
-/// Whether two ranges share an address.
-fn overlaps(a: &DeviceRange<'_>, b: &DeviceRange<'_>) -> bool {
-    a.address() < b.address() + b.bytes() && b.address() < a.address() + a.bytes()
 }
