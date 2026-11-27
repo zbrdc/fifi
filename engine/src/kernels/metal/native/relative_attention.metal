@@ -21,6 +21,8 @@ constant constexpr int kWordMax = (1 << 30) - 1;
 constant constexpr int kStatusInvalidStepState = 4;
 // The floats of one partial: the peak, the sum, then the weighted value of each column.
 constant constexpr int kPartial = 2 + kHeadDim;
+// The splits the finish folds an iteration, their loads in flight together.
+constant constexpr int kFold = 8;
 // 1 / sqrt(128): the scale of every score, as the CUDA step's shader applies it.
 constant constexpr float kScale = 0.08838834764831844f;
 
@@ -189,6 +191,8 @@ kernel void relative_attention_partials(
 
 // The head's result from its splits: each partial weighed by the exponential of its peak
 // against a top that includes the sink, whose mass joins the denominator. One thread a column.
+// Eight splits' words are in flight an iteration: a rolled loop waits on every load, and the
+// chain of 512 waits costs more than the partials that made them.
 kernel void relative_attention_finish(
     constant Params &p [[buffer(13)]],
     device float *out [[buffer(0)]],
@@ -206,18 +210,41 @@ kernel void relative_attention_finish(
     const int chunk = split_chunk(count, p.max_splits);
     const int active = (count + chunk - 1) / chunk;
     const size_t head = gid;
+    const size_t base = head * p.max_splits;
     const float sink = sinks[head];
     float top = sink;
-    for (int s = 0; s < active; ++s) {
-        top = fmax(top, part[(head * p.max_splits + uint(s)) * kPartial]);
+    for (int s = 0; s < active; s += kFold) {
+        float peak[kFold];
+#pragma unroll
+        for (int u = 0; u < kFold; ++u) {
+            peak[u] = s + u < active ? part[(base + uint(s + u)) * kPartial] : -INFINITY;
+        }
+#pragma unroll
+        for (int u = 0; u < kFold; ++u) top = fmax(top, peak[u]);
     }
     float sum = exp(sink - top);
     float value = 0.f;
-    for (int s = 0; s < active; ++s) {
-        const size_t cell = (head * p.max_splits + uint(s)) * kPartial;
-        const float mass = exp(part[cell] - top);
-        sum = fma(mass, part[cell + 1], sum);
-        value = fma(mass, part[cell + 2 + d], value);
+    for (int s = 0; s < active; s += kFold) {
+        float peak[kFold], sums[kFold], acc[kFold];
+#pragma unroll
+        for (int u = 0; u < kFold; ++u) {
+            if (s + u < active) {
+                const size_t cell = (base + uint(s + u)) * kPartial;
+                peak[u] = part[cell];
+                sums[u] = part[cell + 1];
+                acc[u] = part[cell + 2 + d];
+            } else {
+                peak[u] = -INFINITY;
+                sums[u] = 0.f;
+                acc[u] = 0.f;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kFold; ++u) {
+            const float mass = exp(peak[u] - top);
+            sum = fma(mass, sums[u], sum);
+            value = fma(mass, acc[u], value);
+        }
     }
     const float gate_logit = gates[head * kHeadDim + d];
     const float gate = 1.f / (1.f + exp(-gate_logit));
