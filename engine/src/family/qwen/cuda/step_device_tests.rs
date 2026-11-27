@@ -17,7 +17,8 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use super::step::{Carried, LoopStep, bytes_range, floats, le_f32};
+use super::serve::CardStep;
+use super::step::{Carried, LoopStep, bytes_range, floats, le_f32, looped};
 use crate::EngError;
 use crate::family::math::rms_plain;
 use crate::family::project::Projector;
@@ -25,7 +26,6 @@ use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, WeightLayout,
 };
 use crate::family::project::gguf::{GgufMatrix, GgufProjector};
-use crate::family::qwen::sensenova::cuda::serve::CardStep;
 use crate::family::qwen::sensenova::step::LoopState;
 use crate::family::qwen::sensenova::step::{logits, trunk_traced};
 use crate::family::qwen::sensenova::weights::{Layer, LoopWeights, Mixer};
@@ -111,16 +111,8 @@ fn open_rig(what: &str) -> Option<Rig> {
     }
     let (file, weights) = open_host()?;
     let ctx = Rc::new(CudaContext::new().unwrap());
-    let loaded = super::load::load(
-        &BorrowedLoader::new(&ctx).unwrap(),
-        &file,
-        weights.plan(),
-        LoadOptions {
-            layout: WeightLayout::Native,
-            ..LoadOptions::default()
-        },
-    )
-    .unwrap();
+    let model = looped(weights.shape(), weights.plan(), weights.rope());
+    let loaded = super::serve::load_model(&ctx, &file, &model).unwrap();
     let projector = weights.projector();
     Some((ctx, loaded, weights, projector))
 }
@@ -1159,6 +1151,84 @@ fn card_runs_the_routed_expert_model_of_the_lineage() {
             t0.elapsed().as_secs_f64()
         );
     }
+}
+
+/// The routed-expert model on the stepper the worker drives, opened the way the served start
+/// opens any model of the lineage (header to model, layer list to load, step, stepper). One
+/// forced token per position through `logits` must draw the greedy ids the harness run wrote
+/// to `<QWEN_EXPERTS_ROWS_OUT>.ids` with one-row prompt chunks: the served decode step is that
+/// walk. A reset then repeats the first rows bit for bit. The ids come from one-row prompt chunks
+/// and these rows from decode steps: the two have the same bits on the looped model, and a near
+/// tie between two ids would fail this comparison if they ever differed here.
+#[test]
+fn the_served_stepper_runs_the_routed_expert_model() {
+    const SEED: usize = 16;
+    let (Ok(path), Ok(out)) = (
+        std::env::var("QWEN_EXPERTS_GGUF"),
+        std::env::var("QWEN_EXPERTS_ROWS_OUT"),
+    ) else {
+        eprintln!("skipped: set QWEN_EXPERTS_GGUF and QWEN_EXPERTS_ROWS_OUT");
+        return;
+    };
+    if !device_present("the routed-expert served stepper") {
+        return;
+    }
+    let file = Arc::new(
+        GgufWeights::open_any_type(
+            &std::path::PathBuf::from(path),
+            GgufLimits {
+                max_header_bytes: 32 << 20,
+                max_tensor_bytes: 8 << 30,
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let ids: Vec<u32> = std::fs::read(format!("{out}.ids"))
+        .expect("the id stream of the harness run")
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    let (model, routing) = super::serve::model_of(&file).unwrap();
+    assert!(
+        model.experts.is_some(),
+        "the file is not the routed-expert model"
+    );
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded: &'static CudaWeights = Box::leak(Box::new(
+        super::serve::load_model(&ctx, &file, &model).unwrap(),
+    ));
+    let step = LoopStep::open_model(ctx.clone(), loaded, &model, routing, ids.len() + 1).unwrap();
+    let mut card = CardStep::new(step, &file, &model).unwrap();
+    let walk = |card: &mut CardStep, count: usize| -> Vec<Vec<f32>> {
+        card.reset().unwrap();
+        (0..count)
+            .map(|pos| card.logits(ids[pos]).unwrap())
+            .collect()
+    };
+    let rows = walk(&mut card, ids.len() - 1);
+    let mut differ = Vec::new();
+    for (pos, row) in rows.iter().enumerate() {
+        assert!(worst_abs(row).is_finite(), "a logits row is not finite");
+        if pos + 1 >= SEED && argmax(row) != ids[pos + 1] {
+            differ.push(pos);
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "the served steps draw other ids than the walk at positions {differ:?}"
+    );
+    assert_eq!(card.fed(), ids.len() - 1);
+    let again = walk(&mut card, SEED);
+    assert!(
+        again.iter().zip(&rows).all(|(a, b)| a
+            .iter()
+            .map(|x| x.to_bits())
+            .eq(b.iter().map(|x| x.to_bits()))),
+        "a reset card repeats other rows"
+    );
 }
 
 /// Anatomy, not a gate: where a chunk leaves a one-row step when both are on the decoding
@@ -2422,12 +2492,17 @@ fn the_served_stepper_matches_the_direct_walk_and_resets_to_a_fresh_card() {
     let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova served stepper") else {
         return;
     };
-    let (_file, stepper_host) = open_host().expect("the rig opened the file");
+    let (file, stepper_host) = open_host().expect("the rig opened the file");
     // Serving leaks the load for the process; the stepper's step borrows it the same way.
     let loaded: &'static CudaWeights = Box::leak(Box::new(loaded));
     let mut walked = open_card(&ctx, loaded, &weights, CACHE_ROWS);
     let step = open_card(&ctx, loaded, &weights, CACHE_ROWS);
-    let mut card = CardStep::new(step, stepper_host);
+    let model = looped(
+        stepper_host.shape(),
+        stepper_host.plan(),
+        stepper_host.rope(),
+    );
+    let mut card = CardStep::new(step, &file, &model).unwrap();
 
     // The oracle: the walk's row at every prompt position, then its greedy continuation.
     let h = weights.shape().hidden;

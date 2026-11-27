@@ -34,13 +34,6 @@ pub(crate) enum Streams {
 
 /// The visits of a trunk whose every `interval`-th block attends and which has no repeated
 /// range: `block_count` visits, one per block.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by the device test that runs the routed-expert model on the lineage step; the served start takes it when that model is cut over"
-    )
-)]
 pub(crate) fn every_nth_attends(block_count: usize, interval: usize) -> Vec<Visit> {
     (0..block_count)
         .map(|block| Visit {
@@ -94,25 +87,11 @@ pub(crate) struct Model {
 }
 
 /// The architecture name of the routed-expert models of the lineage.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by the device test that runs the routed-expert model on the lineage step; the served start takes it when that model is cut over"
-    )
-)]
 pub(crate) const ROUTED_EXPERTS: &str = "qwen35moe";
 
 /// The routed-expert model of `header`: every `full_attention_interval`-th block attends, the
 /// delta inputs are stored apart, the feed-forward is a block of experts beside a gated shared
 /// expert, and the rotary table has no scaling. Refuses a header of another architecture.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by the device test that runs the routed-expert model on the lineage step; the served start takes it when that model is cut over"
-    )
-)]
 pub(crate) fn routed_experts(header: &GgufHeader) -> Result<Model, EngError> {
     let arch = ROUTED_EXPERTS;
     let reject = |what: String| EngError::Checkpoint(format!("{arch}: {what}"));

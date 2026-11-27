@@ -12,11 +12,12 @@
 //! token is gathered on the host, and the card spends its bytes on `output.weight`
 //! (≈0.5 GB Q4_K_M) which every step needs.
 
-#[cfg(feature = "native-cuda")]
+#[cfg(all(test, feature = "native-cuda"))]
 use crate::family::qwen::sensenova::LoopPlan;
 
-/// Every tensor the device holds, in load order: what the plan's layers name.
-#[cfg(feature = "native-cuda")]
+/// Every tensor the device holds for the looped model, in load order: what the plan's layers
+/// name. The serve wiring takes the same list from the model's layers; the tests here pin it.
+#[cfg(all(test, feature = "native-cuda"))]
 pub(crate) fn tensor_names(plan: &LoopPlan) -> Vec<String> {
     use crate::family::qwen::recipe::{Blocks, layers, tensors};
     let blocks = Blocks {
@@ -24,21 +25,6 @@ pub(crate) fn tensor_names(plan: &LoopPlan) -> Vec<String> {
         experts: false,
     };
     tensors(&layers(&plan.visits(), blocks).0)
-}
-
-/// Uploads every tensor of the template in one all-or-nothing Native load. Admission
-/// and reserve are the caller's `options`; the layout must be Native (the resident
-/// kernels read stored blocks).
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) fn load(
-    loader: &crate::family::project::cuda::BorrowedLoader<'_>,
-    weights: &crate::weights::GgufWeights,
-    plan: &LoopPlan,
-    options: crate::family::project::cuda::LoadOptions<'_>,
-) -> Result<crate::family::project::cuda::CudaWeights, crate::EngError> {
-    let names = tensor_names(plan);
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    loader.load_sliced(weights, &refs, options, &[], 0)
 }
 
 #[cfg(all(test, feature = "native-cuda"))]

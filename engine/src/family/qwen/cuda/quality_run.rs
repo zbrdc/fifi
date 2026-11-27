@@ -11,13 +11,10 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use super::step::{LoopStep, Routing, looped};
+use super::step::LoopStep;
 use crate::EngError;
 use crate::family::project::Projector;
-use crate::family::project::cuda::{BorrowedLoader, LoadOptions, WeightLayout};
 use crate::family::project::gguf::{GgufMatrix, GgufProjector};
-use crate::family::qwen::recipe::{layers, routed_experts, tensors};
-use crate::family::qwen::sensenova::weights::LoopWeights;
 use crate::family::session::TokenStepper;
 use crate::family::teacher_forced::{Run, score_windows};
 use crate::kernels::cuda::CudaContext;
@@ -92,41 +89,9 @@ fn lineage_quality_leg() {
         )
         .expect("model"),
     );
-    // The routed-expert model has one residual stream: the routing of a two-stream range is
-    // unused there. Any other header is read as the looped model.
-    let (model, routing) = match routed_experts(file.header()) {
-        Ok(model) => (
-            model,
-            Routing {
-                pre_scale: 1.0,
-                iterations: 1,
-                fixed_identity: true,
-            },
-        ),
-        Err(_) => {
-            let weights = LoopWeights::open(file.clone()).expect("looped model");
-            (
-                looped(weights.shape(), weights.plan(), weights.rope()),
-                weights.plan().routing(),
-            )
-        }
-    };
-    let names = tensors(&layers(&model.visits, model.blocks).0);
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (model, routing) = super::serve::model_of(&file).expect("a model of the lineage");
     let ctx = Rc::new(CudaContext::new().expect("context"));
-    let loaded = BorrowedLoader::new(&ctx)
-        .expect("loader")
-        .load_sliced(
-            &file,
-            &refs,
-            LoadOptions {
-                layout: WeightLayout::Native,
-                ..LoadOptions::default()
-            },
-            &[],
-            0,
-        )
-        .expect("load");
+    let loaded = super::serve::load_model(&ctx, &file, &model).expect("load");
     let mut step =
         LoopStep::open_model(ctx.clone(), &loaded, &model, routing, run.context + 1).expect("step");
     // `KVQ_EXACT=chunks` puts the prompt pieces of two rows or more on the decoding routes,

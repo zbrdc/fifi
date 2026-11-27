@@ -5,6 +5,8 @@ pub(crate) mod load;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod quality_run;
 #[cfg(feature = "native-cuda")]
+pub(crate) mod serve;
+#[cfg(feature = "native-cuda")]
 pub(crate) mod step;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod step_device_tests;

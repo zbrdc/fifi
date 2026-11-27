@@ -123,7 +123,14 @@ fn start_on_card(
     sampler_vocab: usize,
 ) -> Result<(Engine, u32), EngError> {
     let limit = context_limit(&file)?;
-    let engine = super::cuda::serve::start(file, ready_note, eos, sampler_vocab, limit)?;
+    let engine = crate::family::qwen::cuda::serve::start(
+        file,
+        LIMITS,
+        ready_note,
+        eos,
+        sampler_vocab,
+        limit,
+    )?;
     Ok((engine, limit))
 }
 

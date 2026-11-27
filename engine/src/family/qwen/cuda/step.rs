@@ -196,8 +196,10 @@ pub(crate) fn looped(shape: &LoopShape, plan: &LoopPlan, rope: &RopePlan) -> Mod
 }
 
 impl<'a> LoopStep<'a> {
-    /// Builds the executor over a completed device load. `cache_rows` is the session's
-    /// attention cache depth; the GDN state and the conv rings follow the shape.
+    /// Builds the executor of the looped model over a completed device load, as the device
+    /// tests open it. `cache_rows` is the session's attention cache depth; the GDN state and
+    /// the conv rings follow the shape.
+    #[cfg(test)]
     pub(crate) fn open(
         ctx: Rc<CudaContext>,
         weights: &'a CudaWeights,

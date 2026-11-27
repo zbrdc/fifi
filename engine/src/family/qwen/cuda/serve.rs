@@ -1,5 +1,6 @@
-//! Serves SenseNova-Loop from the card step behind `FIFI_SENSENOVA_CUDA=1`: a stepper over
-//! [`LoopStep`] for the shared serial decode session. It follows `flash_next/cuda/start.rs`.
+//! Serves a model of the lineage from the card step: a stepper over [`LoopStep`] for the shared
+//! serial decode session. The file's header says which model it is; the layer list, the device
+//! load and the step follow from that, so every model of the lineage starts here.
 //!
 //! The engine thread builds everything CUDA inside the worker's `make`. A request's prompt rows
 //! take the prefill in pieces of up to [`PREFILL_ROWS`] rows; the pending token and every drawn
@@ -20,25 +21,66 @@ use std::{
     time::Instant,
 };
 
-use super::super::serve::LIMITS;
-use super::super::weights::LoopWeights;
+use super::step::{LoopStep, PREFILL_ROWS, Routing, looped};
 use crate::EngError;
 use crate::family::executor::SerialDecode;
 use crate::family::project::Projector;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, WeightLayout, served_admission,
 };
-use crate::family::project::gguf::GgufProjector;
-use crate::family::qwen::cuda::load;
-use crate::family::qwen::cuda::step::{LoopStep, PREFILL_ROWS};
+use crate::family::project::gguf::{GgufMatrix, GgufProjector};
+use crate::family::qwen::recipe::{Model, ROUTED_EXPERTS, layers, routed_experts, tensors};
+use crate::family::qwen::sensenova::weights::LoopWeights;
 use crate::family::session::{DecodeSession, TokenStepper};
 use crate::kernels::cuda::CudaContext;
 use crate::sched::worker::{Engine, ReadyNote, spawn_engine_noted};
-use crate::weights::GgufWeights;
+use crate::weights::{GgufLimits, GgufWeights, MetaValue};
+
+/// The model of the lineage a file holds and the routing of its two-stream range: the
+/// routed-expert model by its architecture name, the looped model otherwise (its own reader
+/// refuses a header that is neither).
+pub(crate) fn model_of(file: &Arc<GgufWeights>) -> Result<(Model, Routing), EngError> {
+    let routed = MetaValue::String(ROUTED_EXPERTS.to_owned());
+    if file.header().meta("general.architecture") == Some(&routed) {
+        // One residual stream: the routing of a two-stream range is unused.
+        let routing = Routing {
+            pre_scale: 1.0,
+            iterations: 1,
+            fixed_identity: true,
+        };
+        return Ok((routed_experts(file.header())?, routing));
+    }
+    let host = LoopWeights::open(Arc::clone(file))?;
+    Ok((
+        looped(host.shape(), host.plan(), host.rope()),
+        host.plan().routing(),
+    ))
+}
+
+/// The device load of `model`: every tensor its layers name, in the blocks of the file.
+pub(crate) fn load_model(
+    ctx: &Rc<CudaContext>,
+    file: &GgufWeights,
+    model: &Model,
+) -> Result<CudaWeights, EngError> {
+    let names = tensors(&layers(&model.visits, model.blocks).0);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    BorrowedLoader::new(ctx)?.load_sliced(
+        file,
+        &refs,
+        LoadOptions {
+            layout: WeightLayout::Native,
+            ..LoadOptions::default()
+        },
+        &[],
+        0,
+    )
+}
 
 /// Starts the card engine of one GGUF file. The context limit is also the step's cache depth.
 pub(crate) fn start(
     file: PathBuf,
+    limits: GgufLimits,
     ready_note: ReadyNote,
     eos: Vec<u32>,
     sampler_vocab: usize,
@@ -49,77 +91,66 @@ pub(crate) fn start(
     let engine = spawn_engine_noted(PREFILL_ROWS, ready_note, move |_| {
         let began = Instant::now();
         let ctx = Rc::new(CudaContext::with_admission(&served_admission())?);
-        let gguf = Arc::new(GgufWeights::open_any_type(&file, LIMITS, None)?);
-        let host = LoopWeights::open(Arc::clone(&gguf))?;
-        let loaded = load::load(
-            &BorrowedLoader::new(&ctx)?,
-            &gguf,
-            host.plan(),
-            LoadOptions {
-                layout: WeightLayout::Native,
-                ..LoadOptions::default()
-            },
-        )?;
-        drop(gguf);
+        let gguf = Arc::new(GgufWeights::open_any_type(&file, limits, None)?);
+        let (model, routing) = model_of(&gguf)?;
+        let loaded = load_model(&ctx, &gguf, &model)?;
         // Past this point the load is the process's: see the module note.
         guard.commit();
         let loaded: &'static CudaWeights = Box::leak(Box::new(loaded));
-        let step = LoopStep::open(
-            Rc::clone(&ctx),
-            loaded,
-            host.shape(),
-            host.plan(),
-            host.rope(),
-            cache_rows,
-        )?;
+        let step = LoopStep::open_model(Rc::clone(&ctx), loaded, &model, routing, cache_rows)?;
         eprintln!(
-            "sensenova cuda: ready in {:.1} s; the card step serves",
+            "{} cuda: ready in {:.1} s; the card step serves",
+            model.family,
             began.elapsed().as_secs_f64()
         );
-        let card = CardStep::new(step, host);
+        let card = CardStep::new(step, &gguf, &model)?;
         let executor = SerialDecode::new(card, eos, sampler_vocab, cache_rows);
         Ok((executor, DecodeSession::default()))
     })?;
     Ok(engine)
 }
 
-/// The model side of one session: the card step over the leaked load, the host view of the file
-/// (its embedding table feeds the rows), and the number of rows the card has consumed.
+/// The model side of one session: the card step over the leaked load, the file's embedding
+/// table (it feeds the rows from the host) and the number of rows the card has consumed.
 pub(crate) struct CardStep {
     step: LoopStep<'static>,
-    host: LoopWeights,
+    embd: GgufMatrix,
     projector: GgufProjector,
     pos: usize,
 }
 
 impl CardStep {
-    pub(crate) fn new(step: LoopStep<'static>, host: LoopWeights) -> Self {
-        let projector = host.projector();
-        Self {
+    pub(crate) fn new(
+        step: LoopStep<'static>,
+        file: &Arc<GgufWeights>,
+        model: &Model,
+    ) -> Result<Self, EngError> {
+        let (vocab, hidden) = (model.shape.vocab, model.shape.hidden);
+        Ok(Self {
             step,
-            host,
-            projector,
+            embd: GgufMatrix::new(file.header(), "token_embd.weight", vocab, hidden)?,
+            projector: GgufProjector::new(Arc::clone(file)),
             pos: 0,
-        }
+        })
     }
 }
 
 impl TokenStepper for CardStep {
-    const OPERATION: &'static str = "sensenova_logits";
+    const OPERATION: &'static str = "lineage_logits";
 
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
         self.feed_rows(&[token])
     }
 
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
-        let rows = self.projector.rows(self.host.token_embd(), tokens)?;
+        let rows = self.projector.rows(&self.embd, tokens)?;
         self.step.prefill(&rows, self.pos)?;
         self.pos += tokens.len();
         Ok(())
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
-        let row = self.projector.rows(self.host.token_embd(), &[token])?;
+        let row = self.projector.rows(&self.embd, &[token])?;
         self.step.decode(&row, self.pos)?;
         self.pos += 1;
         // The read is enqueued on the step's stream, behind its kernels.
@@ -160,7 +191,7 @@ impl BuildGuard {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
                 EngError::BadRequest(
-                    "engine config: the SenseNova CUDA backend builds one engine per process: its weights are leaked for the process lifetime; configure a single sensenova entry and restart the process to reload"
+                    "engine config: the card step of this lineage builds one engine per process: its weights are leaked for the process lifetime; configure a single entry served by it and restart the process to reload"
                         .to_string(),
                 )
             })?;
