@@ -80,6 +80,9 @@ pub(crate) struct DeviceBuffer {
     raw: RawBuffer,
     shared: Rc<Shared>,
     _lease: Rc<Lease>,
+    /// A buffer over the pages of a mapped file: the host cannot write it and a frame cannot
+    /// fill it.
+    read_only: bool,
 }
 
 /// The `bytes` bytes of a [`DeviceBuffer`] from `offset` on.
@@ -163,6 +166,42 @@ impl MetalContext {
             raw,
             shared: Rc::clone(&self.shared),
             _lease: Rc::clone(&self.lease),
+            read_only: false,
+        })
+    }
+
+    /// The longest buffer the device gives, in bytes.
+    pub(super) fn max_buffer_length(&self) -> Result<usize, EngError> {
+        ensure_usable(&TERMINAL)?;
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        native::max_buffer_length(&self.shared.runtime)
+            .map_err(|_| terminal_failure(ALLOCATE_OPERATION))
+    }
+
+    /// A buffer with no copy over the whole pages of `storage`, which the caller keeps mapped
+    /// and read-only until the buffer is released: the pages of a file `family::MappedFile`
+    /// maps. `BadRequest` for a storage without a whole page, which refused nothing: the
+    /// backend stays usable.
+    pub(super) fn wrap_mapped(&self, storage: &[u8]) -> Result<DeviceBuffer, EngError> {
+        ensure_usable(&TERMINAL)?;
+        let raw = {
+            let _guard = DispatchGuard::enter(&TERMINAL);
+            native::buffer_wrap(&self.shared.runtime, storage).map_err(|status| {
+                if status == native::STATUS_INVALID {
+                    EngError::BadRequest(
+                        "a Metal buffer over mapped pages needs at least one whole page".to_owned(),
+                    )
+                } else {
+                    terminal_failure(ALLOCATE_OPERATION)
+                }
+            })?
+        };
+        self.shared.note(&raw);
+        Ok(DeviceBuffer {
+            raw,
+            shared: Rc::clone(&self.shared),
+            _lease: Rc::clone(&self.lease),
+            read_only: true,
         })
     }
 
@@ -452,6 +491,16 @@ impl DeviceBuffer {
         &self.raw
     }
 
+    /// A buffer over a file's pages takes no host write and no fill.
+    fn check_writable(&self) -> Result<(), EngError> {
+        if self.read_only {
+            return Err(EngError::BadRequest(
+                "a Metal buffer over the pages of a file is read-only".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The `bytes` bytes of the buffer from `offset` on.
     pub(crate) fn range(&self, offset: usize, bytes: usize) -> Result<DeviceRange<'_>, EngError> {
         let inside = offset
@@ -481,6 +530,7 @@ impl DeviceBuffer {
 
     /// Copies `data` into the buffer at `offset`.
     pub(crate) fn write(&self, offset: usize, data: &[u8]) -> Result<(), EngError> {
+        self.check_writable()?;
         let _ = self.range(offset, data.len())?;
         self.shared.settle(self.raw.pointer())?;
         native::buffer_write(&self.raw, offset, data)
@@ -497,6 +547,7 @@ impl DeviceBuffer {
         offset: usize,
         bytes: usize,
     ) -> Result<(), EngError> {
+        self.check_writable()?;
         frame.zero(&self.range(offset, bytes)?)
     }
 }

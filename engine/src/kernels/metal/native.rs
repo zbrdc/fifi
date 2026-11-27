@@ -98,6 +98,8 @@ unsafe extern "C" {
     fn bridge_object_free(object: *mut c_void);
     #[link_name = "inference_metal_buffer_new"]
     fn bridge_buffer_new(runtime: *mut c_void, bytes: usize, out: *mut *mut c_void) -> c_int;
+    #[link_name = "inference_metal_max_buffer_length"]
+    fn bridge_max_buffer_length(runtime: *mut c_void, out: *mut usize) -> c_int;
     #[link_name = "inference_metal_buffer_contents"]
     fn bridge_buffer_contents(buffer: *mut c_void) -> *mut u8;
     #[link_name = "inference_metal_buffer_wrap"]
@@ -201,6 +203,18 @@ pub(super) fn contents(buffer: &RawBuffer) -> *mut u8 {
     // SAFETY: the pointer is a live buffer, the invariant of this module, and `contents`
     // raises no exception.
     unsafe { bridge_buffer_contents(buffer.pointer) }
+}
+
+/// The longest buffer the device gives, in bytes.
+pub(super) fn max_buffer_length(runtime: &RawRuntime) -> Result<usize, c_int> {
+    let mut out = 0usize;
+    // SAFETY: the pointer is a live runtime, the invariant of this module; the call raises no
+    // exception and writes `out`.
+    let status = unsafe { bridge_max_buffer_length(runtime.pointer, &mut out) };
+    if status != 0 {
+        return Err(status);
+    }
+    Ok(out)
 }
 
 /// A buffer with no copy over `storage`, which the caller keeps mapped and read-only until the

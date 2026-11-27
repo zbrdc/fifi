@@ -167,6 +167,19 @@ int inference_metal_buffer_new(void *runtime, size_t bytes, void **out) noexcept
     });
 }
 
+// The longest buffer the device gives, in bytes: a no-copy buffer over a longer storage would
+// throw. No failure: the device reports it.
+int inference_metal_max_buffer_length(void *runtime, size_t *out) noexcept {
+    return guarded("max_buffer_length", [&]() -> int {
+        id<MTLDevice> device = device_of(runtime);
+        if (device == nil || out == nullptr) {
+            return kStatusInvalid;
+        }
+        *out = device.maxBufferLength;
+        return kStatusOk;
+    });
+}
+
 // A buffer with no copy over storage the caller owns and keeps mapped for the buffer's life:
 // the pages of a mapped file. Metal wants an address at a page boundary and a length that is
 // a multiple of the page size: the length is cut down to one, so the bytes of the last partial
