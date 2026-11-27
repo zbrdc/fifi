@@ -9,7 +9,8 @@ use crate::weights::GgufHeader;
 
 /// The tensors of one mapped GGUF file. The file's whole pages are one device buffer, and a
 /// tensor's bytes are a range of it. A tensor that the last partial page of the file cuts is a
-/// copy. Nothing here keeps the device from writing into the pages: a kernel binds them as
+/// copy. The GPU reads every page once at open: the first dispatch over them finds them mapped.
+/// Nothing here keeps the device from writing into the pages: a kernel binds them as
 /// input only.
 // shortcut: one buffer for the whole file, so a file longer than the device's longest buffer
 // is refused; cut the file into page-aligned pieces when a model file exceeds the limit.
@@ -24,7 +25,8 @@ pub(crate) struct WeightMap {
 }
 
 impl WeightMap {
-    /// Maps `path` and gives its pages to the device. `max_header_bytes` bounds the header.
+    /// Maps `path`, gives its pages to the device and reads each page once, so that the first
+    /// dispatch over them finds them mapped. `max_header_bytes` bounds the header.
     pub(crate) fn open(
         context: &MetalContext,
         path: &Path,
@@ -45,6 +47,7 @@ impl WeightMap {
             )));
         }
         let pages = context.wrap_mapped(bytes)?;
+        context.read_pages(&pages)?;
         let mut cut = Vec::new();
         for tensor in header.tensors() {
             let range = tensor.abs_range();
@@ -91,6 +94,7 @@ mod tests {
 
     use super::WeightMap;
     use crate::EngError;
+    use crate::family::mapped_file::MappedFile;
     use crate::kernels::metal::testkit::{Rig, f32_bytes, floats};
     use crate::kernels::metal::{
         DenseDtype, DenseGemvCall, DenseGemvShape, DeviceBuffer, DeviceRange, dense_gemv_bytes,
@@ -320,7 +324,7 @@ mod tests {
         let shape = DenseGemvShape::packed(1, ROWS, COLS);
         let rate = |us: f64| BYTES as f64 / us / 1e3;
 
-        // The first launch from the pages pins them: wall time the GPU clock does not show.
+        // The first launch from the pages, after the pass at open.
         let start = Instant::now();
         rig.ctx
             .dense_gemv(gemv(shape, pages, &x, &y))
@@ -377,6 +381,7 @@ mod tests {
         // file a pass: a file mapped before keeps whatever its first launch paid for.
         const ROWS: usize = 200_058;
         const COLS: usize = 2304;
+        const BYTES: usize = 2 * ROWS * COLS;
         let bytes = gguf_file(&[
             ("w", GgufType::Bf16, &[COLS as u64, ROWS as u64]),
             ("tail", GgufType::F32, &[4096]),
@@ -399,16 +404,19 @@ mod tests {
             "the GPU's pass, again",
         ] {
             let file = written(&bytes);
-            let map = WeightMap::open(&rig.ctx, file.path(), 1 << 20).expect("the map");
-            let pages = map.range("w").expect("the weight from the pages");
+            // The map without its pass: `WeightMap::open` reads the pages, and that is the
+            // pass the variants add or leave out.
+            let mapped = MappedFile::open(file.path(), bytes.len() as u64).expect("the mapping");
+            let buffer = rig.ctx.wrap_mapped(mapped.as_ref()).expect("the wrap");
+            let pages = buffer.range(128, BYTES).expect("the weight from the pages");
             let start = Instant::now();
             let gpu_ms = match pass {
                 "the GPU's pass" | "the GPU's pass, again" => {
-                    Some(rig.ctx.read_pages(&map.pages).expect("the pass") as f64 / 1e6)
+                    Some(rig.ctx.read_pages(&buffer).expect("the pass") as f64 / 1e6)
                 }
                 "a host read" => {
                     // One byte a page of 16 KiB, read by the host.
-                    let storage: &[u8] = map.file.as_ref();
+                    let storage: &[u8] = mapped.as_ref();
                     let mut sum = 0u8;
                     for at in (0..storage.len()).step_by(16_384) {
                         sum ^= storage[at];

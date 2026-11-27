@@ -44,14 +44,10 @@ const FLAG_BYTES: usize = 4;
 /// The flag cleared: no weight marked.
 const FLAG_ZERO: [u8; 4] = [0; 4];
 /// The shader of the first read of the pages of a mapped file.
-#[cfg(test)]
 const PAGE_TOUCH_SOURCE: &str = include_str!("native/page_touch.metal");
-#[cfg(test)]
 const PAGE_TOUCH_KERNEL: &str = "page_touch";
 /// The stride of that read: below any page size, so every page is read.
-#[cfg(test)]
 const PAGE_READ_STRIDE: usize = 4096;
-#[cfg(test)]
 const PAGE_TOUCH_THREADGROUP: usize = 256;
 
 pub(crate) struct MetalContext {
@@ -192,7 +188,6 @@ impl MetalContext {
     /// every 4 KiB, one thread each, a waited launch. A dispatch that comes after it finds the
     /// pages mapped for the GPU. The GPU time of the pass in nanoseconds; `BadRequest` for a
     /// buffer the host can write or an empty one, before any native call.
-    #[cfg(test)]
     pub(super) fn read_pages(&self, buffer: &DeviceBuffer) -> Result<u64, EngError> {
         ensure_usable(&TERMINAL)?;
         if !buffer.read_only {
