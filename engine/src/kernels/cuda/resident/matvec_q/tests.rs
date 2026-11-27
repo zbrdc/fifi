@@ -1705,9 +1705,9 @@ fn matvec_window_vs_vendored_dense_ab_bench() {
             let label = format!("{ty:?} {name}");
             let (v_cold, _) =
                 ab.report(&label, w_bytes, (&y_v, &y_w, y_bytes), (&vendored, &window));
-            // The invariant entry serves Q8_0 from the in-house warp-per-row kernel, the
-            // pattern the removal plan builds the other types on: time it next to the two above.
-            if ty == QuantType::Q80 {
+            // The invariant entry serves Q4_K and Q8_0 from in-house warp-per-row kernels:
+            // time that route next to the two above.
+            if matches!(ty, QuantType::Q4K | QuantType::Q80) {
                 let y_p = nan_filled(&ctx, y_bytes);
                 let in_house = || {
                     ctx.matvec_q_invariant(
@@ -1722,7 +1722,7 @@ fn matvec_window_vs_vendored_dense_ab_bench() {
                             ncols: 1,
                         },
                     )
-                    .expect("in-house q80 matvec")
+                    .expect("in-house matvec")
                 };
                 let (_, cold) = ab.times(&in_house);
                 let (gap, rel) = largest_gap(
@@ -1730,7 +1730,7 @@ fn matvec_window_vs_vendored_dense_ab_bench() {
                     &read_f32(&ctx, &y_v, y_bytes),
                 );
                 println!(
-                    "{label:28} in-house q80 cold {cold:9.2} us, {:.0} GB/s, {:.2} of the vendored cold time, gap to vendored abs {gap:.3} rel {rel:.1e}",
+                    "{label:28} in-house {ty:?} cold {cold:9.2} us, {:.0} GB/s, {:.2} of the vendored cold time, gap to vendored abs {gap:.3} rel {rel:.1e}",
                     w_bytes as f64 / (cold as f64 * 1e-6) / 1e9,
                     cold / v_cold
                 );
@@ -2648,6 +2648,80 @@ fn matvec_q80_matches_the_integer_reference() {
         }
     }
     println!("matvec q80: max tolerance ratio {max_ratio:.3}");
+}
+
+/// The in-house Q4_K arm against the same host reference machinery as the other in-house
+/// arms, including a row count the vendored matvec would refuse (13: no row groups) and the
+/// padded activation shape.
+#[test]
+fn matvec_q4k_matches_the_integer_reference() {
+    if !testkit::device_present("matvec_q4k_matches_the_integer_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ncols = 2;
+    let mut max_ratio = 0.0f64;
+    let shapes = SHAPES
+        .into_iter()
+        .chain([PADDED_SHAPE, (2048, 13)])
+        .map(|(k, rows)| {
+            // Q4_K reads 256-value super-blocks: k rounds up to the 256 grid.
+            (k.div_ceil(256) * 256, rows)
+        });
+    for (k, rows) in shapes {
+        let seed = 0x5eed_4000u64 + k as u64 + rows as u64;
+        let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Q4K, k, rows, ncols, seed);
+        let y_bytes = rows * ncols * 4;
+        let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+        ctx.matvec_q_invariant(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q4K,
+                w: w.range(0, QuantType::Q4K.weight_bytes(rows, k).expect("size"))
+                    .expect("w"),
+                x_q8: x_q8
+                    .range(0, q8_1_bytes(k, ncols).expect("size"))
+                    .expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec q4k");
+        stream.synchronize().expect("drain");
+        let got = read_f32(&ctx, &y, y_bytes);
+        let w_bytes = testkit::read_bytes(
+            &ctx,
+            &w,
+            QuantType::Q4K.weight_bytes(rows, k).expect("size"),
+        );
+        let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes * ncols);
+        for col in 0..ncols {
+            for row in 0..rows {
+                let (reference, abs) = reference::reference_dot(
+                    QuantType::Q4K,
+                    &w_bytes[row * (k / 256) * 144..],
+                    &x_bytes[col * row_bytes..],
+                    k,
+                );
+                let tolerance = 64.0 * 2f64.powi(-24) * abs;
+                let error = (got[col * rows + row] as f64 - reference).abs();
+                let ratio = if tolerance > 0.0 {
+                    error / tolerance
+                } else {
+                    error
+                };
+                max_ratio = max_ratio.max(ratio);
+                assert!(
+                    error <= tolerance,
+                    "Q4K k {k} rows {rows} col {col} row {row}: error {error} over tol {tolerance}"
+                );
+            }
+        }
+    }
+    println!("matvec q4k: max tolerance ratio {max_ratio:.3}");
 }
 
 /// The fused arithmetic contract, pinned without a card: the host mirror of the
