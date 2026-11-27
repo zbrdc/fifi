@@ -209,6 +209,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/device.h",
     "src/kernels/cuda/native/f8_gemv.h",
     "src/kernels/cuda/native/mamba_step.h",
+    "src/kernels/cuda/native/mma_f16.cuh",
     "src/kernels/cuda/native/nvfp4_gemv_batch.h",
     "src/kernels/cuda/native/nvfp4_grouped_gemm.h",
     "src/kernels/cuda/native/peer_ring_policy.h",

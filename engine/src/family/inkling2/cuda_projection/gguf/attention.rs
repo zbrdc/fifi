@@ -1197,10 +1197,12 @@ mod tests {
             key: host_rows[i].key,
             ..device_rows[i]
         });
-        attention.invalidate();
-        let expected = bits(batch(4, &host_rows, None, &values, false).unwrap());
-        let committed = ring();
+        // A tiled prompt scores its queries on tensor cores and a row-by-row one in f32, so each
+        // path compares the resident side with host rows on that same path.
         for tiled in [false, true] {
+            attention.invalidate();
+            let expected = bits(batch(4, &host_rows, None, &values, tiled).unwrap());
+            let committed = ring();
             attention.invalidate();
             resident.write_at(&stream, start, &packed).unwrap();
             assert_eq!(

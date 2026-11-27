@@ -54,56 +54,79 @@ impl Fixture {
         }
     }
 
-    /// Newest-first FP64 reference with the unscaled relative logits and
-    /// zero-value sink in the same positions as the CPU family.
     fn reference(&self, pos: usize) -> Vec<f32> {
-        let mut out = vec![0.0; QUERY];
-        let visible = pos.saturating_sub(SHAPE.capacity - 1)..=pos;
-        let (rows, _) = out.as_chunks_mut::<HEAD_DIM>();
-        for (head, row) in rows.iter_mut().enumerate() {
-            let q = head * HEAD_DIM;
-            let kv = head / (SHAPE.query_heads / SHAPE.kv_heads) * HEAD_DIM;
-            let scores = self.scores(pos, head);
-            let sink = f64::from(self.sinks[head]);
-            let peak = scores.iter().copied().fold(sink, f64::max);
-            let masses: Vec<_> = scores.iter().map(|score| (score - peak).exp()).collect();
-            let normalizer = (sink - peak).exp() + masses.iter().sum::<f64>();
-            for (d, result) in row.iter_mut().enumerate() {
-                let value: f64 = visible
-                    .clone()
-                    .rev()
-                    .zip(&masses)
-                    .map(|(token, mass)| mass * f64::from(self.values[token][kv + d]))
-                    .sum();
-                let gate = 1.0 / (1.0 + (-f64::from(self.gates[q + d])).exp());
-                *result = (value / normalizer * gate) as f32;
-            }
-        }
-        out
+        let row = Row {
+            q: &self.q,
+            relative: &self.relative,
+            sinks: &self.sinks,
+            gates: &self.gates,
+        };
+        reference(row, &self.keys, &self.values, &self.table, pos)
     }
+}
 
-    fn scores(&self, pos: usize, head: usize) -> Vec<f64> {
+/// The per-row inputs of one query: Q, the relative coefficients, the sinks and the gates.
+#[derive(Clone, Copy)]
+struct Row<'a> {
+    q: &'a [f32],
+    relative: &'a [f32],
+    sinks: &'a [f32],
+    gates: &'a [f32],
+}
+
+/// Newest-first FP64 reference with the unscaled relative logits and zero-value sink in the
+/// same positions as the CPU family; `keys` and `values` are indexed by position.
+fn reference(
+    row: Row<'_>,
+    keys: &[Vec<f32>],
+    values: &[Vec<f32>],
+    table: &[f32],
+    pos: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0; QUERY];
+    let visible = pos.saturating_sub(SHAPE.capacity - 1)..=pos;
+    let (rows, _) = out.as_chunks_mut::<HEAD_DIM>();
+    for (head, slot) in rows.iter_mut().enumerate() {
         let q = head * HEAD_DIM;
-        let rel = head * SHAPE.relative_dims;
         let kv = head / (SHAPE.query_heads / SHAPE.kv_heads) * HEAD_DIM;
-        (0..=(pos.min(SHAPE.capacity - 1)))
-            .map(|distance| {
-                let qk: f64 = (0..HEAD_DIM)
-                    .map(|d| {
-                        f64::from(self.q[q + d]) * f64::from(self.keys[pos - distance][kv + d])
-                    })
-                    .sum();
-                let mut bias = 0.0;
-                if distance < SHAPE.relative_extent {
-                    for c in 0..SHAPE.relative_dims {
-                        bias += f64::from(self.relative[rel + c])
-                            * f64::from(self.table[c * SHAPE.relative_extent + distance]);
-                    }
-                }
-                qk / (HEAD_DIM as f64).sqrt() + bias
-            })
-            .collect()
+        let scores = scores(row, keys, table, pos, head);
+        let sink = f64::from(row.sinks[head]);
+        let peak = scores.iter().copied().fold(sink, f64::max);
+        let masses: Vec<_> = scores.iter().map(|score| (score - peak).exp()).collect();
+        let normalizer = (sink - peak).exp() + masses.iter().sum::<f64>();
+        for (d, result) in slot.iter_mut().enumerate() {
+            let value: f64 = visible
+                .clone()
+                .rev()
+                .zip(&masses)
+                .map(|(token, mass)| mass * f64::from(values[token][kv + d]))
+                .sum();
+            let gate = 1.0 / (1.0 + (-f64::from(row.gates[q + d])).exp());
+            *result = (value / normalizer * gate) as f32;
+        }
     }
+    out
+}
+
+fn scores(row: Row<'_>, keys: &[Vec<f32>], table: &[f32], pos: usize, head: usize) -> Vec<f64> {
+    let q = head * HEAD_DIM;
+    let rel = head * SHAPE.relative_dims;
+    let kv = head / (SHAPE.query_heads / SHAPE.kv_heads) * HEAD_DIM;
+    (0..=(pos.min(SHAPE.capacity - 1)))
+        .map(|distance| {
+            let qk: f64 = (0..HEAD_DIM)
+                .map(|d| f64::from(row.q[q + d]) * f64::from(keys[pos - distance][kv + d]))
+                .sum();
+            let mut bias = 0.0;
+            if distance < SHAPE.relative_extent {
+                for c in 0..SHAPE.relative_dims {
+                    bias += f64::from(row.relative[rel + c])
+                        * f64::from(table[c * SHAPE.relative_extent + distance]);
+                }
+            }
+            qk / (HEAD_DIM as f64).sqrt() + bias
+        })
+        .collect()
 }
 
 struct Buffers {
@@ -381,6 +404,119 @@ fn assert_invalid_positions(
             .zip(&snapshots)
         {
             assert_eq!(&read_bytes(ctx, b, b.bytes()), snapshot);
+        }
+    }
+}
+
+/// A query tile against the FP64 reference: rows `first .. first + count` with their own
+/// queries, coefficients, sinks and gates, the older keys in the pre-tile ring (its other rows
+/// NaN, so a wrong row shows) and the tile's own keys staged. The tensor-core kernel rounds Q,
+/// K, V, the probabilities, the coefficients and the bias table to f16; an emulation of that
+/// rounding on these values peaks at 1.1e-3. The commit then publishes the tile's keys and
+/// values to the ring bit for bit.
+#[test]
+fn query_tile_matches_the_fp64_reference() {
+    if !device_present("relative attention query tile") {
+        return;
+    }
+    const TOLERANCE: f32 = 4e-3;
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    // A tile wrapping the ring with three query blocks, a first tile, and the smallest tile.
+    for (first, count) in [(150, 130), (0, 70), (7, 2)] {
+        let positions = first + count;
+        let keys: Vec<Vec<f32>> = (0..positions).map(|p| pattern(KV, p * 2 + 6)).collect();
+        let values: Vec<Vec<f32>> = (0..positions).map(|p| pattern(KV, p * 2 + 7)).collect();
+        let rows = |width: usize, seed: usize, scale: f32| -> Vec<f32> {
+            pattern(count * width, seed)
+                .into_iter()
+                .map(|x| x * scale)
+                .collect()
+        };
+        let q = rows(QUERY, 1, 1.0);
+        let relative = rows(SHAPE.query_heads * SHAPE.relative_dims, 2, 1.0);
+        let sinks = rows(SHAPE.query_heads, 4, 8.0);
+        let gates = rows(QUERY, 5, 4.0);
+        let table = pattern(SHAPE.relative_dims * SHAPE.relative_extent, 3);
+        let mut ring = [
+            vec![f32::NAN; SHAPE.capacity * KV],
+            vec![f32::NAN; SHAPE.capacity * KV],
+        ];
+        for p in first.saturating_sub(SHAPE.capacity)..first {
+            let at = p % SHAPE.capacity * KV;
+            ring[0][at..at + KV].copy_from_slice(&keys[p]);
+            ring[1][at..at + KV].copy_from_slice(&values[p]);
+        }
+        let positions_bytes: Vec<u8> = (first..positions)
+            .flat_map(|p| i32::try_from(p).unwrap().to_le_bytes())
+            .collect();
+        let q_buf = upload_f32(&ctx, &q);
+        let k_buf = upload_f32(&ctx, &keys[first..].concat());
+        let v_buf = upload_f32(&ctx, &values[first..].concat());
+        let relative_buf = upload_f32(&ctx, &relative);
+        let table_buf = upload_f32(&ctx, &table);
+        let sinks_buf = upload_f32(&ctx, &sinks);
+        let gates_buf = upload_f32(&ctx, &gates);
+        let ring_buf = ring.each_ref().map(|plane| upload_f32(&ctx, plane));
+        let pos_buf = ctx.upload(&positions_bytes).unwrap();
+        let status = upload_filled(&ctx, 0, count * 4);
+        let out = upload_filled(&ctx, 0xff, count * QUERY * 4);
+        let call = RelativeAttentionCall {
+            shape: SHAPE,
+            q: whole(&q_buf),
+            k: whole(&k_buf),
+            v: whole(&v_buf),
+            relative: whole(&relative_buf),
+            table: whole(&table_buf),
+            sinks: whole(&sinks_buf),
+            gates: whole(&gates_buf),
+            k_cache: whole(&ring_buf[0]),
+            v_cache: whole(&ring_buf[1]),
+            out: whole(&out),
+            pos: whole(&pos_buf),
+            status: whole(&status),
+        };
+        let tile = RelativeAttentionTile {
+            first,
+            count,
+            input_stride: 0,
+            query_stride: 0,
+            side_stride: 0,
+        };
+        ctx.relative_attention_tile(&stream, call, tile).unwrap();
+        stream.synchronize().unwrap();
+        assert!(
+            read_bytes(&ctx, &status, count * 4).iter().all(|&b| b == 0),
+            "first {first}: a row reported an invalid state"
+        );
+        let got = floats(&read_bytes(&ctx, &out, count * QUERY * 4));
+        let mut worst = 0.0f32;
+        for (r, actual) in got.as_chunks::<QUERY>().0.iter().enumerate() {
+            let row = Row {
+                q: &q[r * QUERY..][..QUERY],
+                relative: &relative[r * SHAPE.query_heads * SHAPE.relative_dims..]
+                    [..SHAPE.query_heads * SHAPE.relative_dims],
+                sinks: &sinks[r * SHAPE.query_heads..][..SHAPE.query_heads],
+                gates: &gates[r * QUERY..][..QUERY],
+            };
+            let expected = reference(row, &keys, &values, &table, first + r);
+            for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                let error = (a - e).abs();
+                assert!(
+                    error <= TOLERANCE,
+                    "first {first}, row {r}, element {i}: expected {e}, got {a}"
+                );
+                worst = worst.max(error);
+            }
+        }
+        println!("query tile at {first} of {count} rows: worst error {worst:e}");
+        for (plane, rows) in ring_buf.iter().zip([&keys, &values]) {
+            let all = read_bytes(&ctx, plane, plane.bytes());
+            let kept = positions.saturating_sub(SHAPE.capacity).max(first);
+            for (p, row) in rows.iter().enumerate().skip(kept) {
+                let at = p % SHAPE.capacity * KV * 4;
+                assert_eq!(&all[at..at + KV * 4], bytes(row), "ring row {p}");
+            }
         }
     }
 }

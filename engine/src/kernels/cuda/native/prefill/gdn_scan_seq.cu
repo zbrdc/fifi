@@ -20,6 +20,7 @@
 
 #include "abi.h"
 #include "device.h"
+#include "mma_f16.cuh"
 #include "resident/gdn_mutants.h"
 
 namespace {
@@ -751,9 +752,8 @@ __device__ __forceinline__ void f2s_at(float x, __half *hib, __half *lob, int i)
 #if __CUDA_ARCH__ >= 800
 // The tensor-core primitives of the chunk kernel's matmul phases, in the house style of
 // attn_prefill.cu (sm_80+; sm_72 builds never compile them and take the joined SIMT paths).
-__device__ __forceinline__ unsigned smem_addr(const void *p) {
-    return (unsigned)__cvta_generic_to_shared(p);
-}
+using inference::mma::mma_16816;
+using inference::mma::smem_addr;
 // The A fragment (16x16 halves, row-major source): lanes 0-7 name the rows of the
 // (rows 0-7, cols 0-7) block, lanes 8-15 rows 8-15, lanes 16-23 the col+8 halves of rows
 // 0-7, lanes 24-31 the same of rows 8-15.
@@ -807,14 +807,6 @@ __device__ __forceinline__ void ldm_bts(const __half *m, int row, int col, unsig
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(addr));
-}
-// D (16x8 f32) += A (16x16 f16, row) * B (16x8 f16, col).
-__device__ __forceinline__ void mma_16816(float *d, const unsigned *a, unsigned b0, unsigned b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 #endif
 

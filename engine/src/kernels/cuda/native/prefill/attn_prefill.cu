@@ -18,6 +18,7 @@
 
 #include "abi.h"
 #include "device.h"
+#include "mma_f16.cuh"
 #include "prefill/attn_prefill_plan.h"
 
 namespace {
@@ -171,26 +172,10 @@ __device__ inline bool block_of(const Args &a, int s, int kvh, int tile, Block &
 }
 
 #if __CUDA_ARCH__ >= 750
-/* D (16x8 f32) += A (16x16 f16, row) * B (16x8 f16, col), the sm_80 tensor-core path. */
-__device__ inline void mma_16816(float *d, const unsigned *a, unsigned b0, unsigned b1) {
-#if __CUDA_ARCH__ >= 800
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    // PTX m16n8k8 stores the first eight columns in A[0:2], B[0],
-    // and the next eight in A[2:4], B[1]; C/D has the same four f32 lanes.
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,%1,%2,%3}, {%7,%8}, {%9}, {%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(b0), "r"(a[2]), "r"(a[3]), "r"(b1));
-#endif
-}
+using inference::mma::ldsm_x4;
+using inference::mma::ldsm_x4_trans;
+using inference::mma::mma_16816;
+using inference::mma::smem_addr;
 #endif
 /* The Q tile in shared memory, rounded to fp16 once (128 threads): rows past the chunk's end
  * (m not a multiple of 8) hold zeros; their partials are written but never read. */
@@ -307,10 +292,6 @@ __device__ inline unsigned swz(int key, int chunk) {
     return key * (2 * kHeadDim) + ((chunk ^ (key & 7)) << 4);
 }
 
-__device__ inline unsigned smem_addr(const void *p) {
-    return (unsigned)__cvta_generic_to_shared(p);
-}
-
 /* 16 bytes global -> shared, bypassing L1; src_bytes 0 reads nothing and writes zeros. */
 __device__ inline void cp_async16(unsigned dst, const void *src, int src_bytes) {
 #if __CUDA_ARCH__ >= 800
@@ -334,20 +315,6 @@ __device__ inline void cp_async_wait_all() {
 #if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
 #endif
-}
-
-/* Four 8x8 b16 matrices; lanes 8i..8i+7 give the row addresses of matrix i. */
-__device__ inline void ldsm_x4(unsigned addr, unsigned (&r)[4]) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
-}
-
-/* The same, transposed: lane number T gets rows 2(T%4), 2(T%4)+1 of column T/4. */
-__device__ inline void ldsm_x4_trans(unsigned addr, unsigned (&r)[4]) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
 }
 
 /* The named barrier of one row group's four warps (ids 1..4; 0 is __syncthreads). */
