@@ -258,7 +258,7 @@ fn matched_history_step(
 
 /// Independently project the captured host core without modifying the QSA cache.
 fn host_core_projection(step: &FlashStep<'_>, core: &[f32]) -> serde_json::Value {
-    use crate::family::qwen::flash_next::cuda::step::{NativeProjection, project_q6_f32};
+    use crate::family::{qwen::flash_next::cuda::step::project_q6_f32, step::rows::NativeRow};
     let name = layer_name(3, "self_attn.o_proj");
     let Some(CudaWeight::Native { weight, .. }) = step.weights.get(&name) else {
         panic!("missing native QSA output weight");
@@ -288,11 +288,10 @@ fn host_core_projection(step: &FlashStep<'_>, core: &[f32]) -> serde_json::Value
     project_q6_f32(
         &step.ctx,
         &step.stream,
-        NativeProjection {
+        NativeRow {
             weight,
             input: x,
             output: y,
-            scratch,
         },
     )
     .unwrap();

@@ -1,7 +1,10 @@
 //! Test-only matched-input DeltaNet projections; no recurrent state or full model execution.
 use super::*;
 use crate::{
-    family::qwen::flash_next::cuda::step::{NativeProjection, project_q6_f16, project_q6_f32},
+    family::{
+        qwen::flash_next::cuda::step::{project_q6_f16, project_q6_f32},
+        step::rows::NativeRow,
+    },
     kernels::cuda::{
         DeviceBuffer,
         resident::{
@@ -91,11 +94,10 @@ fn q6_results(
     let mut alternatives = Vec::new();
     for f16 in [true, false] {
         out.write_at(&step.stream, 0, &poison).unwrap();
-        let call = NativeProjection {
+        let call = NativeRow {
             weight,
             input: x,
             output: y,
-            scratch,
         };
         if f16 {
             project_q6_f16(&step.ctx, &step.stream, call).unwrap();
@@ -112,11 +114,10 @@ fn q6_results(
     );
     assert!(q8_output.iter().any(|v| *v != 0.0));
     let run = |mode| {
-        let call = NativeProjection {
+        let call = NativeRow {
             weight,
             input: x,
             output: y,
-            scratch,
         };
         match mode {
             "q8" => step.project(name, x, y, 1).unwrap(),

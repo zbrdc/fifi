@@ -70,9 +70,10 @@ use crate::{
             moe::context_budget::KvFormat,
             step::{GgufDecodePrecision, ModelShape},
         },
+        step::rows::NativeRow,
     },
     kernels::cuda::{
-        CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight,
+        CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
         prefill::gdn_scan_seq::GdnForm,
         resident::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape},
@@ -80,7 +81,6 @@ use crate::{
             hyper::{
                 HyperApplyCall, HyperDtype, HyperReadCall, HyperScratch, HyperShape, HyperWeights,
             },
-            matvec_gguf_f32::DenseF32Call,
             matvec_q::MatvecCall,
             quantize_q8_1::{QuantizeCall, q8_1_bytes},
             step_params::{OFFSET_POS, OFFSET_STATUS},
@@ -95,72 +95,13 @@ pub(super) fn refuse(detail: String) -> EngError {
     EngError::BadRequest(format!("Flash-Next step: {detail}"))
 }
 
-/// One staged native GGUF decode projection with caller-owned, stream-ordered scratch.
-pub(super) struct NativeProjection<'a> {
-    pub(super) weight: &'a NativeWeight,
-    pub(super) input: DeviceRange<'a>,
-    pub(super) output: DeviceRange<'a>,
-    pub(super) scratch: DeviceRange<'a>,
-}
-
-pub(super) fn project_native(
-    ctx: &CudaContext,
-    stream: &DeviceStream,
-    call: NativeProjection<'_>,
-) -> Result<(), EngError> {
-    if call.weight.experts().is_some() {
-        return Err(refuse(
-            "native projection requires a matrix, not an expert stack".into(),
-        ));
-    }
-    ctx.validate_native_projection(call.weight, call.input, call.scratch, call.output)?;
-    ctx.quantize_q8_1(
-        stream,
-        QuantizeCall {
-            x: call.input,
-            y: call.scratch,
-            k: call.weight.k(),
-            ncols: 1,
-        },
-    )?;
-    ctx.matvec_native(stream, call.weight, call.scratch, call.output, 1)
-}
-
-/// One exact native GGUF decode projection ([`GgufDecodePrecision::Exact`]): the f32 activation
-/// against the exactly decoded weights of any type the window decoders serve. No scratch.
-pub(super) fn project_exact(
-    ctx: &CudaContext,
-    stream: &DeviceStream,
-    weight: &NativeWeight,
-    input: DeviceRange<'_>,
-    output: DeviceRange<'_>,
-) -> Result<(), EngError> {
-    if weight.experts().is_some() {
-        return Err(refuse(
-            "exact projection requires a matrix, not an expert stack".into(),
-        ));
-    }
-    ctx.matvec_gguf_f32(
-        stream,
-        DenseF32Call {
-            ty: weight.quant(),
-            w: weight.buffer().range(0, weight.buffer().bytes())?,
-            x: input,
-            y: output,
-            k: weight.k(),
-            rows: weight.n_rows(),
-            ncols: 1,
-        },
-    )
-}
-
 /// Test-only experiment: retain the native Q6_K weights and use the existing dequantizing
 /// tensor-core GEMM, which rounds activations and decoded weights to FP16 rather than Q8_1.
 #[cfg(test)]
 pub(super) fn project_q6_f16(
     ctx: &CudaContext,
     stream: &DeviceStream,
-    call: NativeProjection<'_>,
+    call: NativeRow<'_>,
 ) -> Result<(), EngError> {
     use crate::kernels::cuda::{prefill::gemm_dq::GemmDqTypedCall, resident::matvec_q::QuantType};
     if call.weight.quant() != QuantType::Q6K || call.weight.experts().is_some() {
@@ -193,7 +134,7 @@ pub(super) fn project_q6_f16(
 pub(super) fn project_q6_f32(
     ctx: &CudaContext,
     stream: &DeviceStream,
-    call: NativeProjection<'_>,
+    call: NativeRow<'_>,
 ) -> Result<(), EngError> {
     use crate::kernels::cuda::resident::{matvec_q::QuantType, q6_f32::Q6F32Call};
     if call.weight.quant() != QuantType::Q6K || call.weight.experts().is_some() {
@@ -807,11 +748,10 @@ impl<'a> FlashStep<'a> {
                         "{prefix}: native projection supports decode only"
                     )));
                 }
-                let call = NativeProjection {
+                let call = NativeRow {
                     weight,
                     input: x,
                     output: out,
-                    scratch: self.slot(Slot::GgufDecodeQ8)?,
                 };
                 #[cfg(test)]
                 if (prefix.ends_with("linear_attn.in_proj_qkv")
@@ -876,10 +816,10 @@ impl<'a> FlashStep<'a> {
                     );
                 }
                 return match self.gguf_decode {
-                    GgufDecodePrecision::Q8 => project_native(&self.ctx, &self.stream, call),
-                    GgufDecodePrecision::Exact => {
-                        project_exact(&self.ctx, &self.stream, weight, x, out)
+                    GgufDecodePrecision::Q8 => {
+                        call.quantized(&self.ctx, &self.stream, self.slot(Slot::GgufDecodeQ8)?)
                     }
+                    GgufDecodePrecision::Exact => call.exact(&self.ctx, &self.stream),
                 };
             }
             None => return self.project_dense_pair(prefix, x, out, m),
@@ -1206,11 +1146,10 @@ impl<'a> FlashStep<'a> {
                 let output = Self::columns(row, *col, *n)?;
                 self.ctx
                     .validate_native_projection(weight, x, scratch, output)?;
-                calls.push(NativeProjection {
+                calls.push(NativeRow {
                     weight,
                     input: x,
                     output,
-                    scratch,
                 });
             }
             #[cfg(test)]
@@ -1246,13 +1185,7 @@ impl<'a> FlashStep<'a> {
             }
             if self.gguf_decode == GgufDecodePrecision::Exact {
                 for call in &calls {
-                    project_exact(
-                        &self.ctx,
-                        &self.stream,
-                        call.weight,
-                        call.input,
-                        call.output,
-                    )?;
+                    call.exact(&self.ctx, &self.stream)?;
                 }
                 return Ok(());
             }
@@ -1274,7 +1207,7 @@ impl<'a> FlashStep<'a> {
                 }
             } else {
                 for call in calls {
-                    project_native(&self.ctx, &self.stream, call)?;
+                    call.quantized(&self.ctx, &self.stream, scratch)?;
                 }
             }
             return Ok(());

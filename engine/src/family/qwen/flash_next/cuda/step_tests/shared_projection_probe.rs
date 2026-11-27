@@ -1,7 +1,7 @@
 //! Matched-input diagnostics for native GGUF shared-expert projections.
 use super::*;
 use crate::{
-    family::qwen::flash_next::cuda::step::{NativeProjection, project_native, project_q6_f32},
+    family::{qwen::flash_next::cuda::step::project_q6_f32, step::rows::NativeRow},
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, NativeWeight,
         prefill::gemm_dq::GemmDqTypedCall,
@@ -62,19 +62,12 @@ pub(super) fn projection(
             .collect::<Vec<_>>(),
     )
     .unwrap();
-    let native = || {
-        project_native(
-            ctx,
-            stream,
-            NativeProjection {
-                weight,
-                input: all(&x),
-                output: all(&y),
-                scratch: all(&q8),
-            },
-        )
-        .unwrap()
+    let row = NativeRow {
+        weight,
+        input: all(&x),
+        output: all(&y),
     };
+    let native = || row.quantized(ctx, stream, all(&q8)).unwrap();
     let f16 = || {
         ctx.gemm_dq_codebook(
             stream,
@@ -93,19 +86,7 @@ pub(super) fn projection(
         )
         .unwrap()
     };
-    let f32 = || {
-        project_q6_f32(
-            ctx,
-            stream,
-            NativeProjection {
-                weight,
-                input: all(&x),
-                output: all(&y),
-                scratch: all(&q8),
-            },
-        )
-        .unwrap()
-    };
+    let f32 = || project_q6_f32(ctx, stream, row).unwrap();
     native();
     let native_output = read_f32(stream, &y);
     let mut q8_bytes = vec![0; q8.bytes()];

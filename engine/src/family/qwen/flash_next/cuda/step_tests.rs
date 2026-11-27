@@ -1376,10 +1376,12 @@ fn gguf_head_loader_projects_logits() {
 #[test]
 #[ignore = "requires an admitted CUDA device"]
 fn native_decode_projection_uses_supplied_scratch() {
-    use super::step::{NativeProjection, project_native};
-    use crate::kernels::cuda::{
-        CudaContext, NativeWeight,
-        resident::{matvec_q::QuantType, quantize_q8_1::q8_1_bytes},
+    use crate::{
+        family::step::rows::NativeRow,
+        kernels::cuda::{
+            CudaContext, NativeWeight,
+            resident::{matvec_q::QuantType, quantize_q8_1::q8_1_bytes},
+        },
     };
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
@@ -1398,45 +1400,29 @@ fn native_decode_projection_uses_supplied_scratch() {
     let scratch = ctx.allocate(n).unwrap();
     let output = ctx.allocate(16).unwrap();
     scratch.write_at(&stream, 0, &vec![0x55; n]).unwrap();
+    let call = NativeRow {
+        weight: &weight,
+        input: input.range(0, 1024).unwrap(),
+        output: output.range(0, 16).unwrap(),
+    };
+    let q8 = scratch.range(0, n).unwrap();
     assert!(
-        project_native(
-            &ctx,
-            &stream,
-            NativeProjection {
-                weight: &weight,
-                input: input.range(0, 1024).unwrap(),
-                output: output.range(0, 16).unwrap(),
-                scratch: weight.buffer().range(0, n).unwrap(),
-            }
-        )
-        .is_err()
+        call.quantized(&ctx, &stream, weight.buffer().range(0, n).unwrap())
+            .is_err()
     );
-    assert!(
-        project_native(
-            &ctx,
-            &stream,
-            NativeProjection {
-                weight: &weight,
-                input: input.range(0, 1024).unwrap(),
-                output: output.range(0, 4).unwrap(),
-                scratch: scratch.range(0, n).unwrap(),
+    for bad_output in [
+        output.range(0, 4).unwrap(),
+        weight.buffer().range(blocks.len() - 16, 16).unwrap(),
+    ] {
+        assert!(
+            NativeRow {
+                output: bad_output,
+                ..call
             }
-        )
-        .is_err()
-    );
-    assert!(
-        project_native(
-            &ctx,
-            &stream,
-            NativeProjection {
-                weight: &weight,
-                input: input.range(0, 1024).unwrap(),
-                output: weight.buffer().range(blocks.len() - 16, 16).unwrap(),
-                scratch: scratch.range(0, n).unwrap(),
-            }
-        )
-        .is_err()
-    );
+            .quantized(&ctx, &stream, q8)
+            .is_err()
+        );
+    }
     let mut unchanged = vec![0; n];
     scratch.read_at(&stream, 0, &mut unchanged).unwrap();
     assert_eq!(unchanged, vec![0x55; n]);
@@ -1446,22 +1432,24 @@ fn native_decode_projection_uses_supplied_scratch() {
         .read_at(&stream, 0, &mut weight_after)
         .unwrap();
     assert_eq!(weight_after, blocks);
-    project_native(
-        &ctx,
-        &stream,
-        NativeProjection {
-            weight: &weight,
-            input: input.range(0, 1024).unwrap(),
-            output: output.range(0, 16).unwrap(),
-            scratch: scratch.range(0, n).unwrap(),
-        },
-    )
-    .unwrap();
+    // The opt-out uses the supplied scratch; the exact reference doesn't read or write it.
+    call.exact(&ctx, &stream).unwrap();
+    let mut expected = [0u8; 16];
+    output.read_at(&stream, 0, &mut expected).unwrap();
+    scratch.read_at(&stream, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, vec![0x55; n]);
+    call.quantized(&ctx, &stream, q8).unwrap();
     let mut got = [0u8; 16];
     output.read_at(&stream, 0, &mut got).unwrap();
-    for bytes in got.as_chunks::<4>().0 {
-        let value = f32::from_ne_bytes(*bytes);
-        assert!((value - 256.0).abs() < 0.5, "{value}");
+    scratch.read_at(&stream, 0, &mut unchanged).unwrap();
+    assert_ne!(unchanged, vec![0x55; n]);
+    for (got, expected) in got
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0)
+    {
+        assert!((f32::from_ne_bytes(*got) - f32::from_ne_bytes(*expected)).abs() < 0.5);
     }
     let weights = CudaWeights::from_weights(vec![CudaWeight::Native {
         name: "native".into(),
@@ -1469,22 +1457,6 @@ fn native_decode_projection_uses_supplied_scratch() {
     }])
     .unwrap();
     let config = include_bytes!("../../../../../tests/fixtures/qwen3_8_flash_next_config.json");
-    // Without the decode description a step has no decode slot: it projects on the q8_1 path
-    // of its own pack, which serves every step that is not a decode owner.
-    let plain = FlashStep::new(&ctx, &stream, &weights, config, 1, 1, 0..1).unwrap();
-    assert!(!plain.gguf_decode_step());
-    assert_eq!(
-        plain.gguf_decode_precision(),
-        crate::family::qwen::flash_next::step::GgufDecodePrecision::Q8
-    );
-    plain
-        .project(
-            "native",
-            input.range(0, 1024).unwrap(),
-            output.range(0, 16).unwrap(),
-            1,
-        )
-        .unwrap();
     let (model, kinds) = model_shape(config).unwrap();
     let admitted = super::gguf_decode_arena_bytes(&model, &kinds, 1, ctx.sm_count(), 256).unwrap();
     let step =
@@ -1499,10 +1471,8 @@ fn native_decode_projection_uses_supplied_scratch() {
     )
     .unwrap();
     output.read_at(&stream, 0, &mut got).unwrap();
-    for bytes in got.as_chunks::<4>().0 {
-        let value = f32::from_ne_bytes(*bytes);
-        assert!((value - 256.0).abs() < 0.5, "{value}");
-    }
+    assert_eq!(got, expected);
+    assert_eq!(got.as_chunks::<4>().0, &[256.0f32.to_ne_bytes(); 4]);
 }
 
 #[test]

@@ -78,8 +78,9 @@ pub(super) fn before(step: &FlashStep<'_>, reference: &Reference, position: usiz
 
 fn benchmark_projection(step: &FlashStep<'_>, name: &str, core: &DeviceBuffer, host: &[f32]) {
     use crate::{
-        family::qwen::flash_next::cuda::step::{
-            NativeProjection, project_native, project_q6_f16, project_q6_f32,
+        family::{
+            qwen::flash_next::cuda::step::{project_q6_f16, project_q6_f32},
+            step::rows::NativeRow,
         },
         kernels::cuda::resident::quantize_q8_1::q8_1_bytes,
     };
@@ -92,14 +93,15 @@ fn benchmark_projection(step: &FlashStep<'_>, name: &str, core: &DeviceBuffer, h
         .unwrap();
     let output = step.ctx.allocate(host.len() * 4).unwrap();
     let launch = |mode| {
-        let call = NativeProjection {
+        let call = NativeRow {
             weight,
             input: core.range(0, core.bytes()).unwrap(),
             output: output.range(0, output.bytes()).unwrap(),
-            scratch: q8.range(0, q8.bytes()).unwrap(),
         };
         match mode {
-            "q8" => project_native(&step.ctx, &step.stream, call).unwrap(),
+            "q8" => call
+                .quantized(&step.ctx, &step.stream, q8.range(0, q8.bytes()).unwrap())
+                .unwrap(),
             "f16" => project_q6_f16(&step.ctx, &step.stream, call).unwrap(),
             "f32" => project_q6_f32(&step.ctx, &step.stream, call).unwrap(),
             _ => unreachable!(),

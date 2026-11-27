@@ -14,9 +14,10 @@ use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::block_ops::{BlockOp, RowOutputs};
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
+use crate::kernels::cuda::resident::matvec_gguf_f32::DenseF32Call;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::pack_rows::{PackRowsCall, PackSegment};
-use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
+use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 
 /// Bytes of `rows` q8_1 rows of `width` values.
@@ -122,6 +123,68 @@ impl<'a> Rows<'a> {
         Self { q8, f32: Some(f32) }
     }
 }
+
+/// A single f32 activation row through a native GGUF matrix. The ranges can be slices of a
+/// step arena; neither route needs chunk buffers or a weight map.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeRow<'a> {
+    pub(crate) weight: &'a NativeWeight,
+    pub(crate) input: DeviceRange<'a>,
+    pub(crate) output: DeviceRange<'a>,
+}
+
+impl NativeRow<'_> {
+    fn require_matrix(&self) -> Result<(), EngError> {
+        if self.weight.experts().is_some() {
+            return Err(EngError::BadRequest(
+                "a native row projection requires a matrix, not an expert stack".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decode the weight's blocks by type and multiply them by the f32 row. No scratch.
+    pub(crate) fn exact(&self, ctx: &CudaContext, stream: &DeviceStream) -> Result<(), EngError> {
+        self.require_matrix()?;
+        let w = self.weight.buffer();
+        ctx.matvec_gguf_f32(
+            stream,
+            DenseF32Call {
+                ty: self.weight.quant(),
+                w: w.range(0, w.bytes())?,
+                x: self.input,
+                y: self.output,
+                k: self.weight.k(),
+                rows: self.weight.n_rows(),
+                ncols: 1,
+            },
+        )
+    }
+
+    /// Opt into q8_1 activation arithmetic. Check both launches before writing scratch.
+    pub(crate) fn quantized(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        scratch: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        self.require_matrix()?;
+        ctx.validate_native_projection(self.weight, self.input, scratch, self.output)?;
+        ctx.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: self.input,
+                y: scratch,
+                k: self.weight.k(),
+                ncols: 1,
+            },
+        )?;
+        ctx.matvec_native(stream, self.weight, scratch, self.output, 1)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod native_row_tests;
 
 /// What the projections of one step share. `family` names the model in refusals.
 #[derive(Clone, Copy)]

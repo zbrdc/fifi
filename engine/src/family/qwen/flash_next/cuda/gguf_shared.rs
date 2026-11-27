@@ -93,9 +93,10 @@ impl FlashStep<'_> {
         input: crate::kernels::cuda::DeviceRange<'_>,
         output: crate::kernels::cuda::DeviceRange<'_>,
     ) -> Result<(), EngError> {
-        use super::step::{NativeProjection, project_q6_f32};
-        use crate::kernels::cuda::{
-            prefill::gemm_dq::GemmDqTypedCall, resident::matvec_q::QuantType,
+        use super::step::project_q6_f32;
+        use crate::{
+            family::step::rows::NativeRow,
+            kernels::cuda::{prefill::gemm_dq::GemmDqTypedCall, resident::matvec_q::QuantType},
         };
         let Some(CudaWeight::Native { weight, .. }) = self.weights.get(name) else {
             return Err(refuse(format!("{name}: expected native shared projection")));
@@ -104,11 +105,10 @@ impl FlashStep<'_> {
             QuantType::Q6K => project_q6_f32(
                 &self.ctx,
                 &self.stream,
-                NativeProjection {
+                NativeRow {
                     weight,
                     input,
                     output,
-                    scratch: self.slot(Slot::GgufDecodeQ8)?,
                 },
             ),
             QuantType::Q80 => self.ctx.gemm_dq_codebook(
