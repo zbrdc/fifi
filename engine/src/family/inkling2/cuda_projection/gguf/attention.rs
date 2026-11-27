@@ -5,6 +5,7 @@
 //! invalidates every cursor. Rejection repairs only overwritten visible rows.
 
 use crate::family::inkling2::switches::Switch;
+use crate::kernels::cuda::set_pool::SetPool;
 use std::{cell::RefCell, collections::VecDeque, sync::Arc};
 
 use crate::{
@@ -112,6 +113,8 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     query_tiles: bool,
     state: RefCell<Runtime>,
     prefill: RefCell<Option<prefill::Workspace>>,
+    /// The device buffers of finished prompt convolutions, kept for the next visit's.
+    conv_pool: SetPool<prefill::ConvBuffers>,
     local_aux: RefCell<Option<local::AuxStore>>,
     resident: RefCell<Option<local::ResidentWorkspace>>,
     /// The MMQ GEMM state of prompt output projections.
@@ -281,6 +284,7 @@ impl Plan {
             stream,
             query_tiles: self.projected_rows.is_some() && prefill::query_tiles_enabled(context),
             prefill: RefCell::default(),
+            conv_pool: SetPool::new(prefill::CONV_POOL),
             local_aux: RefCell::default(),
             resident: RefCell::default(),
             tensor_core: RefCell::default(),

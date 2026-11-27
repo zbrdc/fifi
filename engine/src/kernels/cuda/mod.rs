@@ -66,6 +66,7 @@ pub(crate) mod peer_ring;
 pub(crate) mod plan;
 pub(crate) mod prefill;
 pub(crate) mod resident;
+pub(crate) mod set_pool;
 #[cfg(test)]
 mod testkit;
 

@@ -130,6 +130,16 @@ pub(super) struct OutputConvolution<'a> {
     pub read_convolved: bool,
 }
 
+/// The four buffers of a [`PrefillConv`]: raw rows after their history, convolved rows, weights
+/// and row status. Every visit of a prompt chunk convolves planes of the same shape, so a finished
+/// convolution hands its buffers to the next one instead of returning them to the allocator, whose
+/// return synchronizes the device, and the next admission skips its allocations and memory queries.
+pub(super) type ConvBuffers = [DeviceBuffer; 4];
+
+/// Shapes of convolution buffers a prompt keeps at once: an attention and an expert plane are open
+/// together, and a chunk of another size can follow.
+pub(super) const CONV_POOL: usize = 4;
+
 /// Owns the admitted whole visit. Adjacent raw tiles become convolution
 /// history by slicing the same buffer, with no intermediate copies.
 pub(in crate::family::inkling2) struct PrefillConv {
@@ -546,26 +556,12 @@ impl ResidentAttention {
         if weights.len() != taps || prior.iter().any(|row| row.len() != width) {
             return Err(bad("invalid CUDA prefill convolution weights or history"));
         }
-        let bytes = 4 * (2 * plane + past + taps + rows);
-        if (context.memory_info()?.free as u64).saturating_sub(bytes as u64) < DEVICE_HEADROOM {
+        let sizes = [4 * (plane + past), 4 * plane, 4 * taps, 4 * rows];
+        let Some([raw, convolved, kernel, status]) =
+            (self.conv_pool).take_or_allocate(context, sizes, DEVICE_HEADROOM)?
+        else {
             return Ok(None);
-        }
-        let buffers = (|| {
-            Ok::<_, EngError>([
-                context.allocate(4 * (plane + past))?,
-                context.allocate(4 * plane)?,
-                context.allocate(4 * taps)?,
-                context.allocate(4 * rows)?,
-            ])
-        })();
-        let [raw, convolved, kernel, status] = match buffers {
-            Ok(buffers) => buffers,
-            Err(EngError::MemoryPlan(_)) => return Ok(None),
-            Err(error) => return Err(error),
         };
-        if (context.memory_info()?.free as u64) < DEVICE_HEADROOM {
-            return Ok(None);
-        }
         let mut upload = vec![0; 4 * (past - initial * width)];
         for row in prior.iter().rev() {
             extend_words(&mut upload, row);
@@ -665,6 +661,9 @@ impl ResidentAttention {
         )
     }
 
+    /// The raw rows the next visit's convolution takes as history, newest first. The caller must
+    /// have synchronized every stream other than this one's that reads the visit's planes: the
+    /// buffers go back to the pool for the next admission.
     pub(in crate::family::inkling2) fn prefill_conv_tail(
         &self,
         conv: PrefillConv,
@@ -682,6 +681,9 @@ impl ResidentAttention {
             conv.stride,
             "non-finite CUDA prefill convolution history",
         )?;
+        // The read above drained this stream and the caller synchronized every other stream that
+        // read the planes, so no queued work still touches the buffers the next visit reuses.
+        (self.conv_pool).put([conv.raw, conv.convolved, conv.weights, conv.status]);
         Ok(rows.into_iter().rev().collect())
     }
 
