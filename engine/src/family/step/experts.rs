@@ -102,11 +102,7 @@ fn input<'a, 'q>(
         quant: RoutedQuant {
             ids,
             gather: per_slot,
-            packing: if per_slot {
-                MmqPacking::Vendor
-            } else {
-                MmqPacking::CpuReference
-            },
+            packing: MmqPacking::Rounded,
             cursor: Q8Cursor::default(),
         },
     }

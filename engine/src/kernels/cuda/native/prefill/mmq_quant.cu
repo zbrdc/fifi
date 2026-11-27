@@ -20,7 +20,10 @@
 
 namespace {
 
-// Q4_K reference codes use a signed scale per 256 values, repacked into DS4 groups.
+// Q4_K reference codes use a signed scale per 256 values, repacked into DS4 groups. The fine
+// form takes one such scale per 32 values. Both store, beside each scale, the scale times the
+// sum of the rounded codes, so the offset term of a K-quant weight reads the same rounded row
+// as its code term.
 struct Q8kMmqCall {
     const float *x;
     const int32_t *ids;
@@ -36,7 +39,7 @@ __device__ __forceinline__ bool prefer_q8k_max(float a, int ai, float b, int bi)
     return aa > ab || (aa == ab && ai < bi);
 }
 
-template <bool Scatter>
+template <bool Scatter, bool Fine>
 __global__ void q8k_mmq_kernel(Q8kMmqCall a) {
     const int lane = threadIdx.x;
     const int row = blockIdx.x;
@@ -66,13 +69,34 @@ __global__ void q8k_mmq_kernel(Q8kMmqCall a) {
         }
     }
     maximum = __shfl_sync(0xffffffff, maximum, 0);
-    const float inverse = maximum == 0.0f ? 0.0f : __fdiv_rn(-127.0f, maximum);
-    const float scale = maximum == 0.0f ? 0.0f : __fdiv_rn(1.0f, inverse);
-    const float stored_scale = __half2float(__float2half_rn(scale));
+    float inverses[8], stored_scales[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float group_max = maximum;
+        if (Fine) {
+            // The largest magnitude of this group of 32, the first on a tie.
+            group_max = values[j];
+            int group_first = lane;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                const float other = __shfl_down_sync(0xffffffff, group_max, offset);
+                const int index = __shfl_down_sync(0xffffffff, group_first, offset);
+                if (lane + offset < 32 && prefer_q8k_max(other, index, group_max, group_first)) {
+                    group_max = other;
+                    group_first = index;
+                }
+            }
+            group_max = __shfl_sync(0xffffffff, group_max, 0);
+        }
+        inverses[j] = group_max == 0.0f ? 0.0f : __fdiv_rn(-127.0f, group_max);
+        const float scale = group_max == 0.0f ? 0.0f : __fdiv_rn(1.0f, inverses[j]);
+        stored_scales[j] = __half2float(__float2half_rn(scale));
+    }
     const int copies = Scatter ? a.top_k : 1;
     const int columns = a.rows * copies;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
+        const float inverse = inverses[j], stored_scale = stored_scales[j];
         const int q = min(127, __float2int_rn(__fmul_rn(values[j], inverse)));
         int sum = q;
 #pragma unroll
@@ -88,10 +112,10 @@ __global__ void q8k_mmq_kernel(Q8kMmqCall a) {
     }
 }
 
-template <bool Scatter>
+template <bool Scatter, bool Fine>
 int launch_q8k_mmq(Q8kMmqCall a, void *stream, int *out_stage) {
     Failure failure;
-    q8k_mmq_kernel<Scatter><<<dim3(a.rows, a.k/256), 32, 0, (cudaStream_t)stream>>>(a);
+    q8k_mmq_kernel<Scatter, Fine><<<dim3(a.rows, a.k/256), 32, 0, (cudaStream_t)stream>>>(a);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
     return (int)failure.err;
@@ -148,6 +172,12 @@ long long k_read(int k) { return ((long long)k + kKGrid - 1) / kKGrid * kKGrid; 
 /* Only the types the glue serves reach the vendored switch: the list of prefill/mmq_types.h and
  * NVFP4, which the wrapper's MmqType names exactly, so no other int is ever cast to ggml_type.
  * Each one has a q8_1 ds layout (mmq.cuh:61-101), so the vendored default refusal stays dead. */
+/* The types whose product reads a stored sum beside each scale of a 256-value block (the DS4
+ * layout): the offset of Q4_K and Q5_K, the delta of IQ1_S. */
+bool takes_rounded_sums(int type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ1_S;
+}
+
 bool served_type(int type) {
     switch (type) {
 #define INFERENCE_CUDA_MMQ_SERVED(T, B) case T:
@@ -167,7 +197,7 @@ bool valid_quantize(const inference_cuda_mmq_quantize_args *a) {
     if (a->ids != NULL && !aligned_to(a->ids, 4)) return false;
     if (!aligned_to(a->x, 16) || !aligned_to(a->y, 16)) return false;
     if (!served_type(a->type) || !k_ok(a->type, a->k, a->row_stride)) return false;
-    if (a->packing != 0 && a->packing != 1) return false;
+    if (a->packing < 0 || a->packing > 2) return false;
     /* ids == NULL: the plain dense call, ncols = M. ids != NULL: the gathered down call,
      * ncols = ne_get_rows (the map's values are trusted device indices, guarded by the ids
      * builder). */
@@ -185,7 +215,7 @@ bool valid_scatter(const inference_cuda_mmq_quantize_scatter_args *a) {
     if (!aligned_to(a->x, 16) || !aligned_to(a->y, 16) || !aligned_to(a->ids_src1_inv, 4))
         return false;
     if (!served_type(a->type) || !k_ok(a->type, a->k, a->row_stride)) return false;
-    if (a->packing != 0 && a->packing != 1) return false;
+    if (a->packing < 0 || a->packing > 2) return false;
     if (a->m < 1 || a->m > kRowLimit || a->top_k < 1 || a->top_k > kTopKMax) return false;
     const long long nrows = (long long)a->m * a->top_k;
     if (nrows < 1 || nrows > kRowsMax) return false;
@@ -206,8 +236,13 @@ extern "C" int inference_cuda_mmq_quantize(const inference_cuda_mmq_quantize_arg
         if (!valid_quantize(a)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
+        if (a->packing == 2 && takes_rounded_sums(a->type)) {
+            return launch_q8k_mmq<false, true>({
+                (const float *)a->x, (const int32_t *)a->ids,
+                (block_q8_1_mmq *)a->y, a->k, a->row_stride, a->ncols, 1}, stream, out_stage);
+        }
         if (a->packing == 1 && a->type == 12) {
-            return launch_q8k_mmq<false >({
+            return launch_q8k_mmq<false, false>({
                 (const float *)a->x, (const int32_t *)a->ids,
                 (block_q8_1_mmq *)a->y, a->k, a->row_stride, a->ncols, 1}, stream, out_stage);
         }
@@ -232,8 +267,13 @@ extern "C" int inference_cuda_mmq_quantize_scatter(
         if (!valid_scatter(a)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
+        if (a->packing == 2 && takes_rounded_sums(a->type)) {
+            return launch_q8k_mmq<true, true>({
+                (const float *)a->x, (const int32_t *)a->ids_src1_inv,
+                (block_q8_1_mmq *)a->y, a->k, a->row_stride, a->m, a->top_k}, stream, out_stage);
+        }
         if (a->packing == 1 && a->type == 12) {
-            return launch_q8k_mmq<true >({
+            return launch_q8k_mmq<true, false>({
                 (const float *)a->x, (const int32_t *)a->ids_src1_inv,
                 (block_q8_1_mmq *)a->y, a->k, a->row_stride, a->m, a->top_k}, stream, out_stage);
         }

@@ -291,7 +291,11 @@ impl<'a> StepIo<'a> {
             .dst
             .buffer()
             .range(out.dst.offset() + out.col_off * 4, span)?;
-        if self.exact
+        #[cfg(test)]
+        let exact = self.exact || exact_class::holds(weight);
+        #[cfg(not(test))]
+        let exact = self.exact;
+        if exact
             && matches!(weight.quant(), QuantType::Q4K | QuantType::Q6K)
             && let Some(f32_rows) = x.f32
         {
@@ -330,7 +334,9 @@ impl<'a> StepIo<'a> {
             self.ctx.mmq_dense_input(
                 self.stream,
                 MmqDenseInputCall {
-                    packing: MmqPacking::CpuReference,
+                    // A scale per 32 values and the sum of the rounded codes: the product
+                    // then reads what the one-row matvec reads.
+                    packing: MmqPacking::Rounded,
                     weight,
                     m: n,
                     row_stride: k,
@@ -452,5 +458,24 @@ impl<'a> StepIo<'a> {
                 f32: out.f32.map(|b| b.range(0, n * width * 4)).transpose()?,
             },
         )?)
+    }
+}
+
+/// A test's switch: the weights of one shape and type take the decoding routes while every
+/// other weight stays on its own, so an anatomy test can find which products carry an error.
+#[cfg(test)]
+pub(crate) mod exact_class {
+    use super::{NativeWeight, QuantType};
+    use std::sync::Mutex;
+
+    static CLASS: Mutex<Option<(usize, usize, QuantType)>> = Mutex::new(None);
+
+    /// Sets the class as `(rows, k, type)`, or clears it.
+    pub(crate) fn set(class: Option<(usize, usize, QuantType)>) {
+        *CLASS.lock().unwrap() = class;
+    }
+
+    pub(super) fn holds(weight: &NativeWeight) -> bool {
+        *CLASS.lock().unwrap() == Some((weight.n_rows(), weight.k(), weight.quant()))
     }
 }

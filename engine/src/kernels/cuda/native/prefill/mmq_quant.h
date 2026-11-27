@@ -51,7 +51,7 @@ typedef struct inference_cuda_mmq_quantize_args {
     int k;           /* values per row quantized: 256..=32768, a multiple of the type's block */
     int row_stride;  /* floats per source row: multiple of 4, k..=2^30 */
     int ncols;       /* output columns: 1..=4096 (ids == NULL), 1..=32768 (ids != NULL) */
-    int packing;     /* 0: vendor, 1: CPU-reference Q8_0/Q4_K packing */
+    int packing;     /* 0: vendor, 1: CPU-reference Q8_0/Q4_K, 2: rounded sums */
 } inference_cuda_mmq_quantize_args;
 
 /* The scatter call: m source rows, m*top_k compact output columns. */
@@ -64,7 +64,7 @@ typedef struct inference_cuda_mmq_quantize_scatter_args {
     int row_stride;             /* floats per source row: multiple of 4, k..=2^30 */
     int m;                      /* source rows (tokens): 1..=4096 */
     int top_k;                  /* compact rows per token: 1..=32, m*top_k <= 32768 */
-    int packing;                /* 0: vendor, 1: CPU-reference Q8_0/Q4_K packing */
+    int packing;                /* 0: vendor, 1: CPU-reference Q8_0/Q4_K, 2: rounded sums */
 } inference_cuda_mmq_quantize_scatter_args;
 
 /* Queues the gather/plain quantize on stream. Returns INFERENCE_CUDA_OK, an argument

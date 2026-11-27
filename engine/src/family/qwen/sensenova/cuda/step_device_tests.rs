@@ -1916,6 +1916,7 @@ fn card_products(
     fixup: &DeviceBuffer,
     weight: &NativeWeight,
     row: &CardQ8,
+    packing: MmqPacking,
 ) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
     let stream = ctx.stream().unwrap();
     let (k, rows) = (weight.k(), weight.n_rows());
@@ -1938,7 +1939,7 @@ fn card_products(
     ctx.mmq_dense_input(
         &stream,
         MmqDenseInputCall {
-            packing: MmqPacking::CpuReference,
+            packing,
             weight,
             m: 1,
             row_stride: k,
@@ -1971,6 +1972,192 @@ fn card_products(
     )
 }
 
+/// Anatomy, not a gate: which products carry the batched route's error. From one carried state
+/// (16 tokens on the decoding routes) a 16-row chunk runs quantized with the weights of one
+/// shape and type on the decoding routes, one class per run. Prints the relative error of
+/// row 0 of the last residual against the all-exact chunk, and the mean over the visits.
+#[test]
+fn card_reports_which_products_carry_the_batched_error() {
+    use crate::family::step::rows::exact_class;
+    const PREFIX: usize = 16;
+    const CHUNK: usize = 16;
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova class anatomy") else {
+        return;
+    };
+    let shape = *weights.shape();
+    let vocab = shape.vocab as u32;
+    let ids: Vec<u32> = (1..=(PREFIX + CHUNK) as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab)
+        .collect();
+    let mut carried = |exact_after: bool, rows: usize| -> Vec<Vec<f32>> {
+        let mut card = open_card(&ctx, &loaded, &weights, PREFIX + CHUNK + 1);
+        card.set_exact(true);
+        for (pos, &token) in ids[..PREFIX].iter().enumerate() {
+            let row = projector.rows(weights.token_embd(), &[token]).unwrap();
+            card.prefill(&row, pos).unwrap();
+        }
+        card.stream().synchronize().unwrap();
+        card.set_exact(exact_after);
+        let embed = projector
+            .rows(weights.token_embd(), &ids[PREFIX..PREFIX + rows])
+            .unwrap();
+        let mut trace = Vec::new();
+        card.chunk_traced(&embed, PREFIX, &mut trace).unwrap();
+        card.stream().synchronize().unwrap();
+        trace
+    };
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let rel = |a: &[f32], b: &[f32]| {
+        let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+        norm(&diff) / norm(b).max(1e-30)
+    };
+    let reference = carried(true, CHUNK);
+    let (h, ff) = (shape.hidden, shape.feed_forward);
+    let (q, kv) = (
+        shape.heads_q * 2 * shape.head_dim,
+        shape.heads_kv * shape.head_dim,
+    );
+    let classes = [
+        ("none (all quantized)", None),
+        ("delta inputs", Some((shape.qkvz_dim(), h, QuantType::Q6K))),
+        (
+            "delta logits",
+            Some((2 * shape.delta_value_heads, h, QuantType::Q4K)),
+        ),
+        (
+            "delta out, attention out",
+            Some((h, shape.delta_inner(), QuantType::Q4K)),
+        ),
+        ("feed-forward gate, up", Some((ff, h, QuantType::Q4K))),
+        ("feed-forward down", Some((h, ff, QuantType::Q6K))),
+        ("attention q", Some((q, h, QuantType::Q4K))),
+        ("attention k", Some((kv, h, QuantType::Q4K))),
+        ("attention v", Some((kv, h, QuantType::Q6K))),
+    ];
+    eprintln!("class made exact             last-resid   mean-resid   mean-mixer");
+    for (label, class) in classes {
+        exact_class::set(class);
+        let trace = carried(false, CHUNK);
+        exact_class::set(None);
+        let errors: Vec<f64> = trace
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| rel(a, b))
+            .collect();
+        let mean = |odd: usize| {
+            let picked: Vec<f64> = errors.iter().skip(odd).step_by(2).copied().collect();
+            picked.iter().sum::<f64>() / picked.len() as f64
+        };
+        eprintln!(
+            "{label:<27}  {:>10.3e}  {:>10.3e}  {:>10.3e}",
+            errors[errors.len() - 1],
+            mean(1),
+            mean(0)
+        );
+    }
+}
+
+/// Anatomy, not a gate: one product at a time on real rows, no CPU step. The normed embedding
+/// rows of a few tokens go through the projections of block 0 four ways: every weight decoded
+/// over the f32 row (the reference), the one-row matvec over the q8_1 row, and the batched
+/// product over each of its two activation packings. Prints each route's relative L2 error.
+#[test]
+fn card_reports_the_error_of_each_product_route() {
+    let Some((ctx, loaded, weights, mut projector)) = open_rig("sensenova product anatomy") else {
+        return;
+    };
+    let shape = *weights.shape();
+    let vocab = shape.vocab as u32;
+    let fixup_bytes = 4 * fixup_floats_max(ctx.sm_count() as usize).unwrap();
+    let fixup = ctx.upload(&vec![0u8; fixup_bytes]).unwrap();
+    let norm =
+        crate::family::step::rows::raw(&loaded, "sensenova", "blk.0.attn_norm.weight").unwrap();
+    let norm_of = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let rel = |a: &[f32], b: &[f32]| {
+        let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+        norm_of(&diff) / norm_of(b).max(1e-30)
+    };
+    eprintln!(
+        "weight            type   matvec-q8_1  batched-256  batched-32  rounded-32 | rows: q8_1  pack-256  pack-32  rounded-32"
+    );
+    for name in [
+        "attn_qkv_gate",
+        "ssm_beta_alpha",
+        "ssm_out",
+        "ffn_gate",
+        "ffn_up",
+    ] {
+        let weight = crate::family::step::rows::native(
+            &loaded,
+            "sensenova",
+            &format!("blk.0.{name}.weight"),
+        )
+        .unwrap();
+        let mut sums = [0f64; 8];
+        const TOKENS: u32 = 8;
+        for i in 1..=TOKENS {
+            let token = (i.wrapping_mul(2_654_435_761) >> 7) % vocab;
+            let embed = projector.rows(weights.token_embd(), &[token]).unwrap();
+            let row = card_q8_row(&ctx, &embed, norm, shape.eps);
+            let stream = ctx.stream().unwrap();
+            let (x, y) = (
+                ctx.upload(&le_f32(&row.normed)).unwrap(),
+                ctx.upload(&vec![0u8; 4 * weight.n_rows()]).unwrap(),
+            );
+            ctx.matvec_dq_native(
+                &stream,
+                weight,
+                floats(&x, 0, weight.k()).unwrap(),
+                floats(&y, 0, weight.n_rows()).unwrap(),
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let exact = download_f32(&ctx, &y).unwrap();
+            let (matvec, wide, wide_pack) =
+                card_products(&ctx, &fixup, weight, &row, MmqPacking::CpuReference);
+            let (_, narrow, narrow_pack) =
+                card_products(&ctx, &fixup, weight, &row, MmqPacking::Vendor);
+            // The rows each product read, as floats, against the f32 row.
+            let q6 = matches!(weight.quant(), QuantType::Q6K);
+            let k = weight.k();
+            let read = [
+                dequant_q8_1(&row.bytes, k),
+                dequant_mmq(&wide_pack, k, 1, q6).remove(0),
+                dequant_mmq(&narrow_pack, k, 1, q6).remove(0),
+            ];
+            let (_, rounded, rounded_pack) =
+                card_products(&ctx, &fixup, weight, &row, MmqPacking::Rounded);
+            let rounded_read = dequant_mmq(&rounded_pack, k, 1, q6).remove(0);
+            let errors = [
+                rel(&matvec, &exact),
+                rel(&wide, &exact),
+                rel(&narrow, &exact),
+                rel(&rounded, &exact),
+                rel(&read[0], &row.normed),
+                rel(&read[1], &row.normed),
+                rel(&read[2], &row.normed),
+                rel(&rounded_read, &row.normed),
+            ];
+            for (sum, error) in sums.iter_mut().zip(errors) {
+                *sum += error;
+            }
+        }
+        let mean = sums.map(|s| s / f64::from(TOKENS));
+        eprintln!(
+            "{name:<16}  {:?}  {:>10.3e}  {:>10.3e}  {:>10.3e}  {:>10.3e} | {:>9.3e} {:>9.3e} {:>9.3e} {:>9.3e}",
+            weight.quant(),
+            mean[0],
+            mean[1],
+            mean[2],
+            mean[3],
+            mean[4],
+            mean[5],
+            mean[6],
+            mean[7]
+        );
+    }
+}
+
 /// The card's quantize, matvec and MMQ on the rows the position probe saved: each kernel
 /// against the CPU product over the bytes that kernel itself wrote, which needs no model of
 /// the quantizer, and the step each takes from the f32 row. Then the head from the saved final
@@ -1994,7 +2181,8 @@ fn card_projection_kernels_over_their_own_q8_1_bytes() {
     let fixup_bytes = 4 * fixup_floats_max(ctx.sm_count() as usize).unwrap();
     let fixup = ctx.upload(&vec![0u8; fixup_bytes]).unwrap();
     let mut replay = |label: &str, cpu_weight: &GgufMatrix, weight: &NativeWeight, row: &CardQ8| {
-        let (y_card, y_mmq, pack) = card_products(&ctx, &fixup, weight, row);
+        let (y_card, y_mmq, pack) =
+            card_products(&ctx, &fixup, weight, row, MmqPacking::CpuReference);
         let dq = dequant_q8_1(&row.bytes, weight.k());
         let q6 = matches!(weight.quant(), QuantType::Q6K);
         let pack_dq = dequant_mmq(&pack, weight.k(), 1, q6).remove(0);

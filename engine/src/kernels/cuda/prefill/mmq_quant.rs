@@ -222,6 +222,10 @@ pub(crate) enum MmqPacking {
     Vendor = 0,
     /// Reference-compatible Q8_0 and Q4_K packing. Other types retain vendor packing.
     CpuReference = 1,
+    /// For Q4_K, Q5_K and IQ1_S, one scale per 32 values with the stored sum taken from the
+    /// rounded codes, so the weight's offset term and its code term read the same rounded row.
+    /// Other types retain vendor packing.
+    Rounded = 2,
 }
 
 /// One (optionally gathered) quantize call: `ncols` output columns over `ncols` source
