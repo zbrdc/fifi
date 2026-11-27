@@ -1,0 +1,27 @@
+diff --git a/src/ops.cu b/src/ops.cu
+--- a/src/ops.cu
++++ b/src/ops.cu
+@@ -218,7 +218,8 @@
+   int half = a.n_rot / 2;
+   if (d < a.n_rot) {
+     int i = d % half;
+-    float theta = pos * powf(a.rope_base, -2.f * i / a.n_rot), sn, cs;
++    float freq = a.inv_freq ? a.inv_freq[i] : powf(a.rope_base, -2.f * i / a.n_rot);
++    float theta = pos * freq, sn, cs;
+     sincosf(theta, &sn, &cs);
+     out = d < half ? x[d] * cs - x[d + half] * sn : x[d - half] * sn + x[d] * cs;
+   }
+diff --git a/src/ops.h b/src/ops.h
+--- a/src/ops.h
++++ b/src/ops.h
+@@ -104,6 +104,10 @@
+   // is then the plane cell count that bounds the pos word.
+   float* k_rows = nullptr;  // [m][n_kv_head][256] f32
+   float* v_rows = nullptr;
++  // Null, or the n_rot/2 inverse-frequency entries of a YaRN-scaled rope. When non-null the
++  // kernel reads inv_freq[i] instead of deriving theta from rope_base; the host owns the exact
++  // blend (SenseNova: YaRN factor 2.0 from a 262144 trained context).
++  const float* inv_freq = nullptr;  // [n_rot/2]
+ };
+ cudaError_t attn_prep(const AttnArgs& a, cudaStream_t stream = nullptr);
+ 

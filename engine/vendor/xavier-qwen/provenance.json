@@ -43,12 +43,12 @@
     "src/ops.cu": {
       "restored_from": "src/kernels.cu",
       "vendored_sha256": "e514e857b4d0472a79d373157e49bc4d0bc62a86a4363a596d1d56eb32b76b1b",
-      "patched_sha256": "6bd2cb60b292432ec9c8c3eaa75776d26238fab143604b26fec50be4c9f3bb59"
+      "patched_sha256": "ce665e0978de6e0a90942ecdc248f6d659c83485104a20f6cbe2195e3d40e88e"
     },
     "src/ops.h": {
       "restored_from": "src/kernels.h",
       "vendored_sha256": "fc9fae28d1156632ab102c4b4b6d679cbb0f55eadfc27311738355f6cecf5f44",
-      "patched_sha256": "6a9557d8d432fba86982c2894077ca68d93569e758f2a80cc3fd49a5618ad7ae"
+      "patched_sha256": "d8dbbad576003911ba868e474392745d6204994a1c08c50abf2fda2c03b85460"
     },
     "src/frag_layout.cuh": {
       "patched_sha256": "b566a419e9896c30251116d6ff6613680f8cf9eff304cbddd81e9d14c86fd1bc"
@@ -247,9 +247,24 @@
           "after_sha256": "6a9557d8d432fba86982c2894077ca68d93569e758f2a80cc3fd49a5618ad7ae"
         }
       }
+    },
+    {
+      "id": "YARN-freq-table",
+      "description": "attn_prep takes an optional YaRN frequency table (45c42184b): AttnArgs gains inv_freq, null or the n_rot/2 inverse-frequency entries of a YaRN-scaled rope, and attn_prep_k reads inv_freq[i] when it is non-null instead of deriving theta from rope_base. The commit did not update this record; this patch records the disk's bytes and changes nothing.",
+      "diff": "patches/YARN-freq-table.patch",
+      "files": {
+        "src/ops.cu": {
+          "before_sha256": "6bd2cb60b292432ec9c8c3eaa75776d26238fab143604b26fec50be4c9f3bb59",
+          "after_sha256": "ce665e0978de6e0a90942ecdc248f6d659c83485104a20f6cbe2195e3d40e88e"
+        },
+        "src/ops.h": {
+          "before_sha256": "6a9557d8d432fba86982c2894077ca68d93569e758f2a80cc3fd49a5618ad7ae",
+          "after_sha256": "d8dbbad576003911ba868e474392745d6204994a1c08c50abf2fda2c03b85460"
+        }
+      }
     }
   ],
-  "note": "Import commit 80fdb5b is byte-identical to upstream; trim commit cea80ef is whole-function only; the exit-path patch (52ae269) and the alignment fix (884020c) are their own commits. vendored_sha256 is the trimmed file. patched_sha256 is the file after the last entry of patches, in order: exit-paths-and-alignment, then RD-0-explicit-stream, then RD-0b-expert-index (their diffs are stored in patches/). RD-0b-expert-index is the third entry: it appends the device-indexed expert entry (patched_sha256 of kernels.cu, kernels.h and mma884.cuh is the file after it; gemm.cuh, repack.cu and repack.h are not in that entry). RD-4V (2026-10-10) restores the functions listed under \"restored\" into src/ops.cu and src/ops.h; the line ranges taken unchanged from 2f9183c are listed there, and the RD-4V patches follow in \"patches\".",
+  "note": "Import commit 80fdb5b is byte-identical to upstream; trim commit cea80ef is whole-function only; the exit-path patch (52ae269) and the alignment fix (884020c) are their own commits. vendored_sha256 is the trimmed file. patched_sha256 is the file after the last entry of patches, in order: exit-paths-and-alignment, then RD-0-explicit-stream, then RD-0b-expert-index (their diffs are stored in patches/). RD-0b-expert-index is the third entry: it appends the device-indexed expert entry (patched_sha256 of kernels.cu, kernels.h and mma884.cuh is the file after it; gemm.cuh, repack.cu and repack.h are not in that entry). RD-4V (2026-10-10) restores the functions listed under \"restored\" into src/ops.cu and src/ops.h; the line ranges taken unchanged from 2f9183c are listed there, and the RD-4V patches follow in \"patches\". YARN-freq-table (2026-11-22, 45c42184b) records attn_prep taking an optional YaRN frequency table: AttnArgs gains inv_freq and attn_prep_k reads inv_freq[i] when it is non-null; that commit did not update this record, and patched_sha256 of src/ops.cu and src/ops.h is the file after it.",
   "trim": {
     "approval": "approved in review of the origin audit",
     "scope": "whole functions and declarations only; kept code is byte-identical to upstream",
