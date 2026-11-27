@@ -1398,22 +1398,24 @@ fn the_grouped_tile_hint_is_clamped_to_a_tiling_width() {
     // auto for 128 tokens x top_k 8 over 256 experts is four columns, which the chooser rounds to
     // its smallest tile (J=8).
     assert_eq!(hint_cols(1024, 256), 4);
-    // The clamp keeps the grouped launch off the stream-k configs, which start above 64.
-    assert_eq!(clamp_hint(4, 128), 4);
-    assert_eq!(clamp_hint(80, 128), GROUPED_TILE_MAX);
-    assert_eq!(clamp_hint(1, 128), 1);
-    assert_eq!(clamp_hint(0, 128), 1);
+    // The clamp keeps a Q4_K launch off the stream-k configs, which start above 64; the other
+    // types reach the widest tile.
+    let q4k = QuantType::Q4K;
+    assert_eq!(clamp_hint(4, 128, q4k), 4);
+    assert_eq!(clamp_hint(80, 128, q4k), GROUPED_TILE_MAX);
+    assert_eq!(clamp_hint(80, 128, QuantType::Iq4Nl), 80);
+    assert_eq!(clamp_hint(200, 512, QuantType::Iq4Nl), 128);
+    assert_eq!(clamp_hint(1, 128, q4k), 1);
+    assert_eq!(clamp_hint(0, 128, q4k), 1);
     // Never past the token count, and never below one column.
-    assert_eq!(clamp_hint(64, 32), 32);
-    assert_eq!(clamp_hint(i64::MAX, 1), 1);
+    assert_eq!(clamp_hint(64, 32, q4k), 32);
+    assert_eq!(clamp_hint(i64::MAX, 1, QuantType::Q6K), 1);
     assert_eq!(hint_cols(0, 0), 1);
     assert_eq!(hint_cols(usize::MAX, 1), i64::MAX);
 }
 
 #[test]
-fn the_tile_hint_reaches_q4_k_only() {
-    // Q6_K has no tiling row in the vendored table, so its launches stay stream-k; a narrower
-    // tile there would change the per-column reduction order without pg1b's guarantee.
+fn the_tile_hint_reaches_every_type() {
     let shape = |quant| MmidLaunchShape {
         ids: MmidShape {
             n_experts: 256,
@@ -1429,9 +1431,12 @@ fn the_tile_hint_reaches_q4_k_only() {
     set_hint_override(Some(Some(8)));
     let q4k = mmid_geometry(&shape(QuantType::Q4K));
     let q6k = mmid_geometry(&shape(QuantType::Q6K));
+    set_hint_override(Some(Some(100)));
+    let wide = [QuantType::Q4K, QuantType::Iq4Nl].map(|quant| mmid_geometry(&shape(quant)));
     set_hint_override(None);
     assert_eq!(q4k.ncols_opt, 8, "Q4_K follows the hint");
-    assert_eq!(q6k.ncols_opt, 128, "Q6_K keeps the whole-chunk tile");
+    assert_eq!(q6k.ncols_opt, 8, "Q6_K follows the hint");
+    assert_eq!(wide.map(|g| g.ncols_opt), [GROUPED_TILE_MAX, 100]);
 }
 
 /// Exercise the enlarged token and gathered-row bounds against two legacy-sized launches.

@@ -550,10 +550,10 @@ pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
 /// (`nchannels_x = nchannels_y = n_experts`, stride `s02` in weight blocks), `y` and `dst` carry
 /// the `m * top_k` compact columns, and the channel and sample strides of `y` and `dst` are 0
 /// (every grouped path zeroes those offsets, mmq.cuh:966-967, :1054-1055, :1143-1144).
-/// The widest tile the grouped launch may ask for. Above it the vendored Q4_K table has no tiling
-/// config, and under stream-k a column's reduction order follows its index inside the tile, which
-/// is the property pg1b pins.
+/// The widest tile a Q4_K grouped launch may ask for: above it the vendored Q4_K table has no
+/// tiling config. Every other type may ask for the widest tile the vendored tables have.
 const GROUPED_TILE_MAX: i64 = 64;
+const TILE_MAX: i64 = 128;
 
 fn hint_cols(ne: usize, experts: usize) -> i64 {
     let per = ne.div_ceil(experts.max(1)).max(1);
@@ -566,28 +566,32 @@ fn hint_cols(ne: usize, experts: usize) -> i64 {
 /// the launch grid still spans every token (`ncols_max`). With the whole chunk as the hint it picks
 /// the widest tile, so every expert computes a full tile although it owns a few columns; a block
 /// whose tile starts past its expert returns before it loads anything (`mmq.cuh`, `jt*J >= col_diff`).
-/// Aiming the hint at the average expert count rounds J down instead.
+/// Aiming the hint at the average expert count rounds J down instead, as upstream's grouped
+/// launch does: a 512-token prompt over 128 experts at top-8 asks for 32 columns.
 ///
-/// On by default: `INFERENCE_CUDA_MMID_COLS_HINT` unset or `auto` follows `hint_cols`; `off` or
-/// `0` disables it, and a positive number is used as given. The switch exists because the tile
-/// width changes the k tiling and therefore the accumulation grouping.
+/// The tile width sets the k tiling and, under stream-k, which k split a column's sum sees, so it
+/// sets the accumulation grouping: a column keeps its bits for a fixed tile configuration (the
+/// property pg1b pins), and a different width is a numerics change within rounding.
+///
+/// On by default for every type: `INFERENCE_CUDA_MMID_COLS_HINT` unset or `auto` follows
+/// `hint_cols`; `off` or `0` disables it, and a positive number is used as given.
 fn mmid_geometry(s: &MmidLaunchShape) -> MmidGeometry {
     let mut g = fill_mmid_args(s);
-    // The tiling rows of the vendored Q4_K tiling patch exist for Q4_K only. Every other type keeps
-    // its stream-k configs, and under stream-k a narrower tile changes the per-column reduction
-    // order without the tiling guarantee, so the hint must not reach those types.
-    if s.quant == QuantType::Q4K
-        && let Some(hint) = cols_hint(s)
-    {
-        g.ncols_opt = clamp_hint(hint, g.ncols_max);
+    if let Some(hint) = cols_hint(s) {
+        g.ncols_opt = clamp_hint(hint, g.ncols_max, s.quant);
     }
     g
 }
 
 /// The tile hint a grouped launch may use: the operator value, clamped to a width the vendored
-/// Q4_K table implements as tiling, and never past the token count.
-fn clamp_hint(hint: i64, ncols_max: i64) -> i64 {
-    hint.clamp(1, GROUPED_TILE_MAX.min(ncols_max.max(1)))
+/// table of `quant` implements (Q4_K's as tiling), and never past the token count.
+fn clamp_hint(hint: i64, ncols_max: i64, quant: QuantType) -> i64 {
+    let widest = if quant == QuantType::Q4K {
+        GROUPED_TILE_MAX
+    } else {
+        TILE_MAX
+    };
+    hint.clamp(1, widest.min(ncols_max.max(1)))
 }
 
 // A test-only override of the hint, so a device test can execute a chosen tile width. The
