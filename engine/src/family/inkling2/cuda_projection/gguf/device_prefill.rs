@@ -157,8 +157,9 @@ impl Layout {
         } else {
             None
         };
-        if shape.grouped_experts > 0 {
-            // F32 vector loads in GEMM require packed operands at 16-byte alignment.
+        if shape.grouped_experts > 0 || shape.mmq_experts > 0 {
+            // F32 vector loads in GEMM and the q8_1 gather of a tensor-core stage require packed
+            // operands at 16-byte alignment.
             let end = route.as_ref().map_or(weights.end, |spans| spans.logits.end);
             span((4 - end / 4 % 4) % 4, 1)?;
         }
@@ -1577,6 +1578,32 @@ mod tests {
             assert_eq!(retained.down.end + saved, original.down.end);
         }
         assert!(!admits_router_input(usize::MAX, 2, 0));
+    }
+
+    #[test]
+    fn tensor_core_only_expert_stacks_align_their_activation_planes() {
+        // Q4_K and Q6_K stacks take the tensor-core stage without the dequantizing grouped one.
+        for routed_experts in [0, 128] {
+            let shape = Geometry {
+                hidden: 2304,
+                middle: 1152,
+                rank: 8,
+                grouped_experts: 0,
+                routed_experts,
+                mmq_experts: 128,
+            };
+            for rows in [1, 2, 3, 7, 31, 255, 256, 511, 512] {
+                let layout = Layout::new(rows, shape).unwrap();
+                for plane in [
+                    &layout.output,
+                    &layout.gathered,
+                    &layout.gate,
+                    &layout.middle,
+                ] {
+                    assert_eq!(plane.start % 16, 0, "rows {rows}, routed {routed_experts}");
+                }
+            }
+        }
     }
 
     #[test]
