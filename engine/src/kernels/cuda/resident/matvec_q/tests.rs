@@ -14,7 +14,7 @@
 use super::{MatvecCall, QuantType, matvec_needs};
 use crate::EngError;
 use crate::kernels::cuda::native::resident::matvec_q;
-use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
+use crate::kernels::cuda::resident::matvec_expert::{ExpertKernel, ExpertMatvecCall};
 use crate::kernels::cuda::resident::quantize_q8_1::{MATRIX_ROW_PADDING, QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::testkit;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
@@ -1506,6 +1506,349 @@ pub(in crate::kernels::cuda) fn bench(
     ctx.bench_destroy(start).expect("destroy");
     ctx.bench_destroy(end).expect("destroy");
     warm * 1000.0 / iters as f32
+}
+
+/// The L2 flush of the cold column: a dense Q8_0 matvec over `FLUSH_ROWS` rows of the flush
+/// buffer, so the launch before a cold one is timed reads every byte of it.
+fn flush_rig<'a>(ctx: &'a CudaContext, stream: &'a DeviceStream) -> impl Fn() + 'a {
+    let w_bytes = QuantType::Q80
+        .weight_bytes(FLUSH_ROWS, FLUSH_K)
+        .expect("size");
+    let x_bytes = q8_1_bytes(FLUSH_K, 1).expect("size");
+    let (w, x_q8, y) = (
+        testkit::upload_filled(ctx, 0x5A, w_bytes),
+        testkit::upload_filled(ctx, 0x5A, x_bytes),
+        testkit::upload_filled(ctx, 0x5A, FLUSH_ROWS * 4),
+    );
+    move || {
+        ctx.matvec_q(
+            stream,
+            MatvecCall {
+                ty: QuantType::Q80,
+                w: w.range(0, w_bytes).expect("flush w"),
+                x_q8: x_q8.range(0, x_bytes).expect("flush x"),
+                y: y.range(0, FLUSH_ROWS * 4).expect("flush y"),
+                k: FLUSH_K,
+                rows: FLUSH_ROWS,
+                ncols: 1,
+            },
+        )
+        .expect("flush matvec");
+    }
+}
+
+/// The largest absolute gap between two outputs, and the same gap over the largest output.
+fn largest_gap(a: &[f32], b: &[f32]) -> (f32, f32) {
+    let peak = a.iter().chain(b).fold(0.0f32, |m, v| m.max(v.abs()));
+    let gap = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, |m, g| m.max(g));
+    (gap, gap / peak)
+}
+
+/// The rig of the window-against-vendored benches: the device, the flush before a cold
+/// launch, and the iteration counts of the warm and the cold column.
+struct AbRig<'a> {
+    ctx: &'a CudaContext,
+    stream: &'a DeviceStream,
+    flush: &'a dyn Fn(),
+    warm: usize,
+    cold: usize,
+}
+
+impl AbRig<'_> {
+    /// The warm time of one launch and the median of its cold launches, each timed alone
+    /// right after the flush.
+    fn times(&self, launch: &dyn Fn()) -> (f32, f32) {
+        let warm_us = bench(self.ctx, self.stream, self.warm, launch);
+        let mut cold = Vec::new();
+        for _ in 0..self.cold {
+            (self.flush)();
+            let start = self.ctx.bench_mark(self.stream).expect("start");
+            launch();
+            let end = self.ctx.bench_mark(self.stream).expect("end");
+            self.stream.synchronize().expect("drain");
+            cold.push(self.ctx.bench_elapsed_ms(start, end).expect("elapsed") * 1000.0);
+            self.ctx.bench_destroy(start).expect("destroy");
+            self.ctx.bench_destroy(end).expect("destroy");
+        }
+        cold.sort_by(|a, b| a.total_cmp(b));
+        (warm_us, cold[cold.len() / 2])
+    }
+
+    /// One row of the table: both routes timed on the same shape, the rate of the weight bytes
+    /// each reads, and the largest gap between their outputs. A wrong decode is off by a large
+    /// fraction; the 5 percent bound lets through the known Q5_0 rule difference (the vendored
+    /// kernel subtracts the stored half sum, about a third of a percent) and nothing much larger.
+    /// Returns the two cold times.
+    fn report(
+        &self,
+        label: &str,
+        bytes: usize,
+        outputs: (&DeviceBuffer, &DeviceBuffer, usize),
+        routes: (&dyn Fn(), &dyn Fn()),
+    ) -> (f32, f32) {
+        let (v_warm, v_cold) = self.times(routes.0);
+        let (w_warm, w_cold) = self.times(routes.1);
+        let (y_v, y_w, len) = outputs;
+        let a = read_f32(self.ctx, y_v, len);
+        let b = read_f32(self.ctx, y_w, len);
+        assert!(
+            a.iter().chain(&b).all(|v| !v.is_nan()),
+            "{label}: NaN output"
+        );
+        let (gap, rel) = largest_gap(&a, &b);
+        assert!(
+            rel < 0.05,
+            "{label}: the window sums are off the vendored ones by {gap} ({rel})"
+        );
+        let gbs = |us: f32| bytes as f64 / (us as f64 * 1e-6) / 1e9;
+        println!(
+            "{label:28} {:5} MB | {v_warm:9.2} {v_cold:9.2} | {w_warm:9.2} {w_cold:9.2} | {:5.2} | {:5.0} {:5.0} | {gap:9.3} {rel:8.1e}",
+            bytes / 1_000_000,
+            w_cold / v_cold,
+            gbs(v_cold),
+            gbs(w_cold)
+        );
+        (v_cold, w_cold)
+    }
+}
+
+/// The in-house window kernel against the vendored MMVQ on the dense shapes of the design
+/// table, one route after the other on the same buffers; on Q8_0 the in-house warp-per-row
+/// kernel of the invariant entry rides as a third route. An ignored bench: it needs an
+/// exclusive timing slot on the device.
+#[test]
+#[ignore = "bench: exclusive timing slot"]
+fn matvec_window_vs_vendored_dense_ab_bench() {
+    if !testkit::device_present("matvec_window_vs_vendored_dense_ab_bench") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let flush = flush_rig(&ctx, &stream);
+    let (warm, cold) = if cfg!(debug_assertions) {
+        (5, 3)
+    } else {
+        (200, 20)
+    };
+    let ab = AbRig {
+        ctx: &ctx,
+        stream: &stream,
+        flush: &flush,
+        warm,
+        cold,
+    };
+    println!(
+        "dense | vendored warm_us cold_us | window warm_us cold_us | cold window/vendored | GB/s cold vendored window | gap abs rel"
+    );
+    for ty in [
+        QuantType::Q4K,
+        QuantType::Q50,
+        QuantType::Q6K,
+        QuantType::Q80,
+    ] {
+        let mut shapes: Vec<(&str, usize, usize)> = vec![
+            ("qkv / attn_q", 2048, 8192),
+            ("attn_gate", 2048, 4096),
+            ("ssm_out / attn_output", 4096, 2048),
+            ("shared gate/up, attn k/v", 2048, 512),
+            ("shared down", 512, 2048),
+            ("alpha / beta", 2048, 32),
+        ];
+        if ty == QuantType::Q6K {
+            shapes.push(("lm_head", 2048, 248_320));
+        }
+        for (name, k, rows) in shapes {
+            let (w, x_q8, _) = rig(&ctx, &stream, ty, k, rows, 1, 0x7100_0000 + rows as u64);
+            let w_bytes = ty.weight_bytes(rows, k).expect("size");
+            let x_bytes = q8_1_bytes(k, 1).expect("size");
+            let y_bytes = rows * 4;
+            let (w_r, x_r) = (
+                w.range(0, w_bytes).expect("w"),
+                x_q8.range(0, x_bytes).expect("x"),
+            );
+            let (y_v, y_w) = (nan_filled(&ctx, y_bytes), nan_filled(&ctx, y_bytes));
+            let vendored = || {
+                ctx.matvec_q(
+                    &stream,
+                    MatvecCall {
+                        ty,
+                        w: w_r,
+                        x_q8: x_r,
+                        y: y_v.range(0, y_bytes).expect("y"),
+                        k,
+                        rows,
+                        ncols: 1,
+                    },
+                )
+                .expect("vendored matvec")
+            };
+            let window = || {
+                ctx.matvec_q_window(
+                    &stream,
+                    MatvecCall {
+                        ty,
+                        w: w_r,
+                        x_q8: x_r,
+                        y: y_w.range(0, y_bytes).expect("y"),
+                        k,
+                        rows,
+                        ncols: 1,
+                    },
+                    false,
+                )
+                .expect("window matvec")
+            };
+            let label = format!("{ty:?} {name}");
+            let (v_cold, _) =
+                ab.report(&label, w_bytes, (&y_v, &y_w, y_bytes), (&vendored, &window));
+            // The invariant entry serves Q8_0 from the in-house warp-per-row kernel, the
+            // pattern the removal plan builds the other types on: time it next to the two above.
+            if ty == QuantType::Q80 {
+                let y_p = nan_filled(&ctx, y_bytes);
+                let in_house = || {
+                    ctx.matvec_q_invariant(
+                        &stream,
+                        MatvecCall {
+                            ty,
+                            w: w_r,
+                            x_q8: x_r,
+                            y: y_p.range(0, y_bytes).expect("y"),
+                            k,
+                            rows,
+                            ncols: 1,
+                        },
+                    )
+                    .expect("in-house q80 matvec")
+                };
+                let (_, cold) = ab.times(&in_house);
+                let (gap, rel) = largest_gap(
+                    &read_f32(&ctx, &y_p, y_bytes),
+                    &read_f32(&ctx, &y_v, y_bytes),
+                );
+                println!(
+                    "{label:28} in-house q80 cold {cold:9.2} us, {:.0} GB/s, {:.2} of the vendored cold time, gap to vendored abs {gap:.3} rel {rel:.1e}",
+                    w_bytes as f64 / (cold as f64 * 1e-6) / 1e9,
+                    cold / v_cold
+                );
+            }
+        }
+    }
+}
+
+/// The same A/B on the two expert shapes, eight used experts of 256 a launch, through the
+/// entry that names the kernel. An ignored bench: it needs an exclusive timing slot.
+#[test]
+#[ignore = "bench: exclusive timing slot"]
+fn matvec_window_vs_vendored_expert_ab_bench() {
+    if !testkit::device_present("matvec_window_vs_vendored_expert_ab_bench") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let flush = flush_rig(&ctx, &stream);
+    let (warm, cold) = if cfg!(debug_assertions) {
+        (5, 3)
+    } else {
+        (200, 20)
+    };
+    let ab = AbRig {
+        ctx: &ctx,
+        stream: &stream,
+        flush: &flush,
+        warm,
+        cold,
+    };
+    let mut rng = testkit::Rng::new(0x7100_0002);
+    let (n_expert, n_used) = (256, 8);
+    println!(
+        "expert | vendored warm_us cold_us | window warm_us cold_us | cold window/vendored | GB/s cold vendored window | gap abs rel"
+    );
+    for ty in [QuantType::Q4K, QuantType::Q6K] {
+        for (name, k, rows) in [("experts gate/up", 2048, 512), ("experts down", 512, 2048)] {
+            let mut stack = Vec::new();
+            for _ in 0..n_expert {
+                stack.extend_from_slice(&reference::build_weight(ty, rows, k, &mut rng));
+            }
+            let stack_bytes = stack.len();
+            let stack = testkit::upload_bytes(&ctx, &stack);
+            let x_q8_bytes = q8_1_bytes(k, 1).expect("size");
+            let x: Vec<f32> = (0..k).map(|_| (rng.normal() as f32) * 0.05).collect();
+            let x_f32 = testkit::upload_f32(&ctx, &x);
+            let x_q8 = testkit::upload_filled(&ctx, 0xAA, x_q8_bytes);
+            ctx.quantize_q8_1(
+                &stream,
+                QuantizeCall {
+                    x: x_f32.range(0, k * 4).expect("x"),
+                    y: x_q8.range(0, x_q8_bytes).expect("y"),
+                    k,
+                    ncols: 1,
+                },
+            )
+            .expect("quantize");
+            let y_bytes = rows * n_used * 4;
+            let (y_v, y_w) = (nan_filled(&ctx, y_bytes), nan_filled(&ctx, y_bytes));
+            let ids: Vec<i32> = (0..n_used)
+                .map(|_| rng.below(n_expert as u64) as i32)
+                .collect();
+            let ids_buf = ids_buffer(&ctx, &ids);
+            let ids = ids_buf.range(0, n_used * 4).expect("ids");
+            let vendored = || {
+                ctx.matvec_expert_on(
+                    &stream,
+                    ExpertMatvecCall {
+                        ty,
+                        w_stack: stack.range(0, stack_bytes).expect("stack"),
+                        ids,
+                        x_q8: x_q8.range(0, x_q8_bytes).expect("x"),
+                        x_per_slot: false,
+                        y: y_v.range(0, y_bytes).expect("y"),
+                        y_slot_stride: rows,
+                        k,
+                        rows,
+                        n_expert,
+                        n_used,
+                        glu_gate: None,
+                    },
+                    ExpertKernel::Vendored,
+                )
+                .expect("vendored expert matvec")
+            };
+            let window = || {
+                ctx.matvec_expert_on(
+                    &stream,
+                    ExpertMatvecCall {
+                        ty,
+                        w_stack: stack.range(0, stack_bytes).expect("stack"),
+                        ids,
+                        x_q8: x_q8.range(0, x_q8_bytes).expect("x"),
+                        x_per_slot: false,
+                        y: y_w.range(0, y_bytes).expect("y"),
+                        y_slot_stride: rows,
+                        k,
+                        rows,
+                        n_expert,
+                        n_used,
+                        glu_gate: None,
+                    },
+                    ExpertKernel::Window,
+                )
+                .expect("window expert matvec")
+            };
+            let label = format!("{ty:?} {name}");
+            // A launch reads the rows of its used experts, not the whole stack.
+            let read_bytes = ty.weight_bytes(rows * n_used, k).expect("size");
+            ab.report(
+                &label,
+                read_bytes,
+                (&y_v, &y_w, y_bytes),
+                (&vendored, &window),
+            );
+        }
+    }
 }
 
 #[test]

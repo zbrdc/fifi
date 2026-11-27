@@ -311,12 +311,47 @@ impl CudaContext {
         self.matvec_q_impl(stream, call, true)
     }
 
+    /// [`Self::matvec_q`] on the in-house window kernel, whatever the type's route. The
+    /// kernel decodes the codebook types and Q4_K, Q5_0, Q6_K and Q8_0, and accumulates with
+    /// `__dp4a` in another order, so its sums differ from the vendored kernel's in the last
+    /// bits.
+    /// shortcut: a type outside the codebook set still plans under the vendored rule of `rows`
+    /// as a multiple of 4, until the window kernel is chosen as its route.
+    pub(crate) fn matvec_q_window(
+        &self,
+        stream: &DeviceStream,
+        call: MatvecCall<'_>,
+        invariant: bool,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let raw = self.plan_matvec(&call, invariant)?;
+        let row_bytes = q8_1_bytes(call.k, 1).expect("checked in plan_matvec");
+        self.launch_on(stream, |stream_raw| {
+            matvec_gguf_launch(
+                stream_raw,
+                &MatvecGgufRaw {
+                    ty: call.ty,
+                    w: raw.w,
+                    x_q8: raw.x_q8,
+                    y: raw.y,
+                    k: raw.k,
+                    rows: raw.rows,
+                    ncols: raw.ncols,
+                },
+                row_bytes,
+            )
+        })
+    }
+
     fn matvec_q_impl(
         &self,
         stream: &DeviceStream,
         call: MatvecCall<'_>,
         invariant: bool,
     ) -> Result<(), EngError> {
+        if call.ty.is_codebook() {
+            return self.matvec_q_window(stream, call, invariant);
+        }
         self.ensure_usable()?;
         let raw = self.plan_matvec(&call, invariant)?;
         let row_bytes = q8_1_bytes(call.k, 1).expect("checked in plan_matvec");
@@ -350,21 +385,6 @@ impl CudaContext {
             QuantType::Q3K => matvec_q3k_launch(
                 stream_raw,
                 &crate::kernels::cuda::native::resident::matvec_q3k::MatvecQ3kRaw {
-                    w: raw.w,
-                    x_q8: raw.x_q8,
-                    y: raw.y,
-                    k: raw.k,
-                    rows: raw.rows,
-                    ncols: raw.ncols,
-                },
-                row_bytes,
-            ),
-            // The in-house codebook matvec: its own ABI, native blocks, whole rows, the
-            // type's lookup table passed to the kernel by value.
-            ty if ty.is_codebook() => matvec_gguf_launch(
-                stream_raw,
-                &MatvecGgufRaw {
-                    ty,
                     w: raw.w,
                     x_q8: raw.x_q8,
                     y: raw.y,
