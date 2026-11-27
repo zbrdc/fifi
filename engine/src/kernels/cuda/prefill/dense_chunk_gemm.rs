@@ -160,7 +160,7 @@ impl PlaneGemm {
                 ctx.mmq_dense_input(
                     stream,
                     MmqDenseInputCall {
-                        packing: MmqPacking::CpuReference,
+                        packing: MmqPacking::Rounded,
                         weight: &call.weight,
                         m,
                         row_stride: call.ld_x,

@@ -1434,7 +1434,7 @@ impl Scratch {
             &self.stream,
             &ids,
             MmidQuantCall {
-                packing: MmqPacking::Vendor,
+                packing: MmqPacking::Rounded,
                 quant: weight.quant,
                 k: weight.k,
                 row_stride: weight.k,
