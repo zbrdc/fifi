@@ -286,6 +286,31 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_memset_strided_async"]
+    fn memset_strided_async_raw(
+        destination: *mut c_void,
+        pitch: usize,
+        width: usize,
+        rows: usize,
+        value: c_int,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_copy_h2d_pinned_strided_async"]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the C declaration in abi_resident.h"
+    )]
+    fn copy_h2d_pinned_strided_async_raw(
+        device: *mut c_void,
+        dst_pitch: usize,
+        host: *const c_void,
+        src_pitch: usize,
+        width: usize,
+        rows: usize,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_pack_launch"]
     fn pack_launch_raw(
         x: *const f32,
@@ -649,6 +674,90 @@ pub(in crate::kernels::cuda) fn memset_async(
             dst.address(),
             dst.bytes,
             value as c_int,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The bytes a strided block of `[pitch, width, rows]` covers from its first byte: the
+/// segments may touch (pitch == width) but never overlap, and none may be empty.
+pub(in crate::kernels::cuda) fn strided_span([pitch, width, rows]: [usize; 3]) -> Option<usize> {
+    if width == 0 || rows == 0 || pitch < width {
+        return None;
+    }
+    pitch
+        .checked_mul(rows - 1)
+        .and_then(|span| span.checked_add(width))
+}
+
+/// Enqueues a device-side fill of `value` over the strided block of `dst`, which must cover
+/// exactly its span. The contract is [`memset_async`]'s.
+pub(in crate::kernels::cuda) fn memset_strided_async(
+    dst: RawRange<'_>,
+    block: [usize; 3],
+    value: u8,
+    stream: &RawStream,
+) -> Result<(), DeviceFailure> {
+    if strided_span(block) != Some(dst.bytes) {
+        return Err(invalid_argument());
+    }
+    let [pitch, width, rows] = block;
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `memset_async`: `RawRange::new` proved the range inside a live allocation,
+    // which stays valid until queued work finishes. No host memory is involved.
+    let status = unsafe {
+        memset_strided_async_raw(
+            dst.address(),
+            pitch,
+            width,
+            rows,
+            value as c_int,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// Queues the strided block of page-locked host memory at `host_offset` of `host`, `src_pitch`
+/// bytes between segments, into the strided block of `dst`, `dst_pitch` bytes between segments;
+/// `dst` covers exactly the segments' span. The contract is [`copy_h2d_async_at`]'s.
+pub(in crate::kernels::cuda) fn copy_h2d_async_at_strided(
+    dst: RawRange<'_>,
+    dst_pitch: usize,
+    host: &RawPinned,
+    host_offset: usize,
+    src_pitch: usize,
+    width: usize,
+    rows: usize,
+    stream: &RawStream,
+) -> Result<(), DeviceFailure> {
+    let fits = strided_span([src_pitch, width, rows])
+        .and_then(|span| host_offset.checked_add(span))
+        .is_some_and(|end| end <= host.bytes);
+    if !fits || strided_span([dst_pitch, width, rows]) != Some(dst.bytes) {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: both checked ranges stay alive until their synchronizing frees; the safe pinned
+    // owner orders all DMA on one stream and refuses host reads until a covering event completes.
+    let status = unsafe {
+        let src = host
+            .ptr
+            .as_ptr()
+            .cast::<u8>()
+            .add(host_offset)
+            .cast_const()
+            .cast::<c_void>();
+        copy_h2d_pinned_strided_async_raw(
+            dst.address(),
+            dst_pitch,
+            src,
+            src_pitch,
+            width,
+            rows,
             stream.0.as_ptr(),
             &mut stage,
         )

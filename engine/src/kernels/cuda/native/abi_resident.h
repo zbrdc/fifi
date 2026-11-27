@@ -73,6 +73,21 @@ int inference_cuda_copy_d2d_async(void *device_dst, const void *device_src, size
  * queued launch would. stream must not be NULL; bytes must not be 0. */
 int inference_cuda_memset_async(void *device_dst, size_t bytes, int value, void *stream,
                                 int *out_stage);
+/* Stream-ordered device-side fill of `rows` segments of `width` bytes, every `pitch`
+ * bytes from device_dst, with the low byte of `value`. Same contract as
+ * inference_cuda_memset_async; width and rows must not be 0 and pitch >= width. */
+int inference_cuda_memset_strided_async(void *device_dst, size_t pitch, size_t width, size_t rows,
+                                        int value, void *stream, int *out_stage);
+/* Stream-ordered copy of `rows` segments of `width` bytes from page-locked host
+ * memory (every src_pitch bytes from host_pinned) into device memory (every
+ * dst_pitch bytes from device). Launch-only, like a pinned
+ * inference_cuda_copy_h2d_async: the caller keeps the source live and unchanged
+ * until the stream completes the copy. width and rows must not be 0; the pitches
+ * are at least width. */
+int inference_cuda_copy_h2d_pinned_strided_async(void *device, size_t dst_pitch,
+                                                 const void *host_pinned, size_t src_pitch,
+                                                 size_t width, size_t rows, void *stream,
+                                                 int *out_stage);
 
 /* xf = fp16 pack of x [m][k] (kern::pack_f32), on stream. stream must not be
  * NULL: the entry never falls back to the default stream. x_dev and xf_dev are

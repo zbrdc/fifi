@@ -348,6 +348,30 @@ impl DeviceBuffer {
         Ok(())
     }
 
+    /// [`Self::zero_at`] over a strided block of `[pitch, width, rows]` starting at `offset`:
+    /// `rows` segments of `width` bytes every `pitch` bytes, which the call covers exactly.
+    pub(crate) fn zero_strided_at(
+        &self,
+        stream: &DeviceStream,
+        offset: usize,
+        [pitch, width, rows]: [usize; 3],
+    ) -> Result<(), EngError> {
+        let bytes = resident::strided_span([pitch, width, rows]).ok_or_else(|| {
+            EngError::BadRequest(
+                "the CUDA strided zero is not a block of rows of equal width".to_owned(),
+            )
+        })?;
+        let range = self.io_range(stream, "write", offset, bytes)?;
+        let raw = stream.raw()?;
+        let _dispatch = enter_on(stream.lease().device())?;
+        resident::memset_strided_async(range, [pitch, width, rows], 0, raw)
+            .map_err(device_error)?;
+        stream.note_enqueue();
+        #[cfg(test)]
+        record_memset(std::rc::Rc::as_ptr(&self.lease) as usize, width * rows);
+        Ok(())
+    }
+
     /// The checks both calls share, then the native view of the range.
     fn io_range(
         &self,

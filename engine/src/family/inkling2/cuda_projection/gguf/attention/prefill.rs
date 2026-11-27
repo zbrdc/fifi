@@ -752,18 +752,29 @@ impl ResidentAttention {
         if let Some(dest) = destination {
             dest.validate(work, layout, count)?;
         }
+        // With the switch on, rows that are already whole on the device keep their K/V slots
+        // there too: the K and V slot bytes of each row are cleared on the device instead of
+        // being uploaded as zeros.
+        let device_kv = side.as_ref().is_some_and(|s| s.kv.is_some());
+        let slots = (Switch::PrefillTiledGemm.on()
+            && device_kv
+            && rows.iter().all(|row| row.is_device_only()))
+        .then_some(2 * layout.resident[1]);
         work.encoded.clear();
         let mut offsets = Vec::with_capacity(count);
         for (i, row) in rows.iter().enumerate() {
-            offsets.push(row.append_inputs(
-                visit.shape,
-                (position + i) as i32,
-                &mut work.encoded,
-                (
-                    layout.side_slots(),
-                    side.as_ref().is_some_and(|s| s.kv.is_some()),
-                ),
-            )?);
+            let position = (position + i) as i32;
+            let resident = (layout.side_slots(), device_kv);
+            offsets.push(match slots {
+                Some(_) => row.append_position(
+                    visit.shape,
+                    position,
+                    &mut work.encoded,
+                    resident,
+                    i * layout.input,
+                )?,
+                None => row.append_inputs(visit.shape, position, &mut work.encoded, resident)?,
+            });
         }
         if let Some(query) = side.as_ref().and_then(|s| s.query) {
             for (scale, i) in query.scales.into_iter().zip([0, 3]) {
@@ -794,7 +805,7 @@ impl ResidentAttention {
         let result = self.execute_prefill(
             context,
             visit,
-            layout,
+            (layout, slots),
             work,
             (&offsets, side, kv.zip(kv_history)),
             (projection, tile, destination),
@@ -816,7 +827,7 @@ impl ResidentAttention {
         &self,
         context: &CudaContext,
         visit: Visit,
-        layout: Layout,
+        (layout, slots): (Layout, Option<usize>),
         work: &mut Workspace,
         (offsets, side, kv): (
             &[[usize; 8]],
@@ -834,7 +845,8 @@ impl ResidentAttention {
             .and_then(|d| d.convolution)
             .filter(|c| c.read_convolved)
             .map(|c| c.planes[2]);
-        let scales_at = layout.input * count;
+        let rows_at = layout.input * count;
+        let scales_at = rows_at;
         let prep_at = scales_at + layout.scales;
         let [fixed_words, tap_words] = layout.kv_prep_words();
         let prep_words = if kv.is_some_and(|(kv, _)| kv.coefficients.is_some()) {
@@ -849,8 +861,11 @@ impl ResidentAttention {
         } else {
             out_at
         };
-        debug_assert_eq!(work.encoded.len(), status_at);
-        work.encoded.resize(out_at, 0);
+        // When the K/V slots stay on the device, the upload holds the positions of every row
+        // (4 * count bytes) and then the rest of the tile: it skips the slots.
+        let skip = slots.map_or(0, |_| rows_at - 4 * count);
+        debug_assert_eq!(work.encoded.len(), status_at - skip);
+        work.encoded.resize(out_at - skip, 0);
         work.transfer.write(0, &work.encoded)?;
         let device = &work.device;
         let call = |i: usize, bytes: [usize; 12]| {
@@ -879,12 +894,33 @@ impl ResidentAttention {
             })
         };
         let queued = (|| {
-            context.copy_from_pinned(
-                &self.stream,
-                &mut work.transfer,
-                0,
-                device.range(0, out_at)?,
-            )?;
+            match slots {
+                Some(slot_bytes) => {
+                    // The slots are cleared where they lie and the positions land at the end
+                    // of their rows; the rest of the tile follows. All before any launch below.
+                    let last = layout.input * (count - 1);
+                    device.zero_strided_at(&self.stream, 0, [layout.input, slot_bytes, count])?;
+                    context.copy_from_pinned_strided(
+                        &self.stream,
+                        &mut work.transfer,
+                        0,
+                        device.range(slot_bytes, last + 4)?,
+                        [layout.input, 4, 4, count],
+                    )?;
+                    context.copy_from_pinned(
+                        &self.stream,
+                        &mut work.transfer,
+                        rows_at - skip,
+                        device.range(rows_at, out_at - rows_at)?,
+                    )
+                }
+                None => context.copy_from_pinned(
+                    &self.stream,
+                    &mut work.transfer,
+                    0,
+                    device.range(0, out_at)?,
+                ),
+            }?;
             if let Some(side) = &side
                 && let Some(query) = side.query
             {
@@ -1058,6 +1094,71 @@ impl ResidentAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_only_rows_upload_their_position_only() {
+        let shape = RelativeAttentionShape {
+            query_heads: 64,
+            kv_heads: 8,
+            relative_dims: 32,
+            relative_extent: 1024,
+            capacity: 4096,
+        };
+        let words = |n| n * size_of::<f32>();
+        let layout = Layout::new(shape, None, &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert!(layout.raw_kv);
+        let resident = layout.side_slots();
+        assert_eq!(resident, [true, false, false, true, true, true]);
+        let row = Row {
+            query: &[],
+            key: &[],
+            value: &[],
+            relative: &[],
+            sinks: &[],
+            gates: &[],
+        };
+        assert!(row.is_device_only());
+        let (mut full, mut compact) = (Vec::new(), Vec::new());
+        for i in 0..3usize {
+            let base = i * layout.input;
+            let position = (100 + i) as i32;
+            let upload = row
+                .append_inputs(shape, position, &mut full, (resident, true))
+                .unwrap();
+            let skip = row
+                .append_position(shape, position, &mut compact, (resident, true), base)
+                .unwrap();
+            // The same row in the device layout: zero slots the device fills, then the position.
+            assert_eq!(upload, skip);
+            assert_eq!(
+                [upload[1], upload[2], upload[6], upload[7]],
+                [
+                    base,
+                    base + words(1024),
+                    base + words(2048),
+                    base + layout.input
+                ]
+            );
+            assert_eq!(&compact[words(i)..], &position.to_ne_bytes());
+        }
+        assert_eq!(full.len(), 3 * layout.input);
+        assert_eq!(compact.len(), words(3));
+        assert!(
+            full.chunks_exact(layout.input)
+                .all(|row| row[..words(2048)] == [0; 8192])
+        );
+        // Anything the host still holds keeps the upload: a host slot, no device K/V
+        // preparation, or a slot of the sidecar that is not resident.
+        let with = |query: &[f32], resident, device_kv| {
+            let mut bytes = Vec::new();
+            Row { query, ..row }
+                .append_position(shape, 0, &mut bytes, (resident, device_kv), 0)
+                .is_err()
+        };
+        assert!(with(&[1.0], resident, true));
+        assert!(with(&[], resident, false));
+        assert!(with(&[], [false; 6], true));
+    }
 
     #[test]
     fn resident_query_layout_leaves_only_kv_and_position_in_host_rows() {

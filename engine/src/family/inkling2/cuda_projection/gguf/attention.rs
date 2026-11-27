@@ -591,6 +591,52 @@ impl Row<'_> {
         Ok(offsets)
     }
 
+    /// Whether every input of the row is already on the device: the sidecar carries the
+    /// resident slots and the device's K/V preparation fills the rest. The position is then
+    /// the only byte the host holds for the row.
+    fn is_device_only(&self) -> bool {
+        [
+            &self.query,
+            &self.key,
+            &self.value,
+            &self.relative,
+            &self.sinks,
+            &self.gates,
+        ]
+        .into_iter()
+        .all(|slot| slot.is_empty())
+    }
+
+    /// [`Self::append_inputs`] of a device-only row whose K/V slots are not uploaded: the
+    /// offsets still describe the row at byte `base` of the device layout, `[K slot][V slot]
+    /// [position]`, which a strided device fill clears and a strided upload of the positions
+    /// completes; only the position is appended, for that upload.
+    fn append_position(
+        &self,
+        shape: RelativeAttentionShape,
+        position: i32,
+        bytes: &mut Vec<u8>,
+        (resident, device_kv): ([bool; 6], bool),
+        base: usize,
+    ) -> Result<[usize; 8], EngError> {
+        let sizes = slot_sizes(shape, resident);
+        if !device_kv
+            || !self.is_device_only()
+            || (0..6).any(|i| !(i == 1 || i == 2) && !resident[i])
+        {
+            return Err(bad(
+                "a CUDA attention row with host inputs keeps its K/V slots",
+            ));
+        }
+        let mut offsets = [base; 8];
+        for (i, size) in sizes.into_iter().enumerate() {
+            offsets[i + 1] = offsets[i] + size * size_of::<f32>();
+        }
+        bytes.extend_from_slice(&position.to_ne_bytes());
+        offsets[7] = offsets[6] + size_of::<f32>();
+        Ok(offsets)
+    }
+
     /// Appends the row's host inputs. Slots marked `resident` take no bytes; with `device_kv`
     /// an empty K or V row is a zero slot the device's K/V preparation fills.
     fn append_inputs(
@@ -608,21 +654,7 @@ impl Row<'_> {
             self.sinks,
             self.gates,
         ];
-        let q = shape.query_heads * HEAD_DIM;
-        let kv = shape.kv_heads * HEAD_DIM;
-        let mut sizes = [
-            q,
-            kv,
-            kv,
-            shape.query_heads * shape.relative_dims,
-            shape.query_heads,
-            q,
-        ];
-        for (size, resident) in sizes.iter_mut().zip(resident) {
-            if resident {
-                *size = 0;
-            }
-        }
+        let sizes = slot_sizes(shape, resident);
         let filled = |i: usize| device_kv && (i == 1 || i == 2) && slices[i].is_empty();
         if (0..6).any(|i| slices[i].len() != sizes[i] && !filled(i)) {
             return Err(bad("incorrect CUDA relative attention input shape"));
@@ -641,6 +673,26 @@ impl Row<'_> {
         offsets[7] = bytes.len();
         Ok(offsets)
     }
+}
+
+/// Words of each host input slot of an attention row: zero for a resident slot.
+fn slot_sizes(shape: RelativeAttentionShape, resident: [bool; 6]) -> [usize; 6] {
+    let q = shape.query_heads * HEAD_DIM;
+    let kv = shape.kv_heads * HEAD_DIM;
+    let mut sizes = [
+        q,
+        kv,
+        kv,
+        shape.query_heads * shape.relative_dims,
+        shape.query_heads,
+        q,
+    ];
+    for (size, resident) in sizes.iter_mut().zip(resident) {
+        if resident {
+            *size = 0;
+        }
+    }
+    sizes
 }
 
 fn ring_splits(first_slot: usize, rows: usize, capacity: usize) -> [(usize, usize); 2] {

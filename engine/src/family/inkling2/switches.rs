@@ -45,6 +45,7 @@ crate::family::switch_table::switch_table! {
         PrefillQ8RowReuse = "FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE", true;
         PrefillQ8RowReuseReport = "FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE_REPORT", false;
         PrefillQ8Visit = "FIFI_INKLING_CUDA_PREFILL_Q8_VISIT", true;
+        PrefillTiledGemm = "FIFI_INKLING_CUDA_PREFILL_TILED_GEMM", false;
         PrefillQueryTiles = "FIFI_INKLING_CUDA_PREFILL_QUERY_TILES", true;
         PrefillRebuildGates = "FIFI_INKLING_CUDA_PREFILL_REBUILD_GATES", true;
         PrefillResidentExpertConv = "FIFI_INKLING_CUDA_PREFILL_RESIDENT_EXPERT_CONV", true;

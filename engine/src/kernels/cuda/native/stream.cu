@@ -429,3 +429,47 @@ extern "C" int inference_cuda_memset_async(void *device_dst, size_t bytes, int v
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
 }
+
+/* Strided device-side fill (see abi_resident.h): rows of a batch that the device
+ * produces anyway, such as the K/V slots a preparation kernel overwrites, are
+ * cleared where they lie instead of being uploaded as zeros. */
+extern "C" int inference_cuda_memset_strided_async(void *device_dst, size_t pitch, size_t width,
+                                                   size_t rows, int value, void *stream,
+                                                   int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (device_dst == NULL || stream == NULL || width == 0 || rows == 0 || pitch < width) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        failure.record(cudaMemset2DAsync(device_dst, pitch, value, width, rows,
+                                         (cudaStream_t)stream),
+                       INFERENCE_CUDA_STAGE_COPY);
+        return finish(failure, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+/* Strided page-locked upload (see abi_resident.h): the few bytes each row of such
+ * a batch still holds on the host, every row stride, without uploading the rest. */
+extern "C" int inference_cuda_copy_h2d_pinned_strided_async(void *device, size_t dst_pitch,
+                                                            const void *host_pinned,
+                                                            size_t src_pitch, size_t width,
+                                                            size_t rows, void *stream,
+                                                            int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (device == NULL || host_pinned == NULL || stream == NULL || width == 0 || rows == 0 ||
+            dst_pitch < width || src_pitch < width) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        failure.record(cudaMemcpy2DAsync(device, dst_pitch, host_pinned, src_pitch, width, rows,
+                                         cudaMemcpyHostToDevice, (cudaStream_t)stream),
+                       INFERENCE_CUDA_STAGE_COPY);
+        return finish(failure, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}

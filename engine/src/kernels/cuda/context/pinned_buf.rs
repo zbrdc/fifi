@@ -122,15 +122,66 @@ impl CudaContext {
         src_offset: usize,
         dst: DeviceRange<'_>,
     ) -> Result<(), EngError> {
+        let range = self.pinned_import(stream, src, src_offset.checked_add(dst.bytes()), dst)?;
+        let _dispatch = self.enter()?;
+        resident::copy_h2d_async_at(range, src.raw()?, src_offset, stream.raw()?)
+            .map_err(device_error)?;
+        src.pending = Some((stream.id(), stream.note_enqueue()));
+        Ok(())
+    }
+
+    /// [`Self::copy_from_pinned`] of a strided block: `rows` segments of `width` bytes, every
+    /// `src_pitch` bytes of `src` from `src_offset`, land every `dst_pitch` bytes of `dst`,
+    /// which covers exactly their span, `(rows - 1) * dst_pitch + width` bytes.
+    pub(crate) fn copy_from_pinned_strided(
+        &self,
+        stream: &DeviceStream,
+        src: &mut PinnedBuf,
+        src_offset: usize,
+        dst: DeviceRange<'_>,
+        [dst_pitch, src_pitch, width, rows]: [usize; 4],
+    ) -> Result<(), EngError> {
+        if resident::strided_span([dst_pitch, width, rows]) != Some(dst.bytes()) {
+            return Err(refuse(
+                "the CUDA pinned import device range is not the strided block",
+            ));
+        }
+        // An impossible source block (zero width or rows, a short pitch, an overflow) ends
+        // nowhere inside the host buffer, which `pinned_import` refuses.
+        let end = resident::strided_span([src_pitch, width, rows])
+            .and_then(|span| src_offset.checked_add(span));
+        let range = self.pinned_import(stream, src, end, dst)?;
+        let _dispatch = self.enter()?;
+        resident::copy_h2d_async_at_strided(
+            range,
+            dst_pitch,
+            src.raw()?,
+            src_offset,
+            src_pitch,
+            width,
+            rows,
+            stream.raw()?,
+        )
+        .map_err(device_error)?;
+        src.pending = Some((stream.id(), stream.note_enqueue()));
+        Ok(())
+    }
+
+    /// The checks and bookkeeping a pinned import into `dst` shares, for a source that ends at
+    /// `src_end` inside `src`; then the native view of the device range. The caller queues.
+    fn pinned_import<'a>(
+        &self,
+        stream: &DeviceStream,
+        src: &mut PinnedBuf,
+        src_end: Option<usize>,
+        dst: DeviceRange<'a>,
+    ) -> Result<RawRange<'a>, EngError> {
         self.ensure_usable()?;
         ensure_closed("a pinned copy")?;
         same_adapter(&self.lease, &src.lease, "pinned buffer")?;
         same_adapter(&self.lease, stream.lease(), "stream")?;
         let device = self.owned(dst.buffer())?;
-        let fits = src_offset
-            .checked_add(dst.bytes())
-            .is_some_and(|end| end <= src.bytes);
-        if dst.bytes() == 0 || !fits {
+        if dst.bytes() == 0 || !src_end.is_some_and(|end| end <= src.bytes) {
             return Err(refuse(
                 "the CUDA pinned import range lies outside the host buffer",
             ));
@@ -141,13 +192,8 @@ impl CudaContext {
             ));
         }
         stream.next_enqueue()?;
-        let range = RawRange::new(device, dst.offset(), dst.bytes())
-            .ok_or_else(|| refuse("the CUDA pinned import device range is not valid"))?;
-        let _dispatch = self.enter()?;
-        resident::copy_h2d_async_at(range, src.raw()?, src_offset, stream.raw()?)
-            .map_err(device_error)?;
-        src.pending = Some((stream.id(), stream.note_enqueue()));
-        Ok(())
+        RawRange::new(device, dst.offset(), dst.bytes())
+            .ok_or_else(|| refuse("the CUDA pinned import device range is not valid"))
     }
 }
 
@@ -582,6 +628,74 @@ mod tests {
         let mut slack = [0xFFu8; 8];
         buf.read(data.len(), &mut slack).expect("read the slack");
         assert_eq!(slack, [0u8; 8], "memory no copy filled stays zeroed");
+    }
+
+    /// A strided zero clears the slots of every row and a strided import lands the packed
+    /// host bytes at the end of the same rows: the attention rows whose K/V slots the device
+    /// fills are uploaded as positions only. Both refuse a block that is not the range.
+    #[test]
+    fn a_strided_zero_and_import_fill_rows_of_a_pattern() {
+        if !testkit::device_present("a_strided_zero_and_import_fill_rows_of_a_pattern") {
+            return;
+        }
+        let ctx = CudaContext::new().expect("context");
+        let (stream, event) = (ctx.stream().expect("stream"), ctx.event().expect("event"));
+        const ROWS: usize = 5;
+        const PITCH: usize = 8196;
+        const SLOTS: usize = 8192;
+        let (pitch, slots) = (PITCH, SLOTS);
+        let device = testkit::upload_bytes(&ctx, &[0xAB; ROWS * PITCH]);
+        device
+            .zero_strided_at(&stream, 0, [pitch, slots, ROWS])
+            .expect("strided zero");
+        let mut buf = ctx.pinned_buf(4 * ROWS).expect("pinned buffer");
+        let positions: Vec<u8> = (0..ROWS as i32)
+            .flat_map(|i| (100 + i).to_ne_bytes())
+            .collect();
+        buf.write(0, &positions).expect("write the positions");
+        let last = pitch * (ROWS - 1) + 4;
+        let block = [pitch, 4, 4, ROWS];
+        let short = device.range(slots, last - 4).expect("a short range");
+        assert_bad_request(
+            ctx.copy_from_pinned_strided(&stream, &mut buf, 0, short, block),
+            "a range shorter than the block",
+            "not the strided block",
+        );
+        assert_bad_request(
+            ctx.copy_from_pinned_strided(
+                &stream,
+                &mut buf,
+                8,
+                device.range(slots, last).expect("the block's range"),
+                block,
+            ),
+            "a source past its end",
+            "outside the host buffer",
+        );
+        assert_bad_request(
+            ctx.copy_from_pinned_strided(
+                &stream,
+                &mut buf,
+                0,
+                device.range(slots, last).expect("the block's range"),
+                [pitch - 1, 4, 4, ROWS],
+            ),
+            "a pitch below the width",
+            "not the strided block",
+        );
+        assert!(!buf.is_pending(), "the refusals queued nothing");
+        let rows = device.range(slots, last).expect("the block's range");
+        ctx.copy_from_pinned_strided(&stream, &mut buf, 0, rows, block)
+            .expect("strided import");
+        assert!(buf.is_pending());
+        stream.record(&event).expect("record behind the copies");
+        buf.wait(&event).expect("the event covers the copies");
+        let mut got = vec![0u8; ROWS * pitch];
+        device.read_at(&stream, 0, &mut got).expect("read back");
+        for (i, row) in got.chunks_exact(pitch).enumerate() {
+            assert_eq!(&row[..SLOTS], &[0u8; SLOTS], "row {i}'s slots are cleared");
+            assert_eq!(&row[slots..], &(100 + i as i32).to_ne_bytes());
+        }
     }
 
     #[test]
