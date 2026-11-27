@@ -146,10 +146,13 @@ fn group_kernel(
     Ok((kernel, need))
 }
 
-/// The fused and weight-visit kernels a context's dense matvec may take. A context starts with
-/// both off; the session that owns it sets them.
+/// The fused and weight-visit kernels a context's dense matvec may take, and the decode glue of
+/// its launch-only chain. A context starts with all off; the session that owns it sets them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DenseGroupPolicy {
+    /// The parallel reductions and folded launches of a resident decode visit
+    /// (`FIFI_INKLING_CUDA_DECODE_GLUE`): the single-row weighted norm takes the block reduction.
+    pub(crate) decode_glue: bool,
     /// One launch for the six or eight attention matvecs of a decode step, and one per
     /// controller pair.
     pub(crate) decode_split: bool,

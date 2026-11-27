@@ -11,6 +11,7 @@ use crate::{
         plan_arena,
         resident::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes},
+            inkling_decode_controller::PAIR_RANK,
             matvec_q::{MatvecCall, QuantType, ROWS_MULTIPLE},
             quantize_q8_1::{QuantizeCall, q8_1_bytes},
             router::{
@@ -93,6 +94,24 @@ pub(super) struct ResidentProjection<'a> {
 }
 
 pub(super) type ControllerWeights<'a> = [(&'a Resident, DenseDtype); 3];
+
+/// The ranges of one role's controller calls, as `inference_cuda_controller_gate_role` and
+/// `inference_cuda_controller_apply_role` name them.
+#[derive(Clone, Copy)]
+pub(in crate::family::inkling2::cuda_projection) struct FusedController<'a> {
+    pub(in crate::family::inkling2::cuda_projection) gate: DeviceRange<'a>,
+    pub(in crate::family::inkling2::cuda_projection) down: DeviceRange<'a>,
+    pub(in crate::family::inkling2::cuda_projection) reduced: DeviceRange<'a>,
+    pub(in crate::family::inkling2::cuda_projection) gain_w: DeviceRange<'a>,
+    pub(in crate::family::inkling2::cuda_projection) gain: DeviceRange<'a>,
+    pub(in crate::family::inkling2::cuda_projection) forget_w: DeviceRange<'a>,
+    pub(in crate::family::inkling2::cuda_projection) forget: DeviceRange<'a>,
+}
+
+/// Two ranges of the same bytes of the same allocation.
+fn same_span(a: &DeviceRange<'_>, b: &DeviceRange<'_>) -> bool {
+    std::ptr::eq(a.buffer(), b.buffer()) && [a.offset(), a.bytes()] == [b.offset(), b.bytes()]
+}
 
 pub(super) struct ControllerRow<'a> {
     pub(super) weights: ControllerWeights<'a>,
@@ -740,6 +759,36 @@ impl DenseStep {
             }));
         }
         Ok(results)
+    }
+
+    /// The three controller calls of one role as the fused chain of the decode glue
+    /// (`FIFI_INKLING_CUDA_DECODE_GLUE`) takes them: F32 weights, a rank of
+    /// [`PAIR_RANK`] and a width that is a multiple of 16, both projections reading the down's
+    /// own reduced row. `None` keeps the separate launches.
+    pub(in crate::family::inkling2::cuda_projection) fn fused_controller<'a>(
+        &self,
+        [down, gain, forget]: &[DenseGemvCall<'a>; 3],
+        width: usize,
+    ) -> Option<FusedController<'a>> {
+        let f32 = |call: &DenseGemvCall<'_>| call.dtype == DenseDtype::F32 && call.shape.m == 1;
+        let eligible = Switch::DecodeGlue.on()
+            && (16..=4096).contains(&width)
+            && width.is_multiple_of(16)
+            && down.shape == DenseGemvShape::packed(1, PAIR_RANK, 2 * width)
+            && gain.shape == DenseGemvShape::packed(1, width, PAIR_RANK)
+            && forget.shape == gain.shape
+            && [down, gain, forget].into_iter().all(f32)
+            && same_span(&gain.x, &down.y)
+            && same_span(&forget.x, &down.y);
+        eligible.then_some(FusedController {
+            gate: down.x,
+            down: down.w,
+            reduced: down.y,
+            gain_w: gain.w,
+            gain: gain.y,
+            forget_w: forget.w,
+            forget: forget.y,
+        })
     }
 
     fn controller_calls<'a>(

@@ -21,6 +21,7 @@ crate::family::switch_table::switch_table! {
         ChainLocalDecode = "FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE", true;
         ChainMlpExperts = "FIFI_INKLING_CUDA_CHAIN_MLP_EXPERTS", true;
         DecodeExactQ2Down = "FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN", false;
+        DecodeGlue = "FIFI_INKLING_CUDA_DECODE_GLUE", false;
         DecodeSplit = "FIFI_INKLING_CUDA_DECODE_SPLIT", true;
         DenseStream = "FIFI_INKLING_CUDA_DENSE_STREAM", true;
         DeviceExpertPrefill = "FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL", true;
@@ -91,7 +92,11 @@ mod tests {
 
     #[test]
     fn the_diagnostic_paths_are_off_by_default() {
-        for switch in [Switch::Profile, Switch::PrefillQ8RowReuseReport] {
+        for switch in [
+            Switch::Profile,
+            Switch::PrefillQ8RowReuseReport,
+            Switch::DecodeGlue,
+        ] {
             assert!(!TABLE[switch as usize].2, "{switch:?}");
         }
     }

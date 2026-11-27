@@ -3,7 +3,7 @@ use std::mem::size_of;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present, testkit::Rng};
 
 use super::{
-    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MixCall, MixJob, MixShape, NormCall,
+    AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MAX_NORM_ROWS, MixCall, MixJob, MixNorm, MixShape, NormCall,
     SealCall, States, StreamShape,
 };
 
@@ -841,6 +841,8 @@ fn mix_jobs_match_one_launch_each_bit_for_bit() {
             out: out.range(j * row, row).unwrap(),
             first_block,
             blocks,
+            addend: None,
+            norm: None,
         })
         .collect();
     let health_range = health.range(0, 4).unwrap();
@@ -885,6 +887,8 @@ fn mix_jobs_match_one_launch_each_bit_for_bit() {
             out: one.range(0, row).unwrap(),
             first_block: 0,
             blocks: bank_blocks,
+            addend: None,
+            norm: None,
         })
         .collect();
     assert!(refused(&many));
@@ -896,6 +900,8 @@ fn mix_jobs_match_one_launch_each_bit_for_bit() {
             out: bank_state.range(0, row).unwrap(),
             first_block: 0,
             blocks: depth_blocks,
+            addend: None,
+            norm: None,
         },
         MixJob {
             state: state_of(0),
@@ -903,6 +909,8 @@ fn mix_jobs_match_one_launch_each_bit_for_bit() {
             out: one.range(0, row).unwrap(),
             first_block: 0,
             blocks: bank_blocks,
+            addend: None,
+            norm: None,
         },
     ];
     assert!(refused(&onto_state));
@@ -912,6 +920,159 @@ fn mix_jobs_match_one_launch_each_bit_for_bit() {
         out: one.range(0, row).unwrap(),
         first_block: 0,
         blocks: MAX_BLOCKS + 1,
+        addend: None,
+        norm: None,
     }];
     assert!(refused(&wide));
+}
+
+/// The decode glue's job: the addend goes into the current row first (the bits of the add
+/// launch), the mix is that of the plain launch on the summed state, and the normed row is the
+/// weighted norm of the output within rounding. The refusals cover an addend inside the state
+/// and a second job reading the row the first job adds into.
+#[test]
+fn mix_job_with_addend_and_norm_matches_the_separate_launches() {
+    if !device_present("Inkling stream mix job (decode glue)") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut rng = Rng::new(0x9d3c_47a1);
+    let width = 2304usize;
+    let row = row_bytes(width);
+    let blocks = 6usize;
+    let alloc = |words: usize| ctx.allocate(words * size_of::<f32>()).unwrap();
+    let state: Vec<f32> = (0..=blocks)
+        .flat_map(|_| normal_row(&mut rng, width))
+        .collect();
+    let (query_row, addend, gamma) = (
+        normal_row(&mut rng, width),
+        normal_row(&mut rng, width),
+        normal_row(&mut rng, width),
+    );
+    let (buffer, query, out, normed, normed_ref, addend_b, gamma_b, health, status) = (
+        alloc(state.len()),
+        alloc(width),
+        alloc(width),
+        alloc(width),
+        alloc(width),
+        alloc(width),
+        alloc(width),
+        alloc(1),
+        alloc(1),
+    );
+    upload(&query, &stream, &query_row);
+    upload(&addend_b, &stream, &addend);
+    upload(&gamma_b, &stream, &gamma);
+    upload(&health, &stream, &[0.0]);
+    let health_range = health.range(0, 4).unwrap();
+    let state_range = || buffer.range(0, (blocks + 1) * row).unwrap();
+    let shape = MixShape {
+        first_block: 0,
+        blocks,
+        width,
+        eps: EPS,
+    };
+    // Reference: the add launch, then the mix launch, then the weighted norm launch.
+    upload(&buffer, &stream, &state);
+    ctx.inkling_stream_add(
+        &stream,
+        AddCall {
+            state: buffer.range(0, row).unwrap(),
+            row: addend_b.range(0, row).unwrap(),
+            health: health_range,
+        },
+        width,
+    )
+    .unwrap();
+    ctx.inkling_stream_mix(
+        &stream,
+        MixCall {
+            state: state_range(),
+            query: query.range(0, row).unwrap(),
+            out: out.range(0, row).unwrap(),
+            health: health_range,
+        },
+        shape,
+    )
+    .unwrap();
+    ctx.enqueue_row_weighted_norm(
+        &stream,
+        [
+            out.range(0, row).unwrap(),
+            gamma_b.range(0, row).unwrap(),
+            normed_ref.range(0, row).unwrap(),
+            status.range(0, 4).unwrap(),
+        ],
+        width,
+        EPS,
+    )
+    .unwrap();
+    let expected = (
+        download(&buffer, &stream, 0, state.len()),
+        download(&out, &stream, 0, width),
+        download(&normed_ref, &stream, 0, width),
+    );
+    // The glue: the original state, one job with both extras.
+    upload(&buffer, &stream, &state);
+    let job = MixJob {
+        state: state_range(),
+        query: query.range(0, row).unwrap(),
+        out: out.range(0, row).unwrap(),
+        first_block: 0,
+        blocks,
+        addend: Some(addend_b.range(0, row).unwrap()),
+        norm: Some(MixNorm {
+            gamma: gamma_b.range(0, row).unwrap(),
+            normed: normed.range(0, row).unwrap(),
+            eps: EPS,
+        }),
+    };
+    ctx.inkling_stream_mix_jobs(&stream, &[job], &health_range, (width, EPS))
+        .unwrap();
+    let (actual_state, actual_out, actual_normed) = (
+        download(&buffer, &stream, 0, state.len()),
+        download(&out, &stream, 0, width),
+        download(&normed, &stream, 0, width),
+    );
+    let same_bits = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    assert!(same_bits(&actual_state, &expected.0), "the summed state");
+    assert!(
+        same_bits(&actual_out, &expected.1),
+        "the mix of the summed state"
+    );
+    for (i, (&a, &b)) in actual_normed.iter().zip(&expected.2).enumerate() {
+        assert!(
+            (a - b).abs() <= 4.0e-6 * b.abs().max(1.0),
+            "normed[{i}]: {a} against {b}"
+        );
+    }
+    assert_eq!(download(&health, &stream, 0, 1)[0].to_bits(), 0);
+    // Refusals: an addend inside the state; a second job reading the state the first adds into.
+    let inside = MixJob {
+        addend: Some(buffer.range(row, row).unwrap()),
+        ..job
+    };
+    assert!(
+        ctx.inkling_stream_mix_jobs(&stream, &[inside], &health_range, (width, EPS))
+            .is_err()
+    );
+    let reader = MixJob {
+        out: normed_ref.range(0, row).unwrap(),
+        addend: None,
+        norm: None,
+        ..job
+    };
+    assert!(
+        ctx.inkling_stream_mix_jobs(&stream, &[job, reader], &health_range, (width, EPS))
+            .is_err()
+    );
+    let two_states = ctx.allocate(state.len() * size_of::<f32>()).unwrap();
+    upload(&two_states, &stream, &state);
+    let apart = MixJob {
+        state: two_states.range(0, (blocks + 1) * row).unwrap(),
+        ..reader
+    };
+    ctx.inkling_stream_mix_jobs(&stream, &[job, apart], &health_range, (width, EPS))
+        .unwrap();
 }

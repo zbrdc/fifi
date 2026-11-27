@@ -20,6 +20,14 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+    fn inference_cuda_inkling_weighted_norm_reduced(
+        ranges: *const *mut c_void,
+        rows: c_int,
+        width: c_int,
+        eps: f32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     fn inference_cuda_inkling_output_conv(
         ranges: *const *mut c_void,
         rows: c_int,
@@ -51,11 +59,14 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+/// The single-row weighted norm; `reduced` selects the block reduction of the decode glue over
+/// the host-ordered sum (the same validation and extents for both).
 pub(in crate::kernels::cuda) fn weighted_norm(
     stream: &RawStream,
     ranges: [RawRange<'_>; 4],
     [rows, width]: [usize; 2],
     eps: f32,
+    reduced: bool,
 ) -> Result<(), DeviceFailure> {
     if !eps.is_finite() || eps <= 0.0 {
         return Err(invalid_argument());
@@ -72,14 +83,25 @@ pub(in crate::kernels::cuda) fn weighted_norm(
     let mut stage = STAGE_NONE;
     // SAFETY: validated bounding geometry and disjoint, aligned regions.
     let status = unsafe {
-        inference_cuda_inkling_weighted_norm(
-            pointers.as_ptr(),
-            rows as c_int,
-            width as c_int,
-            eps,
-            stream.0.as_ptr(),
-            &mut stage,
-        )
+        if reduced {
+            inference_cuda_inkling_weighted_norm_reduced(
+                pointers.as_ptr(),
+                rows as c_int,
+                width as c_int,
+                eps,
+                stream.0.as_ptr(),
+                &mut stage,
+            )
+        } else {
+            inference_cuda_inkling_weighted_norm(
+                pointers.as_ptr(),
+                rows as c_int,
+                width as c_int,
+                eps,
+                stream.0.as_ptr(),
+                &mut stage,
+            )
+        }
     };
     checked(status, stage)
 }

@@ -114,11 +114,13 @@ fn expert_stacks(weights: &Weights, layer: usize) -> Result<[ExpertStack<'_>; 2]
     Ok([stack("w13")?, stack("w2")?])
 }
 
-/// The dense matvec kernels every Inkling CUDA context takes.
+/// The dense matvec kernels every Inkling CUDA context takes, and whether the decode glue
+/// (`FIFI_INKLING_CUDA_DECODE_GLUE`) is selected for its launch-only chain.
 pub(super) fn dense_group_policy() -> crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
     crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
         decode_split: Switch::DecodeSplit.on(),
         weight_visit: Switch::PrefillQ8Visit.on(),
+        decode_glue: Switch::DecodeGlue.on(),
     }
 }
 

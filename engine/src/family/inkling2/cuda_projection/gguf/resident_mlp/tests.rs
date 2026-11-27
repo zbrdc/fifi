@@ -276,6 +276,7 @@ impl Rows {
             rank: RANK,
             eps: EPS,
             input: self.range(0, HIDDEN),
+            pre_normed: None,
             message: self.range(1, HIDDEN),
             gamma: self.range(2, HIDDEN),
             bias: self.words.range(0, EXPERTS * 4).unwrap(),

@@ -33,12 +33,36 @@ pub(crate) struct MixCall<'a> {
 
 /// One mix of [`CudaContext::inkling_stream_mix_jobs`]: a state of `blocks + 1` rows whose
 /// sealed rows `first_block..blocks` join the mix, its query and its output row.
+#[derive(Clone, Copy)]
 pub(crate) struct MixJob<'a> {
     pub(crate) state: DeviceRange<'a>,
     pub(crate) query: DeviceRange<'a>,
     pub(crate) out: DeviceRange<'a>,
     pub(crate) first_block: usize,
     pub(crate) blocks: usize,
+    /// The decode glue (`FIFI_INKLING_CUDA_DECODE_GLUE`): a row added into the current row of
+    /// `state` before the mix, the host's residual add ([`CudaContext::inkling_stream_add`]).
+    pub(crate) addend: Option<DeviceRange<'a>>,
+    /// The decode glue: the weighted norm of the job's output, written by the same block.
+    pub(crate) norm: Option<MixNorm<'a>>,
+}
+
+/// The norm epilogue of a [`MixJob`] under the decode glue: `normed = (out * rms_scale(out)) *
+/// gamma` with `eps`, the host's `rms_norm_with_scale` (the row
+/// [`CudaContext::enqueue_row_weighted_norm`] writes).
+#[derive(Clone, Copy)]
+pub(crate) struct MixNorm<'a> {
+    pub(crate) gamma: DeviceRange<'a>,
+    pub(crate) normed: DeviceRange<'a>,
+    pub(crate) eps: f32,
+}
+
+/// One job's claims: what it reads, what it writes, and (for a job with an addend) the current
+/// row of its state that the addend writes into.
+struct MixClaims<'a> {
+    reads: Vec<Claim<'a>>,
+    writes: Vec<Claim<'a>>,
+    current: Option<Claim<'a>>,
 }
 
 /// The sealed rows `first_block..blocks` join the mix, newest first; the current row comes last.
@@ -143,6 +167,112 @@ fn check_row(name: &'static str, range: &DeviceRange<'_>, bytes: usize) -> Resul
     )))
 }
 
+/// The claims of one mix job: the state, the query and the output of every job, then the gamma
+/// and the normed row of a norm epilogue and the addend row, whose sum the job writes into the
+/// first row of the state it reads. Every extra range holds exactly one row.
+fn mix_claims<'a>(job: &MixJob<'a>, (width, eps): (usize, f32)) -> Result<MixClaims<'a>, EngError> {
+    check_shape("mix", job.first_block, job.blocks, width, eps)?;
+    let row = width * size_of::<f32>();
+    let state = (job.blocks + 1) * row;
+    check_row("Inkling stream state", &job.state, state)?;
+    check_row("Inkling stream query", &job.query, row)?;
+    check_row("Inkling stream mix output", &job.out, row)?;
+    let mut claims = MixClaims {
+        reads: vec![
+            Claim::of("Inkling stream state", &job.state, state),
+            Claim::of("Inkling stream query", &job.query, row),
+        ],
+        writes: vec![Claim::of("Inkling stream mix output", &job.out, row)],
+        current: None,
+    };
+    if let Some(norm) = &job.norm {
+        if !norm.eps.is_finite() || norm.eps <= 0.0 {
+            return Err(EngError::BadRequest(
+                "the CUDA Inkling stream mix norm takes a finite positive eps".into(),
+            ));
+        }
+        check_row("Inkling stream norm gamma", &norm.gamma, row)?;
+        check_row("Inkling stream normed row", &norm.normed, row)?;
+        claims
+            .reads
+            .push(Claim::of("Inkling stream norm gamma", &norm.gamma, row));
+        claims
+            .writes
+            .push(Claim::of("Inkling stream normed row", &norm.normed, row));
+    }
+    if let Some(addend) = &job.addend {
+        check_row("Inkling stream addend row", addend, row)?;
+        claims
+            .reads
+            .push(Claim::of("Inkling stream addend row", addend, row));
+        claims.current = Some(Claim::of(
+            "Inkling stream current row",
+            &job.state.slice(0, row)?,
+            row,
+        ));
+    }
+    Ok(claims)
+}
+
+/// Every write of a job (its output, its normed row, the health word and, under the glue, the
+/// current row an addend writes) shares no byte with any row any job reads or writes, except
+/// the state that holds the current row it writes.
+fn require_claims_apart(
+    claims: &[MixClaims<'_>],
+    health: &DeviceRange<'_>,
+) -> Result<(), EngError> {
+    let health = Claim::of("Inkling stream health", health, size_of::<f32>());
+    for (j, claim) in claims.iter().enumerate() {
+        for write in &claim.writes {
+            require_apart(write, &health)?;
+            for read in &claim.reads {
+                require_apart(write, read)?;
+            }
+        }
+        // Within one job the state shares no byte with the query; with the glue's extras it
+        // shares none with the addend, the gamma, the output or the normed row either (the
+        // native entry refuses both, and a native refusal is terminal).
+        let state = &claim.reads[0];
+        require_apart(state, &claim.reads[1])?;
+        if let Some(current) = &claim.current {
+            require_apart(current, &health)?;
+            // The current row an addend writes is part of the state; the rest is apart.
+            for read in claim.reads.iter().skip(2) {
+                require_apart(state, read)?;
+                require_apart(current, read)?;
+            }
+            for write in &claim.writes {
+                require_apart(state, write)?;
+            }
+        } else if claim.reads.len() > 2 {
+            for read in claim.reads.iter().skip(2) {
+                require_apart(state, read)?;
+            }
+            for write in &claim.writes {
+                require_apart(state, write)?;
+            }
+        }
+        let others = claims
+            .iter()
+            .take(j)
+            .chain(&claims[j + 1..])
+            .flat_map(|other| {
+                other
+                    .reads
+                    .iter()
+                    .chain(&other.writes)
+                    .chain(&other.current)
+            })
+            .collect::<Vec<_>>();
+        for write in claim.writes.iter().chain(claim.current.iter()) {
+            for row in &others {
+                require_apart(write, row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `out` and `health` share no byte with each other or with a range in `reads`.
 fn writes_apart<'a>(
     writes: [Claim<'a>; 2],
@@ -185,46 +315,52 @@ impl CudaContext {
                 jobs.len()
             )));
         }
-        let row = width * size_of::<f32>();
-        let health_bytes = size_of::<f32>();
-        check_row("Inkling stream health", health, health_bytes)?;
-        let mut reads = Vec::with_capacity(2 * jobs.len());
-        for job in jobs {
-            check_shape("mix", job.first_block, job.blocks, width, eps)?;
-            let state = (job.blocks + 1) * row;
-            check_row("Inkling stream state", &job.state, state)?;
-            check_row("Inkling stream query", &job.query, row)?;
-            check_row("Inkling stream mix output", &job.out, row)?;
-            let state = Claim::of("Inkling stream state", &job.state, state);
-            let query = Claim::of("Inkling stream query", &job.query, row);
-            require_apart(&state, &query)?;
-            reads.extend([state, query]);
-        }
-        let mut writes = vec![Claim::of("Inkling stream health", health, health_bytes)];
-        writes.extend(
-            jobs.iter()
-                .map(|job| Claim::of("Inkling stream mix output", &job.out, row)),
-        );
-        for (at, write) in writes.iter().enumerate() {
-            for other in reads.iter().chain(&writes[at + 1..]) {
-                require_apart(write, other)?;
-            }
-        }
+        check_row("Inkling stream health", health, size_of::<f32>())?;
+        let claims = jobs
+            .iter()
+            .map(|job| mix_claims(job, (width, eps)))
+            .collect::<Result<Vec<_>, EngError>>()?;
+        require_claims_apart(&claims, health)?;
         self.ensure_usable()?;
         let raw = jobs
             .iter()
-            .map(|job| {
-                Ok(native::MixJobRaw {
-                    state: self.raw_range(&job.state)?,
-                    query: self.raw_range(&job.query)?,
-                    out: self.raw_range(&job.out)?,
-                    first_block: job.first_block,
-                    blocks: job.blocks,
-                })
-            })
+            .map(|job| self.raw_mix_job(job))
             .collect::<Result<Vec<_>, EngError>>()?;
         let health = self.raw_range(health)?;
-        self.launch_on(stream, |s| native::mix_jobs(s, &raw, health, (width, eps)))
+        self.launch_on(stream, move |s| {
+            native::mix_jobs(s, &raw, health, (width, eps))
+        })
+    }
+
+    /// The native job: its three rows and its extras, every range checked by `mix_claims`.
+    fn raw_mix_job<'b>(&self, job: &MixJob<'b>) -> Result<native::MixJobRaw<'b>, EngError> {
+        let extras = match (&job.addend, &job.norm) {
+            (None, None) => None,
+            (addend, norm) => Some(native::MixExtrasRaw {
+                addend: addend
+                    .as_ref()
+                    .map(|range| self.raw_range(range))
+                    .transpose()?,
+                norm: norm
+                    .as_ref()
+                    .map(|norm| {
+                        Ok::<_, EngError>(native::MixNormRaw {
+                            gamma: self.raw_range(&norm.gamma)?,
+                            normed: self.raw_range(&norm.normed)?,
+                            eps: norm.eps,
+                        })
+                    })
+                    .transpose()?,
+            }),
+        };
+        Ok(native::MixJobRaw {
+            state: self.raw_range(&job.state)?,
+            query: self.raw_range(&job.query)?,
+            out: self.raw_range(&job.out)?,
+            first_block: job.first_block,
+            blocks: job.blocks,
+            extras,
+        })
     }
 
     /// [`Self::inkling_stream_mix`] of each of `states`, the outputs packed one row apart.

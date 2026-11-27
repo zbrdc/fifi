@@ -25,7 +25,8 @@ use crate::{
             inkling_conv::ConvCall,
             inkling_local_prep::PrepMath,
             inkling_stream::{
-                AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MixCall, MixJob, MixShape, SealCall, StreamShape,
+                AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MixCall, MixJob, MixNorm, MixShape, SealCall,
+                StreamShape,
             },
         },
     },
@@ -123,6 +124,10 @@ struct Layout {
     attention_out: Region,
     mlp_input: Region,
     mlp_conv: Region,
+    /// The decode glue's rows: the normed attention input a mix job writes and the normed MLP
+    /// input another writes (empty when the glue is off; they never exist then).
+    attention_normed: Region,
+    mlp_normed: Region,
     bytes: usize,
 }
 
@@ -161,7 +166,21 @@ impl Layout {
             attention_out: take(h),
             mlp_input: take(h),
             mlp_conv: take(h),
+            attention_normed: Self::take_normed(&mut take, h, Switch::DecodeGlue.on()),
+            mlp_normed: Self::take_normed(&mut take, h, Switch::DecodeGlue.on()),
             bytes: end,
+        }
+    }
+
+    /// A row a mix job norms into, 16-byte aligned as the projection inputs are; or no row.
+    fn take_normed(take: &mut impl FnMut(usize) -> Region, h: usize, glue: bool) -> Region {
+        if !glue {
+            return take(0);
+        }
+        let span = take(h + 3);
+        Region {
+            start: span.start.next_multiple_of(16),
+            bytes: h * WORD,
         }
     }
 
@@ -640,14 +659,26 @@ impl Execution<'_> {
         let shape = self.plan.shape;
         let width = shape.widths.hidden;
         // The bank queries and the attention query read different stream states (the bank and
-        // the depth), so one launch runs them all, a block per mix.
-        let job = |(state, first_block): (Region, usize), blocks: usize, query, out| {
+        // the depth), so one launch runs them all, a block per mix. Under the decode glue the
+        // attention query's job also norms its output (the attention input of a plain visit):
+        // the glue folds norms into the mixes of plain visits only, since a banked visit's
+        // attention feeds the raw attention input to its controller chain.
+        let glue = Switch::DecodeGlue.on() && !shape.banked;
+        let job = |(state, first_block): (Region, usize),
+                   blocks: usize,
+                   query,
+                   out,
+                   normed: Option<Region>| {
             Ok::<_, EngError>(MixJob {
                 state: self.row(state.row((blocks + 1) * width))?,
                 query: self.weights.row(query)?,
                 out: self.row(out)?,
                 first_block,
                 blocks,
+                addend: None,
+                norm: normed
+                    .map(|normed| self.norm(self.weights.attention[0], normed))
+                    .transpose()?,
             })
         };
         let (depth, bank) = ((l.depth, 0), (l.bank, shape.bank_first));
@@ -659,14 +690,25 @@ impl Execution<'_> {
             .flatten()
             .zip(l.messages)
         {
-            jobs.push(job(bank, shape.bank_blocks, query, out)?);
+            jobs.push(job(bank, shape.bank_blocks, query, out, None)?);
         }
-        let input = match self.weights.attention_query {
-            Some(query) => {
-                jobs.push(job(depth, shape.blocks, query, l.attention_input)?);
-                l.attention_input
+        let (input, normed) = match self.weights.attention_query {
+            Some(query) if glue => {
+                let normed = l.attention_normed;
+                jobs.push(job(
+                    depth,
+                    shape.blocks,
+                    query,
+                    l.attention_input,
+                    Some(normed),
+                )?);
+                (normed, true)
             }
-            None => l.depth.row(width),
+            Some(query) => {
+                jobs.push(job(depth, shape.blocks, query, l.attention_input, None)?);
+                (l.attention_input, false)
+            }
+            None => (l.depth.row(width), false),
         };
         if !jobs.is_empty() {
             self.context.inkling_stream_mix_jobs(
@@ -676,10 +718,41 @@ impl Execution<'_> {
                 (width, MIX_EPS),
             )?;
         }
-        self.attention(cuda, position, input)?;
-        let blocks = self.advance_depth()?;
-        self.mix(depth, blocks, self.weights.mlp_query, l.mlp_input)?;
-        self.mlp(cuda)
+        self.attention(cuda, position, (input, normed))?;
+        // After the attention: the seal, or (under the glue) the attention output as the addend
+        // of the depth mix that follows, or the add launch.
+        let (blocks, addend) = self.advance_depth(glue)?;
+        if !shape.banked && glue {
+            // The depth mix adds the attention output itself and writes the weighted norm of its
+            // output, so the plain MLP reads that row without a norm launch.
+            let job = MixJob {
+                state: self.row(l.depth.row((blocks + 1) * width))?,
+                query: self.weights.row(self.weights.mlp_query)?,
+                out: self.row(l.mlp_input)?,
+                first_block: 0,
+                blocks,
+                addend: addend.map(|addend| self.row(addend)).transpose()?,
+                norm: Some(self.norm(self.weights.mlp[0], l.mlp_normed)?),
+            };
+            self.context.inkling_stream_mix_jobs(
+                self.stream,
+                std::slice::from_ref(&job),
+                &self.row(l.glue_health)?,
+                (width, MIX_EPS),
+            )?;
+            return self.mlp(cuda, Some(l.mlp_normed));
+        }
+        self.mix(depth, blocks, self.weights.mlp_query, l.mlp_input, addend)?;
+        self.mlp(cuda, None)
+    }
+
+    /// The norm epilogue of a mix job: the weighted norm of the job's output into `normed`.
+    fn norm(&self, gamma: Region, normed: Region) -> Result<MixNorm<'_>, EngError> {
+        Ok(MixNorm {
+            gamma: self.weights.row(gamma)?,
+            normed: self.row(normed)?,
+            eps: self.plan.math.eps,
+        })
     }
 
     fn mix(
@@ -688,15 +761,38 @@ impl Execution<'_> {
         blocks: usize,
         query: Region,
         out: Region,
+        addend: Option<Region>,
     ) -> Result<(), EngError> {
         let width = self.plan.shape.widths.hidden;
+        let state = self.row(state.row((blocks + 1) * width))?;
+        let query = self.weights.row(query)?;
+        let out = self.row(out)?;
+        let health = self.row(self.layout.glue_health)?;
+        if let Some(addend) = addend {
+            // The add of the attention output is the job's addend: one launch for both.
+            let job = MixJob {
+                state,
+                query,
+                out,
+                first_block,
+                blocks,
+                addend: Some(self.row(addend)?),
+                norm: None,
+            };
+            return self.context.inkling_stream_mix_jobs(
+                self.stream,
+                std::slice::from_ref(&job),
+                &health,
+                (width, MIX_EPS),
+            );
+        }
         self.context.inkling_stream_mix(
             self.stream,
             MixCall {
-                state: self.row(state.row((blocks + 1) * width))?,
-                query: self.weights.row(query)?,
-                out: self.row(out)?,
-                health: self.row(self.layout.glue_health)?,
+                state,
+                query,
+                out,
+                health,
             },
             MixShape {
                 first_block,
@@ -707,10 +803,27 @@ impl Execution<'_> {
         )
     }
 
-    fn attention(&self, cuda: &GgufCuda, position: usize, input: Region) -> Result<(), EngError> {
+    fn attention(
+        &self,
+        cuda: &GgufCuda,
+        position: usize,
+        (input, normed): (Region, bool),
+    ) -> Result<(), EngError> {
         let l = self.layout;
         let [gamma, q_scale, rel_scale, k_conv, v_conv, conv] = self.weights.attention;
         let [q, k, v, _] = l.messages;
+        // The plain attention's normed rows: the query's is the norm the attention-query mix
+        // already wrote under the decode glue (the query projection reads it), else the message
+        // row the plain attention norms `input` into; the key's and value's are message rows.
+        let normed_rows = [
+            if normed {
+                self.row(l.attention_normed)?
+            } else {
+                self.row(q)?
+            },
+            self.row(k)?,
+            self.row(v)?,
+        ];
         let mut request = ResidentLocalDecode {
             visit: self.plan.visit,
             position,
@@ -742,24 +855,27 @@ impl Execution<'_> {
             let (inputs, coeff) = l
                 .global_scratch
                 .ok_or_else(|| bad("global decode lacks scratch"))?;
-            for (query, out) in queries.into_iter().zip(inputs) {
-                self.mix((l.depth, 0), self.plan.shape.blocks, query, out)?;
-            }
+            let blocks = self.plan.shape.blocks;
             request.gammas = [
                 self.weights.row(gamma)?,
                 self.weights.row(gammas[0])?,
                 self.weights.row(gammas[1])?,
             ];
             if !self.plan.shape.banked {
+                let pre_normed = self.role_mixes((queries, gammas), inputs, blocks, normed)?;
                 return cuda.enqueue_plain_decode(
                     self.stream,
                     request,
-                    [self.row(q)?, self.row(k)?, self.row(v)?],
+                    normed_rows,
+                    pre_normed,
                     Some((
                         [self.row(inputs[0])?, self.row(inputs[1])?],
                         [self.row(coeff[0])?, self.row(coeff[1])?],
                     )),
                 );
+            }
+            for (query, out) in queries.into_iter().zip(inputs) {
+                self.mix((l.depth, 0), blocks, query, out, None)?;
             }
             return cuda.enqueue_banked_global(
                 self.stream,
@@ -772,19 +888,68 @@ impl Execution<'_> {
             return cuda.enqueue_plain_decode(
                 self.stream,
                 request,
-                [self.row(q)?, self.row(k)?, self.row(v)?],
+                normed_rows,
+                [normed, false, false],
                 None,
             );
         }
         cuda.enqueue_local_decode(self.stream, request)
     }
 
-    fn advance_depth(&self) -> Result<usize, EngError> {
+    /// The two role mixes of a plain global visit. Under the decode glue they run in one launch
+    /// and each job also writes its normed role row; otherwise each mix has its own launch and
+    /// the plain attention norms the role rows. Returns which of the plain attention's three
+    /// normed rows (query, key, value) the mixes already wrote.
+    fn role_mixes(
+        &self,
+        (queries, gammas): ([Region; 2], [Region; 2]),
+        inputs: [Region; 2],
+        blocks: usize,
+        normed: bool,
+    ) -> Result<[bool; 3], EngError> {
+        let l = self.layout;
+        let width = self.plan.shape.widths.hidden;
+        if !Switch::DecodeGlue.on() {
+            for (query, out) in queries.into_iter().zip(inputs) {
+                self.mix((l.depth, 0), blocks, query, out, None)?;
+            }
+            return Ok([normed; 3]);
+        }
+        let state = self.row(l.depth.row((blocks + 1) * width))?;
+        let jobs = [0, 1].map(|i| {
+            Ok::<_, EngError>(MixJob {
+                state,
+                query: self.weights.row(queries[i])?,
+                out: self.row(inputs[i])?,
+                first_block: 0,
+                blocks,
+                addend: None,
+                norm: Some(self.norm(gammas[i], l.messages[i + 1])?),
+            })
+        });
+        let [first, second] = jobs;
+        self.context.inkling_stream_mix_jobs(
+            self.stream,
+            &[first?, second?],
+            &self.row(l.glue_health)?,
+            (width, MIX_EPS),
+        )?;
+        Ok([normed, true, true])
+    }
+
+    /// Seal, or leave the depth stream alone after the attention: without a seal the attention
+    /// output joins the current row, as the addend the following depth mix takes under the
+    /// decode glue (`fold`), or through the add launch. Returns the blocks the MLP query mixes
+    /// over and the addend.
+    fn advance_depth(&self, fold: bool) -> Result<(usize, Option<Region>), EngError> {
         let shape = self.plan.shape;
         let l = self.layout;
         if !shape.seal {
+            if fold {
+                return Ok((shape.blocks, Some(l.attention_out)));
+            }
             self.add(l.attention_out)?;
-            return Ok(shape.blocks);
+            return Ok((shape.blocks, None));
         }
         self.context.inkling_stream_seal(
             self.stream,
@@ -799,7 +964,7 @@ impl Execution<'_> {
                 eps: MIX_EPS,
             },
         )?;
-        Ok(shape.blocks + 1)
+        Ok((shape.blocks + 1, None))
     }
 
     fn add(&self, addend: Region) -> Result<(), EngError> {
@@ -815,7 +980,9 @@ impl Execution<'_> {
         )
     }
 
-    fn mlp(&self, cuda: &GgufCuda) -> Result<(), EngError> {
+    /// The MLP half; `pre_normed` is the row the depth mix already normed under the decode
+    /// glue, which the plain MLP reads instead of norming its input.
+    fn mlp(&self, cuda: &GgufCuda, pre_normed: Option<Region>) -> Result<(), EngError> {
         let l = self.layout;
         let [gamma, bias, conv] = self.weights.mlp;
         let controls = &self.plan.controls;
@@ -828,6 +995,7 @@ impl Execution<'_> {
             rank: controls.rank,
             eps: self.plan.math.eps,
             input: self.row(l.mlp_input)?,
+            pre_normed: pre_normed.map(|row| self.row(row)).transpose()?,
             message: self.row(l.messages[3])?,
             gamma: self.weights.row(gamma)?,
             bias: self.weights.row(bias)?,

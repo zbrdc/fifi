@@ -6,12 +6,14 @@
 
 #include "resident/inkling_stream.h"
 #include "resident/ordered_sum.cuh"
+#include "resident/inkling_stream_norm.cuh"
 
 #include "abi.h"
 #include "device.h"
 
 namespace {
 constexpr int threads = 256;
+static_assert(threads == kNormThreads, "the gate norm adds one partial per thread");
 constexpr int warps = threads / 32;
 constexpr int max_blocks = 63;
 constexpr int max_width = 8192;
@@ -28,45 +30,9 @@ __device__ float warp_sum(float value) {
     return value;
 }
 
-// Sum of the 256 per-thread partials: thread 0 adds them in lane order.
-__device__ float block_sum(float value, float *scratch) {
-    const int lane = threadIdx.x;
-    scratch[lane] = value;
-    __syncthreads();
-    if (lane == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < threads; ++i) total = __fadd_rn(total, scratch[i]);
-        scratch[0] = total;
-    }
-    __syncthreads();
-    const float total = scratch[0];
-    __syncthreads();
-    return total;
-}
-
-// Rust rms_norm_with_scale: scale = (dot(x, x) / len + eps).sqrt().recip().
-__device__ float rms_scale(const float *row, int width, float eps, float *scratch, int &invalid) {
-    const int lane = threadIdx.x;
-    float squares = 0.0f;
-    for (int i = lane; i < width; i += threads) {
-        const float value = row[i];
-        invalid |= !isfinite(value);
-        squares = __fadd_rn(squares, __fmul_rn(value, value));
-    }
-    const float total = block_sum(squares, scratch);
-    __shared__ float shared;
-    if (lane == 0) {
-        const float mean = __fdiv_rn(total, static_cast<float>(width));
-        const float root = __fsqrt_rn(__fadd_rn(mean, eps));
-        const float scale = __frcp_rn(root);
-        invalid |= !isfinite(total) || !isfinite(root) || !isfinite(scale);
-        shared = scale;
-    }
-    __syncthreads();
-    const float scale = shared;
-    __syncthreads();
-    return scale;
-}
+// `block_sum` and `rms_scale` (Rust rms_norm_with_scale: scale = (dot(x, x) / len
+// + eps).sqrt().recip()) live in resident/inkling_stream_norm.cuh, which the fused decode
+// controller launch shares.
 
 // Row r of the mix order: the sealed rows newest first, then the current row.
 __device__ const float *mix_row(const float *state, int blocks, int rows, int r, int width) {
@@ -112,11 +78,24 @@ constexpr int kScoreLoads = 16;
 constexpr int kChannelLoads = 9;
 constexpr int kSquareLoads = 9;
 
+// What a mix of the decode glue (FIFI_INKLING_CUDA_DECODE_GLUE) folds in; all null for a plain
+// mix. `addend` is a row added into the current row of the state before anything else: the
+// host's `add_current`, one rounded add, the bits of inkling_stream_add; the mix then reads the
+// sum and the current row keeps it. `gamma` and `normed` make the mix also write
+// `normed[i] = (out[i] * scale) * gamma[i]`, the host's weighted RMSNorm of its own output with
+// `norm_eps` (`rms_norm_with_scale`), the row inkling_weighted_norm would produce.
+struct MixExtras {
+    const float *addend;
+    const float *gamma;
+    float *normed;
+    float norm_eps;
+};
+
 // One block's mix: the body of `inkling_stream_mix` (a block per state) and of each job of
 // `inkling_stream_mix_jobs` (a block per job), so both give the same bits.
 __device__ __forceinline__ void mix_one(const float *state, const float *query, float *out,
                                         float *health, int first_block, int blocks, int width,
-                                        float eps) {
+                                        float eps, MixExtras extras) {
     __shared__ float scratch[threads];
     __shared__ float scores[max_rows];
     __shared__ float weights[max_rows];
@@ -126,6 +105,17 @@ __device__ __forceinline__ void mix_one(const float *state, const float *query, 
     const int sub = lane & 31;
     const int rows = blocks - first_block + 1;
     int invalid = 0;
+    // The host's add comes first; the block sum below is the barrier after which every lane's
+    // later reads of the current row see the sum.
+    if (extras.addend) {
+        float *const current = const_cast<float *>(state);
+        for (int i = lane; i < width; i += threads) {
+            const float value = __fadd_rn(current[i], extras.addend[i]);
+            current[i] = value;
+            invalid |= !isfinite(value);
+        }
+        __syncthreads();
+    }
     // Rust rms_norm_with_scale on the current row: scale = (dot(x, x) / len + eps).sqrt().recip().
     {
         float squares = 0.0f;
@@ -238,6 +228,32 @@ __device__ __forceinline__ void mix_one(const float *state, const float *query, 
         out[i] = value;
         invalid |= !isfinite(value);
     }
+    if (extras.normed) {
+        // The weighted norm of the row this block just wrote: a lane reads back the elements it
+        // wrote, so the sum of squares needs no further barrier. The scale is the host's within
+        // floating-point error, as the depth stream's reductions are.
+        const float scale = rms_scale(out, width, extras.norm_eps, scratch, invalid);
+        int i = lane;
+        for (; i + threads * (kSquareLoads - 1) < width; i += threads * kSquareLoads) {
+            float value[kSquareLoads], weight[kSquareLoads];
+            #pragma unroll
+            for (int u = 0; u < kSquareLoads; ++u) {
+                value[u] = out[i + threads * u];
+                weight[u] = extras.gamma[i + threads * u];
+            }
+            #pragma unroll
+            for (int u = 0; u < kSquareLoads; ++u) {
+                const float result = __fmul_rn(__fmul_rn(value[u], scale), weight[u]);
+                extras.normed[i + threads * u] = result;
+                invalid |= !isfinite(result);
+            }
+        }
+        for (; i < width; i += threads) {
+            const float result = __fmul_rn(__fmul_rn(out[i], scale), extras.gamma[i]);
+            extras.normed[i] = result;
+            invalid |= !isfinite(result);
+        }
+    }
     report(health, invalid);
 }
 
@@ -245,7 +261,8 @@ __global__ void inkling_stream_mix(const float *state, const float *query, float
                                    float *health, int first_block, int blocks, int width,
                                    float eps, int stride) {
     mix_one(state + static_cast<size_t>(blockIdx.x) * stride * width, query,
-            out + static_cast<size_t>(blockIdx.x) * width, health, first_block, blocks, width, eps);
+            out + static_cast<size_t>(blockIdx.x) * width, health, first_block, blocks, width, eps,
+            MixExtras{});
 }
 
 // Independent mixes in one launch, a block per job: the bank queries and the attention query of
@@ -259,12 +276,13 @@ struct MixJobs {
     float *out[max_mix_jobs];
     int first_block[max_mix_jobs];
     int blocks[max_mix_jobs];
+    MixExtras extras[max_mix_jobs];
 };
 
 __global__ void inkling_stream_mix_jobs(MixJobs jobs, float *health, int width, float eps) {
     const int j = blockIdx.x;
     mix_one(jobs.state[j], jobs.query[j], jobs.out[j], health, jobs.first_block[j], jobs.blocks[j],
-            width, eps);
+            width, eps, jobs.extras[j]);
 }
 
 __global__ void inkling_stream_seal(float *state, const float *next, float *health, int blocks,
@@ -559,6 +577,90 @@ extern "C" int inference_cuda_inkling_stream_mix_jobs(const void *const *rows, c
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
             }
         }
+    }
+    inkling_stream_mix_jobs<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        jobs, health, width, eps);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return static_cast<int>(failure.err);
+}
+
+// The decode glue's job lists: `rows` holds `state, query, out, addend, gamma, normed` per job
+// (the last three may be null; `gamma` and `normed` are both null or both set), `extents` holds
+// `first_block, blocks` and `norm_eps` the epilogue's eps per job.
+bool read_glue_jobs(const void *const *rows, const int *extents, const float *norm_eps,
+                    int count, MixJobs &jobs) {
+    for (int j = 0; j < count; ++j) {
+        const void *const *r = rows + 6 * j;
+        const auto *state = static_cast<const float *>(r[0]);
+        const auto *query = static_cast<const float *>(r[1]);
+        auto *out = static_cast<float *>(const_cast<void *>(r[2]));
+        const auto *addend = static_cast<const float *>(r[3]);
+        const auto *gamma = static_cast<const float *>(r[4]);
+        auto *normed = static_cast<float *>(const_cast<void *>(r[5]));
+        const int first_block = extents[2 * j], blocks = extents[2 * j + 1];
+        const bool norm = gamma != nullptr;
+        if (!state || !query || !out || !aligned(state) || !aligned(query) || !aligned(out) ||
+            (addend && !aligned(addend)) || (!norm && normed) ||
+            (norm && (!normed || !aligned(gamma) || !aligned(normed))) ||
+            first_block < 0 || blocks < first_block || blocks > max_blocks ||
+            (norm && !valid_shape(1, norm_eps[j]))) {
+            return false;
+        }
+        jobs.state[j] = state;
+        jobs.query[j] = query;
+        jobs.out[j] = out;
+        jobs.first_block[j] = first_block;
+        jobs.blocks[j] = blocks;
+        jobs.extras[j] = {addend, gamma, normed, norm ? norm_eps[j] : 0.0f};
+    }
+    return true;
+}
+
+// Every row a job writes (its output, its normed row, the current row it adds into, the health
+// word) shares no byte with a row any job reads or writes, except the health word every job
+// writes and, within one job, the output its norm reads, the normed row itself and the current
+// row that is part of the state it mixes.
+bool glue_jobs_apart(const MixJobs &jobs, int count, const void *health, size_t row) {
+    for (int j = 0; j < count; ++j) {
+        const MixExtras &x = jobs.extras[j];
+        const void *writes[4] = {jobs.out[j], x.normed, x.addend ? jobs.state[j] : nullptr, health};
+        const size_t write_bytes[4] = {row, row, row, sizeof(float)};
+        for (int k = 0; k < count; ++k) {
+            const MixExtras &y = jobs.extras[k];
+            const void *reads[6] = {jobs.state[k], jobs.query[k], y.addend, y.gamma, jobs.out[k],
+                                    y.normed};
+            const size_t read_bytes[6] = {static_cast<size_t>(jobs.blocks[k] + 1) * row, row, row,
+                                          row, row, row};
+            for (int w = 0; w < 4; ++w) {
+                if (!writes[w]) continue;
+                for (int r = 0; r < 6; ++r) {
+                    if (!reads[r]) continue;
+                    if (k == j && ((w == 0 && r == 4) || (w == 1 && r == 5) || (w == 2 && r == 0)))
+                        continue;
+                    if (overlaps(writes[w], write_bytes[w], reads[r], read_bytes[r])) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+extern "C" int inference_cuda_inkling_stream_mix_jobs_glue(const void *const *rows,
+                                                            const int *extents,
+                                                            const float *norm_eps, int count,
+                                                            float *health, int width, float eps,
+                                                            void *stream, int *out_stage) {
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+    if (!rows || !extents || !norm_eps || !health || !stream || count < 1 ||
+        count > max_mix_jobs || !aligned(health) || !valid_shape(width, eps)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    MixJobs jobs{};
+    if (!read_glue_jobs(rows, extents, norm_eps, count, jobs) ||
+        !glue_jobs_apart(jobs, count, health, static_cast<size_t>(width) * sizeof(float))) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     inkling_stream_mix_jobs<<<count, threads, 0, static_cast<cudaStream_t>(stream)>>>(
         jobs, health, width, eps);

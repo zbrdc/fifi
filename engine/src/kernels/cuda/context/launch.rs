@@ -288,6 +288,7 @@ pub(crate) fn require_fit(
 /// The kernel wrappers of `kernels::cuda::resident` build their claims with [`Claim::of`] and
 /// compare them with [`require_apart`]; they must not keep a local copy of the overlap rule.
 /// (The native children use `native::resident::Span` instead.)
+#[derive(Clone, Copy)]
 pub(crate) struct Claim<'a> {
     name: &'static str,
     buffer: &'a DeviceBuffer,

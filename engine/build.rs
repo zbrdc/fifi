@@ -152,6 +152,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_conv.cu",
     "src/kernels/cuda/native/resident/head_tile.cu",
     "src/kernels/cuda/native/resident/q6_f32.cu",
+    "src/kernels/cuda/native/resident/inkling_decode_controller.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -338,6 +339,10 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_weight_panel.cuh",
     "src/kernels/cuda/native/resident/gguf_gemv.cuh",
     "src/kernels/cuda/native/resident/inkling_conv.h",
+    "src/kernels/cuda/native/resident/inkling_decode_controller.h",
+    "src/kernels/cuda/native/resident/inkling_controller_norm.cuh",
+    "src/kernels/cuda/native/resident/inkling_stream_norm.cuh",
+    "src/kernels/cuda/native/resident/inkling_warp_sum.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_experts.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_control_pair.cuh",
     "src/kernels/cuda/native/resident/inkling_decode_attention_group.cuh",

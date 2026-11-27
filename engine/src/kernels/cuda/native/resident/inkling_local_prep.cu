@@ -199,11 +199,75 @@ __global__ void inkling_weighted_norm(const float *input, const float *gamma,
     const int failed = __syncthreads_or(bad);
     if (lane == 0) status[row] = failed ? 1.f : 0.f;
 }
+
+// Parallel form of the weighted norm for the launch-only chain
+// (`inference_cuda_inkling_weighted_norm_reduced`, selected by FIFI_INKLING_CUDA_DECODE_GLUE).
+// A lane keeps its kNormKeep samples of the row in registers, adds their squares in row order,
+// the warp adds its lanes in tree order and every lane adds the eight warp partials in warp
+// order. The sum is therefore not the host's ordered sum: the scale agrees with the host within
+// floating-point error, as the depth stream kernels do. The row is read once; the one-block
+// kernel pays one memory latency per pass instead of a dependent add per element.
+constexpr int kNormThreads = 256;
+constexpr int kNormWarps = kNormThreads / 32;
+constexpr int kNormKeep = kMaxNormWidth / kNormThreads;
+static_assert(kNormKeep * kNormThreads == kMaxNormWidth, "the register tile covers the widest row");
+
+__global__ void inkling_weighted_norm_reduced(const float *input, const float *gamma,
+    float *output, float *status, int width, float eps) {
+    __shared__ float partials[kNormWarps];
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float *x = input + row * width;
+    float value[kNormKeep];
+    int invalid = 0;
+    float squares = 0.f;
+#pragma unroll
+    for (int u = 0; u < kNormKeep; ++u) {
+        const int i = lane + u * kNormThreads;
+        value[u] = i < width ? x[i] : 0.f;
+        invalid |= i < width && !isfinite(value[u]);
+        squares = __fadd_rn(squares, __fmul_rn(value[u], value[u]));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        squares = __fadd_rn(squares, __shfl_xor_sync(0xffffffffu, squares, offset));
+    }
+    if ((lane & 31) == 0) partials[lane >> 5] = squares;
+    __syncthreads();
+    // The same sum in every lane: the scale is one value for the whole block.
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kNormWarps; ++w) total = __fadd_rn(total, partials[w]);
+    const float root = __fsqrt_rn(__fadd_rn(__fdiv_rn(total, float(width)), eps));
+    invalid |= !isfinite(total) || !isfinite(root);
+    const float scale = isfinite(root) ? __frcp_rn(root) : __int_as_float(0x7fc00000);
+#pragma unroll
+    for (int u = 0; u < kNormKeep; ++u) {
+        const int i = lane + u * kNormThreads;
+        if (i >= width) continue;
+        const float result = __fmul_rn(__fmul_rn(value[u], scale), gamma[i]);
+        output[row * width + i] = result;
+        invalid |= !isfinite(result);
+    }
+    const int failed = __syncthreads_or(invalid);
+    if (lane == 0) status[row] = failed ? 1.f : 0.f;
+}
 } // namespace
 
 extern "C" int inference_cuda_inkling_weighted_norm(void *const *p, int rows, int width,
     float eps, void *stream, int *out_stage) {
     inkling_weighted_norm<<<rows, 128, 0, (cudaStream_t)stream>>>(
+        static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
+        static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
+}
+
+extern "C" int inference_cuda_inkling_weighted_norm_reduced(void *const *p, int rows, int width,
+    float eps, void *stream, int *out_stage) {
+    inkling_weighted_norm_reduced<<<rows, kNormThreads, 0, (cudaStream_t)stream>>>(
         static_cast<const float *>(p[0]), static_cast<const float *>(p[1]),
         static_cast<float *>(p[2]), static_cast<float *>(p[3]), width, eps);
     Failure failure;

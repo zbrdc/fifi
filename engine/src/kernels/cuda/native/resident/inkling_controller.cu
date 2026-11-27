@@ -4,10 +4,12 @@
 
 #include "abi.h"
 #include "device.h"
+#include "resident/inkling_controller_norm.cuh"
 #include "resident/ordered_sum.cuh"
 
 namespace {
 constexpr int threads = 256;
+static_assert(threads == kNormThreads, "the controller norm reduces one partial per thread");
 
 // Packed [gate outputs | raw triples | scale pairs], all in role order.
 __global__ void inkling_rebuild_gates(float *workspace, int width, int roles) {
@@ -69,40 +71,8 @@ __global__ void inkling_prepare_controller(const float *pairs, const float *gamm
     if (lane == 0) health[half] = failed ? __int_as_float(0x7fc00000) : 0.0f;
 }
 
-// One role over the caller's rows: `out = rmsnorm((input - tanh(forget) * input) + tanh(gain)
-// * message) * gamma`, the host's controller step, every operation rounded.
-__device__ void controller_norm_one(const float *input, const float *message, const float *gamma,
-                                    const float *gain, const float *forget, float *out,
-                                    float *health, int width, float eps) {
-    const int lane = threadIdx.x;
-
-    __shared__ float sums[threads];
-    float squares = 0.0f;
-    bool invalid = false;
-    for (int i = lane; i < width; i += threads) {
-        const float kept = __fsub_rn(input[i], __fmul_rn(tanhf(forget[i]), input[i]));
-        const float x = __fadd_rn(kept, __fmul_rn(tanhf(gain[i]), message[i]));
-        invalid |= !isfinite(gain[i]) || !isfinite(forget[i]) || !isfinite(x);
-        out[i] = x;
-        squares += x * x;
-    }
-    sums[lane] = squares;
-    __syncthreads();
-    for (int stride = threads / 2; stride != 0; stride /= 2) {
-        if (lane < stride) sums[lane] += sums[lane + stride];
-        __syncthreads();
-    }
-    const float variance = sums[0] / width + eps;
-    const float scale = 1.0f / sqrtf(variance);
-    invalid |= !isfinite(variance) || !isfinite(scale);
-    for (int i = lane; i < width; i += threads) {
-        out[i] = __fmul_rn(__fmul_rn(out[i], scale), gamma[i]);
-        invalid |= !isfinite(out[i]);
-    }
-    const int failed = __syncthreads_or(invalid);
-    if (lane == 0) health[0] = failed ? __int_as_float(0x7fc00000) : 0.0f;
-}
-
+// One role over the caller's rows: `controller_norm_one` lives in
+// resident/inkling_controller_norm.cuh, which the fused decode controller launch shares.
 __global__ void inkling_controller_norm(float *workspace, float *health, int width, float eps) {
     const int role = blockIdx.x;
     const int roles = gridDim.x;

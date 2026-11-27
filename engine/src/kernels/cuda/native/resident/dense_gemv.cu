@@ -16,6 +16,7 @@
 #include "device.h"
 #include "resident/dense_gemv.h"
 #include "resident/gguf_gemv.cuh"
+#include "resident/inkling_warp_sum.cuh"
 
 namespace {
 
@@ -44,12 +45,6 @@ bool apart(const Span &a, const Span &b) {
 __device__ __forceinline__ float widen(float v) { return v; }
 __device__ __forceinline__ float widen(__half v) { return __half2float(v); }
 __device__ __forceinline__ float widen(__nv_bfloat16 v) { return __bfloat162float(v); }
-
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
 
 // grid (ceil(rows / kWarps), m); dynamic shared memory holds one row of x.
 template <typename W, bool kVector>

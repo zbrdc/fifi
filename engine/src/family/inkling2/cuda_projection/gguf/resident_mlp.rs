@@ -39,6 +39,10 @@ pub(in crate::family::inkling2) struct ResidentMlpRequest<'a> {
     pub rank: usize,
     pub eps: f32,
     pub input: DeviceRange<'a>,
+    /// The decode glue (`FIFI_INKLING_CUDA_DECODE_GLUE`): the weighted norm of `input` that the
+    /// caller's depth mix already wrote, which the plain MLP reads instead of norming `input`
+    /// into `message`; absent for the controlled MLP and when the glue is off.
+    pub pre_normed: Option<DeviceRange<'a>>,
     pub message: DeviceRange<'a>,
     pub gamma: DeviceRange<'a>,
     pub bias: DeviceRange<'a>,
@@ -145,6 +149,7 @@ impl GgufCuda {
             health,
             gate_health,
             status,
+            ..
         } = request;
         require_packed(dtypes)?;
         let routed = self.routed(layer)?;
@@ -194,7 +199,9 @@ impl GgufCuda {
     }
 
     /// Unbanked MLP: the unused message row is the norm target. The caller
-    /// supplies disjoint exact rows from the pre-admitted visit layout.
+    /// supplies disjoint exact rows from the pre-admitted visit layout. Under the
+    /// decode glue the caller's depth mix already normed the input (`pre_normed`), which
+    /// the router and the experts read without a norm launch.
     pub(in crate::family::inkling2) fn enqueue_plain_mlp(
         &self,
         stream: &DeviceStream,
@@ -202,17 +209,23 @@ impl GgufCuda {
     ) -> Result<(), EngError> {
         require_packed(r.dtypes)?;
         let routed = self.routed(r.layer)?;
-        self.context.enqueue_row_weighted_norm(
-            stream,
-            [r.input, r.gamma, r.message, r.health],
-            routed.shape.hidden,
-            r.eps,
-        )?;
+        let x = match r.pre_normed {
+            Some(normed) => normed,
+            None => {
+                self.context.enqueue_row_weighted_norm(
+                    stream,
+                    [r.input, r.gamma, r.message, r.health],
+                    routed.shape.hidden,
+                    r.eps,
+                )?;
+                r.message
+            }
+        };
         self.enqueue_routed(
             stream,
             &routed,
             (r.dtypes, (r.caps, r.scale)),
-            [r.message, r.bias, r.status, r.out],
+            [x, r.bias, r.status, r.out],
         )
     }
 

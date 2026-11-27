@@ -7,7 +7,11 @@ use crate::{
     EngError,
     family::inkling2::cpu_forward::MIX_EPS,
     kernels::cuda::{
-        CudaContext, DeviceRange, DeviceStream, PinnedBuf, resident::inkling_stream::NormCall,
+        CudaContext, DeviceRange, DeviceStream, PinnedBuf,
+        resident::{
+            inkling_decode_controller::{ApplyRole, GateRole, PAIR_RANK},
+            inkling_stream::NormCall,
+        },
     },
 };
 
@@ -266,8 +270,9 @@ impl DenseStep {
                 return Err(bad("CUDA resident local attention projection rows differ"));
             }
         }
-        // The rows of every controller role: the caller's triples, the gain and forget rows
-        // the GEMVs wrote (or the caller's zero rows), and the normed output rows.
+        // The rows of every controller role that the separate launches still norm: the
+        // caller's triples, the gain and forget rows the GEMVs wrote (or the caller's zero
+        // rows), and the normed output rows. The fused chain of the decode glue leaves none.
         let controller_rows: Vec<[DeviceRange<'_>; 6]> = match &inputs {
             ResidentLocalInputs::Plain {
                 input,
@@ -302,27 +307,35 @@ impl DenseStep {
                 }
                 let roles = role_inputs.unwrap_or([*input; 3]);
                 require_rows("role input", &roles.each_ref(), hidden)?;
-                self.norm_gates(context, stream, (&roles, messages, gate_health), hidden)?;
-                // The controller GEMVs write the gain and forget rows into the work slot; the
-                // norm reads them next to the caller's input, message and gamma rows.
-                let calls =
-                    self.controlled_attention_calls(hidden, controllers.expect("bank checked"))?;
-                context.dense_gemv_group(stream, &calls)?;
-                let mut rows = Vec::with_capacity(3);
-                for role in 0..3 {
-                    rows.push([
-                        roles[role],
-                        messages[role],
-                        gammas[role],
-                        self.range(Slot::Output, (PAIRS_AT + 2 * role) * hidden, hidden)?,
-                        self.range(Slot::Output, (PAIRS_AT + 1 + 2 * role) * hidden, hidden)?,
-                        self.range(Slot::Output, (layout.normed_at + role) * hidden, hidden)?,
-                    ]);
+                let controllers = controllers.expect("bank checked");
+                if self.fused_controllers(
+                    context,
+                    stream,
+                    (&roles, *messages, *gammas, *health, gate_health),
+                    controllers,
+                    (&layout, hidden, eps),
+                )? {
+                    Vec::new()
+                } else {
+                    self.norm_gates(context, stream, (&roles, messages, gate_health), hidden)?;
+                    self.separate_controllers(
+                        context,
+                        stream,
+                        (roles, *messages, *gammas),
+                        controllers,
+                        (hidden, &layout),
+                    )?
                 }
-                rows
             }
         };
-        context.inkling_controller_norm_rows(stream, &controller_rows, *health, (hidden, eps))?;
+        if !controller_rows.is_empty() {
+            context.inkling_controller_norm_rows(
+                stream,
+                &controller_rows,
+                *health,
+                (hidden, eps),
+            )?;
+        }
         let calls = weights
             .into_iter()
             .zip(targets.projections)
@@ -333,6 +346,118 @@ impl DenseStep {
             })
             .collect::<Result<Vec<_>, _>>()?;
         context.dense_gemv_group(stream, &calls)
+    }
+
+    /// The controller chain of the three roles as its separate launches: the controller
+    /// GEMVs write the gain and forget rows into the work slot; the norm reads them next to
+    /// the caller's input, message and gamma rows.
+    fn separate_controllers<'a>(
+        &'a self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        (roles, messages, gammas): (
+            [DeviceRange<'a>; 3],
+            [DeviceRange<'a>; 3],
+            [DeviceRange<'a>; 3],
+        ),
+        controllers: [ControllerWeights<'_>; 3],
+        (hidden, layout): (usize, &ResidentLayout),
+    ) -> Result<Vec<[DeviceRange<'a>; 6]>, EngError> {
+        let calls = self.controlled_attention_calls(hidden, controllers)?;
+        context.dense_gemv_group(stream, &calls)?;
+        let mut rows = Vec::with_capacity(3);
+        for role in 0..3 {
+            rows.push([
+                roles[role],
+                messages[role],
+                gammas[role],
+                self.range(Slot::Output, (PAIRS_AT + 2 * role) * hidden, hidden)?,
+                self.range(Slot::Output, (PAIRS_AT + 1 + 2 * role) * hidden, hidden)?,
+                self.range(Slot::Output, (layout.normed_at + role) * hidden, hidden)?,
+            ]);
+        }
+        Ok(rows)
+    }
+
+    /// The controller chain of the three roles as the two launches of the decode glue
+    /// (`FIFI_INKLING_CUDA_DECODE_GLUE`), the bits of `norm_gates`, `dense_gemv_group` and
+    /// `inkling_controller_norm_rows` above: one `decode_controller_gate_down` over the three
+    /// gate rows and one `decode_controller_pair_norm` writing the three normed rows. Each
+    /// role's reduced row and the three tickets take the raw triple block of the slot, which
+    /// the resident chain leaves unused. `false` keeps the separate launches, before any
+    /// launch: a weight that is not F32 or not of rank [`PAIR_RANK`], or a slot too small for
+    /// the rows.
+    #[allow(clippy::type_complexity)]
+    fn fused_controllers(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        (roles, messages, gammas, health, gate_health): (
+            &[DeviceRange<'_>; 3],
+            [DeviceRange<'_>; 3],
+            [DeviceRange<'_>; 3],
+            DeviceRange<'_>,
+            DeviceRange<'_>,
+        ),
+        controllers: [ControllerWeights<'_>; 3],
+        (layout, hidden, eps): (&ResidentLayout, usize, f32),
+    ) -> Result<bool, EngError> {
+        // Rows of the slot are counted in floats.
+        let reduced_at = RAW_AT * hidden;
+        let tickets_at = (reduced_at + 3 * PAIR_RANK).next_multiple_of(4);
+        let Ok(tickets) = self.range(Slot::Output, tickets_at, 3) else {
+            return Ok(false);
+        };
+        let mut gates = Vec::with_capacity(3);
+        let mut applies = Vec::with_capacity(3);
+        for role in 0..3 {
+            let reduced = match self.range(Slot::Output, reduced_at + role * PAIR_RANK, PAIR_RANK) {
+                Ok(reduced) => reduced,
+                Err(_) => return Ok(false),
+            };
+            // The `[input | message]` row `norm_gates` wrote, then the pair and output rows.
+            let gate = self.range(Slot::Output, 2 * role * hidden, 2 * hidden)?;
+            let gain = self.range(Slot::Output, (PAIRS_AT + 2 * role) * hidden, hidden)?;
+            let forget = self.range(Slot::Output, (PAIRS_AT + 1 + 2 * role) * hidden, hidden)?;
+            let out = self.range(Slot::Output, (layout.normed_at + role) * hidden, hidden)?;
+            let calls = self.controller_calls(controllers[role], [gate, reduced, gain, forget])?;
+            let Some(fused) = self.fused_controller(&calls, hidden) else {
+                return Ok(false);
+            };
+            let word = size_of::<u32>();
+            gates.push(GateRole {
+                input: roles[role],
+                message: messages[role],
+                gate: fused.gate,
+                down: fused.down,
+                reduced: fused.reduced,
+                health: [
+                    gate_health.slice(2 * role * word, word)?,
+                    gate_health.slice((2 * role + 1) * word, word)?,
+                ],
+            });
+            applies.push(ApplyRole {
+                input: roles[role],
+                message: messages[role],
+                gamma: gammas[role],
+                reduced: fused.reduced,
+                gain_w: fused.gain_w,
+                forget_w: fused.forget_w,
+                gain: fused.gain,
+                forget: fused.forget,
+                out,
+                health: health.slice(role * word, word)?,
+            });
+        }
+        context.decode_controller_gate_down(
+            stream,
+            &gates,
+            tickets,
+            [hidden, PAIR_RANK],
+            MIX_EPS,
+        )?;
+        context.decode_controller_pair_norm(stream, &applies, tickets, hidden, eps)?;
+        Ok(true)
     }
 
     /// The six gate halves: one `inkling_stream_norm_rows` launch norms the shared input and

@@ -2,13 +2,17 @@
 
 use std::mem::{align_of, size_of};
 
-use super::{ControlledAttentionInput, ControllerWeights, DenseStep, Slot, bad};
+use super::{ControlledAttentionInput, ControllerWeights, DenseStep, FusedController, Slot, bad};
 use crate::{
     EngError,
     family::inkling2::cpu_forward::MIX_EPS,
     kernels::cuda::{
         Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
-        resident::{dense_gemv::DenseGemvCall, inkling_stream::NormCall},
+        resident::{
+            dense_gemv::DenseGemvCall,
+            inkling_decode_controller::{ApplyRole, GateRole, PAIR_RANK},
+            inkling_stream::NormCall,
+        },
     },
 };
 
@@ -130,6 +134,9 @@ struct Workspace<'a> {
     bias: DeviceRange<'a>,
     x: DeviceRange<'a>,
     calls: [DenseGemvCall<'a>; 3],
+    /// One u32 the fused chain of the decode glue counts its blocks with; the work block's
+    /// first word, which the chain does not otherwise use.
+    tickets: DeviceRange<'a>,
 }
 
 /// Every caller row holds exactly the floats of its role, 4-aligned: the copies take equal
@@ -212,6 +219,7 @@ impl DenseStep {
             bias: self.range(Slot::Output, 0, experts)?,
             x: self.range(Slot::Output, work_at + 5 * width, width)?,
             calls,
+            tickets: self.range(Slot::Output, work_at, 1)?,
         })
     }
 
@@ -265,6 +273,9 @@ impl DenseStep {
         enqueue: impl FnOnce(&DeviceStream, [DeviceRange<'_>; 4]) -> Result<(), EngError>,
     ) -> Result<(), EngError> {
         let row = rows.input.bytes();
+        if let Some(fused) = self.fused_controller(&work.calls, work.width) {
+            return self.launch_fused(context, stream, (rows, work, eps), fused, enqueue);
+        }
         // The gate halves in one launch: the normalized input, then the normalized message.
         let gates = [
             (rows.input, work.gate.slice(0, row)?),
@@ -289,6 +300,65 @@ impl DenseStep {
             (work.width, eps),
         )?;
         enqueue(stream, [work.x, work.bias, rows.status, rows.out])
+    }
+
+    /// The chain of the decode glue (`FIFI_INKLING_CUDA_DECODE_GLUE`): the gate norms and the
+    /// down reduction in one launch, both projections and the controller norm in another, the
+    /// bits of the four launches above. The router reads the caller's bias row where it lives;
+    /// nothing is copied into the arena.
+    fn launch_fused(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        (rows, work, eps): (&RoutedRows<'_>, &Workspace<'_>, f32),
+        fused: FusedController<'_>,
+        enqueue: impl FnOnce(&DeviceStream, [DeviceRange<'_>; 4]) -> Result<(), EngError>,
+    ) -> Result<(), EngError> {
+        let FusedController {
+            gate,
+            down,
+            reduced,
+            gain_w,
+            gain,
+            forget_w,
+            forget,
+        } = fused;
+        let health = [rows.gate_health; 2];
+        let gates = GateRole {
+            input: rows.input,
+            message: rows.message,
+            gate,
+            down,
+            reduced,
+            health,
+        };
+        context.decode_controller_gate_down(
+            stream,
+            std::slice::from_ref(&gates),
+            work.tickets,
+            [work.width, PAIR_RANK],
+            MIX_EPS,
+        )?;
+        let apply = ApplyRole {
+            input: rows.input,
+            message: rows.message,
+            gamma: rows.gamma,
+            reduced,
+            gain_w,
+            forget_w,
+            gain,
+            forget,
+            out: work.x,
+            health: rows.health,
+        };
+        context.decode_controller_pair_norm(
+            stream,
+            std::slice::from_ref(&apply),
+            work.tickets,
+            work.width,
+            eps,
+        )?;
+        enqueue(stream, [work.x, rows.bias, rows.status, rows.out])
     }
 }
 

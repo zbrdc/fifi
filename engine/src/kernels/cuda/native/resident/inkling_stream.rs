@@ -3,6 +3,7 @@
 
 use std::ffi::{c_int, c_void};
 use std::mem::size_of;
+use std::ptr;
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
@@ -31,6 +32,18 @@ unsafe extern "C" {
     fn inference_cuda_inkling_stream_mix_jobs(
         rows: *const *const c_void,
         extents: *const c_int,
+        count: c_int,
+        health: *mut c_void,
+        width: c_int,
+        eps: f32,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
+    fn inference_cuda_inkling_stream_mix_jobs_glue(
+        rows: *const *const c_void,
+        extents: *const c_int,
+        norm_eps: *const f32,
         count: c_int,
         health: *mut c_void,
         width: c_int,
@@ -212,6 +225,19 @@ pub(in crate::kernels::cuda) fn mix(
 /// Largest number of jobs of one [`mix_jobs`] launch.
 pub(crate) const MAX_MIX_JOBS: usize = 8;
 
+/// The decode glue's extras of a mix job: a row the job adds into the current row of its state
+/// before the mix, and the weighted norm of its output (`CpuForward::norm` of the mix).
+pub(in crate::kernels::cuda) struct MixExtrasRaw<'a> {
+    pub(in crate::kernels::cuda) addend: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) norm: Option<MixNormRaw<'a>>,
+}
+
+pub(in crate::kernels::cuda) struct MixNormRaw<'a> {
+    pub(in crate::kernels::cuda) gamma: RawRange<'a>,
+    pub(in crate::kernels::cuda) normed: RawRange<'a>,
+    pub(in crate::kernels::cuda) eps: f32,
+}
+
 /// One job of [`mix_jobs`]: a state of `blocks + 1` rows, its query and its output row.
 pub(in crate::kernels::cuda) struct MixJobRaw<'a> {
     pub(in crate::kernels::cuda) state: RawRange<'a>,
@@ -219,16 +245,23 @@ pub(in crate::kernels::cuda) struct MixJobRaw<'a> {
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) first_block: usize,
     pub(in crate::kernels::cuda) blocks: usize,
+    pub(in crate::kernels::cuda) extras: Option<MixExtrasRaw<'a>>,
 }
 
 /// [`mix`] of each job in one launch, a block per job; the jobs share `health`. Every output and
-/// `health` share no byte with a row any job reads or with each other.
+/// `health` share no byte with a row any job reads or with each other. A job with extras takes
+/// the decode glue's entry, which adds its `addend` into the current row of its state first and
+/// writes the weighted norm of its output; the extras are apart from every row of every job.
 pub(in crate::kernels::cuda) fn mix_jobs(
     stream: &RawStream,
     jobs: &[MixJobRaw<'_>],
     health: RawRange<'_>,
     (width, eps): (usize, f32),
 ) -> Result<(), DeviceFailure> {
+    let glue = jobs.iter().any(|job| job.extras.is_some());
+    if glue {
+        return mix_jobs_glue(stream, jobs, health, (width, eps));
+    }
     let row = width * size_of::<f32>();
     let health_bytes = size_of::<f32>();
     if !(1..=MAX_MIX_JOBS).contains(&jobs.len()) || !sized(&health, health_bytes) {
@@ -289,6 +322,160 @@ pub(in crate::kernels::cuda) fn mix_jobs(
         )
     };
     checked(status, stage)
+}
+
+/// The decode glue's launch: every range of every job is checked here before the entry sees it.
+/// The extras of a job are apart from its own rows and from every row of every other job, except
+/// that its norm reads the job's own output.
+fn mix_jobs_glue(
+    stream: &RawStream,
+    jobs: &[MixJobRaw<'_>],
+    health: RawRange<'_>,
+    shape: (usize, f32),
+) -> Result<(), DeviceFailure> {
+    glue_jobs_apart(jobs, &health, shape)?;
+    let (width, eps) = shape;
+    let rows: Vec<*const c_void> = jobs.iter().map(job_rows).flatten().collect();
+    let extents: Vec<c_int> = jobs
+        .iter()
+        .flat_map(|job| [job.first_block as c_int, job.blocks as c_int])
+        .collect();
+    let norm_eps: Vec<f32> = jobs
+        .iter()
+        .map(|job| {
+            job.extras
+                .as_ref()
+                .and_then(|extras| extras.norm.as_ref())
+                .map_or(1.0, |norm| norm.eps)
+        })
+        .collect();
+    let mut stage = STAGE_NONE;
+    // SAFETY: each job's ranges are aligned and hold the extents above; the outputs, the extras
+    // and the health word share no byte with a read row or with each other. The C entry copies
+    // the lists into the kernel's parameters before it returns.
+    let status = unsafe {
+        inference_cuda_inkling_stream_mix_jobs_glue(
+            rows.as_ptr(),
+            extents.as_ptr(),
+            norm_eps.as_ptr(),
+            jobs.len() as c_int,
+            health.address(),
+            width as c_int,
+            eps,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// `state, query, out, addend, gamma, normed` of one job; a null pointer for an absent extra.
+fn job_rows(job: &MixJobRaw<'_>) -> [*const c_void; 6] {
+    let [state, query, out] =
+        [&job.state, &job.query, &job.out].map(|range| range.address() as *const c_void);
+    let Some(extras) = &job.extras else {
+        return [state, query, out, ptr::null(), ptr::null(), ptr::null()];
+    };
+    let addend = extras
+        .addend
+        .as_ref()
+        .map_or(ptr::null(), |range| range.address() as *const c_void);
+    let (gamma, normed) = match &extras.norm {
+        None => (ptr::null(), ptr::null()),
+        Some(norm) => (
+            norm.gamma.address() as *const c_void,
+            norm.normed.address() as *const c_void,
+        ),
+    };
+    [state, query, out, addend, gamma, normed]
+}
+
+/// The extents and overlaps of the glue's jobs: those of [`mix_jobs`] and, for a job with
+/// extras, one row for each of `addend`, `gamma` and `normed`; every output, normed row and the
+/// health word is apart from every row every job reads and from each other.
+fn glue_jobs_apart(
+    jobs: &[MixJobRaw<'_>],
+    health: &RawRange<'_>,
+    shape: (usize, f32),
+) -> Result<(), DeviceFailure> {
+    let width = shape.0;
+    let row = width * size_of::<f32>();
+    let health_bytes = size_of::<f32>();
+    if !(1..=MAX_MIX_JOBS).contains(&jobs.len()) || !sized(health, health_bytes) {
+        return Err(invalid_argument());
+    }
+    let mut reads = Vec::with_capacity(6 * jobs.len());
+    let mut writes = vec![Span::of(health, health_bytes)];
+    for job in jobs {
+        glue_job_valid(job, shape)?;
+        let state_bytes = (job.blocks + 1) * row;
+        let state = Span::of(&job.state, state_bytes);
+        // The addend joins the current row in place, so a job with one writes its state: the
+        // state must then share no byte with the job's own addend, gamma and output rows either.
+        let writes_state = job
+            .extras
+            .as_ref()
+            .is_some_and(|extras| extras.addend.is_some());
+        if writes_state {
+            writes.push(state);
+        } else {
+            reads.push(state);
+        }
+        if let Some(extras) = &job.extras {
+            reads.extend(extras.addend.iter().map(|range| Span::of(range, row)));
+            if let Some(norm) = &extras.norm {
+                reads.push(Span::of(&norm.gamma, row));
+                writes.push(Span::of(&norm.normed, row));
+            }
+        }
+        reads.push(Span::of(&job.query, row));
+        writes.push(Span::of(&job.out, row));
+    }
+    let apart = writes.iter().enumerate().all(|(at, write)| {
+        reads.iter().all(|read| write.apart(read))
+            && writes[at + 1..].iter().all(|other| write.apart(other))
+    });
+    if !apart {
+        return Err(invalid_argument());
+    }
+    Ok(())
+}
+
+/// One job's extents: those [`mix_jobs`] checks and, with extras, an addend outside the state,
+/// one row for each of `gamma` and `normed`, and a finite positive eps for the norm.
+fn glue_job_valid(job: &MixJobRaw<'_>, (width, eps): (usize, f32)) -> Result<(), DeviceFailure> {
+    let row = width * size_of::<f32>();
+    if !(job.first_block <= job.blocks && shape(job.blocks, width, eps)) {
+        return Err(invalid_argument());
+    }
+    let state_bytes = (job.blocks + 1) * row;
+    if !(sized(&job.state, state_bytes) && sized(&job.query, row) && sized(&job.out, row)) {
+        return Err(invalid_argument());
+    }
+    let state = Span::of(&job.state, state_bytes);
+    if !state.apart(&Span::of(&job.query, row)) {
+        return Err(invalid_argument());
+    }
+    let Some(extras) = &job.extras else {
+        return Ok(());
+    };
+    if extras
+        .addend
+        .as_ref()
+        .is_some_and(|addend| !sized(addend, row) || !Span::of(addend, row).apart(&state))
+    {
+        return Err(invalid_argument());
+    }
+    let Some(norm) = &extras.norm else {
+        return Ok(());
+    };
+    if !(norm.eps.is_finite() && norm.eps > 0.0)
+        || !(sized(&norm.gamma, row) && sized(&norm.normed, row))
+        || !(Span::of(&norm.gamma, row).apart(&state) && Span::of(&norm.normed, row).apart(&state))
+    {
+        return Err(invalid_argument());
+    }
+    Ok(())
 }
 
 /// Ranges of a host-ordered mix: `query` absent takes the raw current row, `gamma` present

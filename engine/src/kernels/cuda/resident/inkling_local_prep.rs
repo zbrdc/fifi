@@ -232,7 +232,8 @@ fn validate_planes<const N: usize>(
 
 impl CudaContext {
     /// Launch-only, single-row RMSNorm/gamma. The transaction owns the status
-    /// word until its final fence; validation still precedes the launch.
+    /// word until its final fence; validation still precedes the launch. The context's
+    /// decode glue policy selects the block reduction over the host-ordered sum.
     pub(crate) fn enqueue_row_weighted_norm(
         &self,
         stream: &DeviceStream,
@@ -252,8 +253,9 @@ impl CudaContext {
         )?;
         let [a, b, c, d] = ranges.each_ref().map(|r| self.raw_range(r));
         let raw = [a?, b?, c?, d?];
-        self.launch_on(stream, |s| {
-            resident::inkling_local_prep::weighted_norm(s, raw, [1, width], eps)
+        let reduced = self.dense_group_policy().decode_glue;
+        self.launch_on(stream, move |s| {
+            resident::inkling_local_prep::weighted_norm(s, raw, [1, width], eps, reduced)
         })
     }
 
@@ -412,6 +414,94 @@ mod tests {
                 .map(|v| u32::from_ne_bytes(*v));
             assert!(row.eq(ordered_norm(&input, &gamma, eps)), "width {width}");
         }
+    }
+
+    /// The decode glue's block reduction: the scale is the host's within floating-point error,
+    /// the status word is that of the ordered form, and the policy is the only difference.
+    #[test]
+    fn weighted_norm_under_the_decode_glue_agrees_with_the_scalar_norm() {
+        if !device_present("Inkling CUDA weighted norm (decode glue)") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        ctx.set_dense_group_policy(
+            crate::kernels::cuda::resident::dense_gemv::DenseGroupPolicy {
+                decode_glue: true,
+                ..Default::default()
+            },
+        );
+        let mut seed = 41_u32;
+        let mut generate = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 8) as f32 * (1.0 / 8388608.0) - 1.0
+                })
+                .collect::<Vec<_>>()
+        };
+        for width in [129, 1536, 2304, 4096] {
+            let input = generate(width);
+            let gamma = generate(width);
+            let x = upload_bytes(&ctx, bytes(&input).as_flattened());
+            let g = upload_bytes(&ctx, bytes(&gamma).as_flattened());
+            let y = ctx.allocate(width * 4).unwrap();
+            let status = upload_bytes(&ctx, &[0; 4]);
+            let eps = 1.0e-6f32;
+            ctx.enqueue_row_weighted_norm(
+                &stream,
+                [
+                    x.range(0, x.bytes()).unwrap(),
+                    g.range(0, g.bytes()).unwrap(),
+                    y.range(0, y.bytes()).unwrap(),
+                    status.range(0, status.bytes()).unwrap(),
+                ],
+                width,
+                eps,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            assert_eq!(read_bytes(&ctx, &status, 4), [0; 4], "width {width}");
+            let actual = read_bytes(&ctx, &y, y.bytes());
+            let row = actual
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_ne_bytes(*v))
+                .collect::<Vec<_>>();
+            let squares = input.iter().fold(-0.0f32, |sum, v| sum + v * v);
+            let scale = 1.0 / (squares / width as f32 + eps).sqrt();
+            for (i, (&v, &actual)) in input.iter().zip(&row).enumerate() {
+                let expected = (v * scale) * gamma[i];
+                let tolerance = 4.0e-6f32 * expected.abs().max(1.0);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "width {width}, element {i}"
+                );
+            }
+        }
+        // A non-finite sample fails the status word under the glue as under the ordered form.
+        let input = [1.0f32, f32::NAN, 2.0, 3.0];
+        let gamma = [1.0f32; 4];
+        let x = upload_bytes(&ctx, bytes(&input).as_flattened());
+        let g = upload_bytes(&ctx, bytes(&gamma).as_flattened());
+        let y = ctx.allocate(16).unwrap();
+        let status = upload_bytes(&ctx, &[0; 4]);
+        ctx.enqueue_row_weighted_norm(
+            &stream,
+            [
+                x.range(0, 16).unwrap(),
+                g.range(0, 16).unwrap(),
+                y.range(0, 16).unwrap(),
+                status.range(0, 4).unwrap(),
+            ],
+            4,
+            1.0e-6,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(read_bytes(&ctx, &status, 4), 1.0f32.to_ne_bytes());
+        ctx.set_dense_group_policy(Default::default());
     }
 
     struct Lcg(u32);

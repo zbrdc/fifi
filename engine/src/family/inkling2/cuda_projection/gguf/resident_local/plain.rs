@@ -19,6 +19,7 @@ impl GgufCuda {
         stream: &DeviceStream,
         r: ResidentLocalDecode<'_>,
         normed: [DeviceRange<'_>; 3],
+        pre_normed: [bool; 3],
         global: Option<([DeviceRange<'_>; 2], [DeviceRange<'_>; 2])>,
     ) -> Result<(), EngError> {
         if r.messages.is_some() || global.is_some() != (r.visit.attention == Attention::Global) {
@@ -26,9 +27,16 @@ impl GgufCuda {
         }
         let (att, shape, projection) = self.resident_decode_parts(r.visit, r.position, false)?;
         let mut claims = request_rows(&r, (shape, self.hidden, 4));
-        claims
-            .writes
-            .extend(normed.map(|a| ("plain norm scratch", a, self.hidden)));
+        // A role row the decode glue's mix already normed is read here; the others are written.
+        for (i, row) in normed.iter().enumerate() {
+            if pre_normed[i] {
+                claims.reads.push(("plain normed role", *row, self.hidden));
+            } else {
+                claims
+                    .writes
+                    .push(("plain norm scratch", *row, self.hidden));
+            }
+        }
         if let Some((roles, coeff)) = global {
             claims
                 .reads
@@ -55,6 +63,9 @@ impl GgufCuda {
                 let inputs =
                     global.map_or([r.input; 3], |(roles, _)| [r.input, roles[0], roles[1]]);
                 for i in 0..if global.is_some() { 3 } else { 1 } {
+                    if pre_normed[i] {
+                        continue;
+                    }
                     self.context.enqueue_row_weighted_norm(
                         stream,
                         [inputs[i], r.gammas[i], normed[i], health.controller_health],
