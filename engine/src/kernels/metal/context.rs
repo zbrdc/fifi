@@ -1,0 +1,376 @@
+//! Device memory behind one Metal adapter lease.
+//!
+//! A [`MetalContext`] holds one of the two process leases. Every buffer it creates shares that
+//! lease, so the slot stays reserved until the context and all its buffers are gone. Context and
+//! buffers stay on the creating thread: none of them is `Send`. Each native call runs inside the
+//! process dispatch guard.
+//!
+//! Memory is unified, so a buffer is host memory the GPU reads: [`MetalContext::upload`] fills
+//! a new buffer with no copy stage, and a [`DeviceBuffer`] reads and writes through the same
+//! storage. The host may touch a buffer only while no command buffer that uses it is in
+//! flight; every launch here waits for its command buffer.
+//!
+//! A failed free latches the backend terminal. Drop never panics. After a terminal failure no
+//! native call runs, so the remaining buffers are left to the process exit.
+//!
+//! Every public operation first reports a terminal failure as `Backend` `execute`, then
+//! validates its input, then enters the dispatch guard.
+
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ffi::CString,
+    rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use crate::EngError;
+
+use super::guard::{DispatchGuard, Lease, SLOTS};
+use super::native::{self, Binding, RawBuffer, RawKernel, RawRuntime};
+use super::{
+    ADAPTER_OPERATION, ALLOCATE_OPERATION, COMPILE_OPERATION, INITIALIZE_OPERATION,
+    LAUNCH_OPERATION, SYNCHRONIZE_OPERATION, TERMINAL, ensure_usable, terminal_failure,
+};
+
+/// The threads of each axis of a dispatch.
+pub(crate) type Grid = [usize; 3];
+
+/// The non-finite weight flag of the dense matvec, one `u32`.
+const FLAG_BYTES: usize = 4;
+
+pub(crate) struct MetalContext {
+    pub(super) shared: Rc<Shared>,
+    lease: Rc<Lease>,
+}
+
+/// What a context and its buffers keep alive together: the runtime, the accounting and the
+/// compiled shaders.
+pub(super) struct Shared {
+    runtime: RawRuntime,
+    live_bytes: AtomicUsize,
+    live_buffers: AtomicUsize,
+    /// The compiled shaders, by name and source.
+    kernels: RefCell<HashMap<(&'static str, &'static str), Rc<RawKernel>>>,
+    /// The non-finite weight flag of the dense matvec, made at first use.
+    flag: RefCell<Option<RawBuffer>>,
+}
+
+pub(crate) struct DeviceBuffer {
+    raw: RawBuffer,
+    shared: Rc<Shared>,
+    _lease: Rc<Lease>,
+}
+
+/// The `bytes` bytes of a [`DeviceBuffer`] from `offset` on.
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceRange<'b> {
+    buffer: &'b DeviceBuffer,
+    offset: usize,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for MetalContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalContext")
+            .field("live_bytes", &self.live_bytes())
+            .field("live_buffers", &self.live_buffers())
+            .finish()
+    }
+}
+
+impl MetalContext {
+    /// Opens the default device and its queue and takes a process lease for them. A host with
+    /// no device is a `Backend` error that does not make the backend terminal.
+    pub(crate) fn new() -> Result<Self, EngError> {
+        let lease = Lease::acquire(&SLOTS, &TERMINAL)?;
+        let runtime = {
+            let _guard = DispatchGuard::enter(&TERMINAL);
+            native::runtime_new().map_err(|status| {
+                if status == native::STATUS_NO_DEVICE {
+                    EngError::Backend {
+                        operation: INITIALIZE_OPERATION,
+                        message: "no supported Metal device".to_owned(),
+                    }
+                } else {
+                    terminal_failure(INITIALIZE_OPERATION)
+                }
+            })?
+        };
+        let shared = Rc::new(Shared {
+            runtime,
+            live_bytes: AtomicUsize::new(0),
+            live_buffers: AtomicUsize::new(0),
+            kernels: RefCell::new(HashMap::new()),
+            flag: RefCell::new(None),
+        });
+        Ok(Self { shared, lease })
+    }
+
+    /// The identity of this context, for the check that a range belongs to it.
+    pub(super) fn id(&self) -> usize {
+        Rc::as_ptr(&self.shared) as usize
+    }
+
+    pub(crate) fn live_bytes(&self) -> usize {
+        self.shared.live_bytes.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn live_buffers(&self) -> usize {
+        self.shared.live_buffers.load(Ordering::Acquire)
+    }
+
+    /// A new buffer that holds a copy of `bytes`.
+    pub(crate) fn upload(&self, bytes: &[u8]) -> Result<DeviceBuffer, EngError> {
+        if bytes.is_empty() {
+            return Err(EngError::BadRequest(
+                "a Metal buffer needs at least one byte".to_owned(),
+            ));
+        }
+        ensure_usable(&TERMINAL)?;
+        let raw = {
+            let _guard = DispatchGuard::enter(&TERMINAL);
+            native::buffer_new(&self.shared.runtime, bytes.len())
+                .and_then(|raw| native::buffer_write(&raw, 0, bytes).map(|()| raw))
+                .map_err(|_| terminal_failure(ALLOCATE_OPERATION))?
+        };
+        self.shared.note(&raw);
+        Ok(DeviceBuffer {
+            raw,
+            shared: Rc::clone(&self.shared),
+            _lease: Rc::clone(&self.lease),
+        })
+    }
+
+    /// The compiled shader `name` of `source`, compiled once per context.
+    pub(super) fn kernel(
+        &self,
+        name: &'static str,
+        source: &'static str,
+    ) -> Result<Rc<RawKernel>, EngError> {
+        ensure_usable(&TERMINAL)?;
+        let key = (name, source);
+        if let Some(kernel) = self.shared.kernels.borrow().get(&key) {
+            return Ok(Rc::clone(kernel));
+        }
+        let name_c = CString::new(name)
+            .map_err(|_| EngError::BadRequest("a shader name holds a null byte".to_owned()))?;
+        let source_c = CString::new(source)
+            .map_err(|_| EngError::BadRequest("a shader source holds a null byte".to_owned()))?;
+        let kernel = {
+            let _guard = DispatchGuard::enter(&TERMINAL);
+            // Another thread may have compiled it while this one waited for the guard.
+            if let Some(kernel) = self.shared.kernels.borrow().get(&key) {
+                return Ok(Rc::clone(kernel));
+            }
+            Rc::new(
+                native::kernel_new(&self.shared.runtime, &source_c, &name_c)
+                    .map_err(|_| terminal_failure(COMPILE_OPERATION))?,
+            )
+        };
+        self.shared
+            .kernels
+            .borrow_mut()
+            .insert(key, Rc::clone(&kernel));
+        Ok(kernel)
+    }
+
+    /// Encodes `repeats` dispatches of `kernel` back to back and waits for the command buffer:
+    /// its GPU time in nanoseconds, 0 when the device reports none. `bytes` are the kernel's
+    /// parameters, bound after `bindings`.
+    pub(super) fn launch_repeated(
+        &self,
+        kernel: &RawKernel,
+        bindings: &[Binding],
+        bytes: &[u8],
+        grid: Grid,
+        per_threadgroup: Grid,
+        repeats: usize,
+    ) -> Result<u64, EngError> {
+        ensure_usable(&TERMINAL)?;
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        native::run(
+            &self.shared.runtime,
+            kernel,
+            bindings,
+            bytes,
+            grid,
+            per_threadgroup,
+            repeats,
+        )
+        .map_err(|status| {
+            terminal_failure(match status {
+                native::STATUS_INVALID | native::STATUS_EXCEPTION => ADAPTER_OPERATION,
+                native::STATUS_COMMAND_BUFFER => SYNCHRONIZE_OPERATION,
+                _ => LAUNCH_OPERATION,
+            })
+        })
+    }
+}
+
+impl Shared {
+    fn note(&self, raw: &RawBuffer) {
+        self.live_bytes.fetch_add(raw.bytes(), Ordering::AcqRel);
+        self.live_buffers.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The non-finite weight flag, made at first use, for `body`.
+    pub(super) fn with_flag<T>(
+        &self,
+        body: impl FnOnce(&RawBuffer) -> Result<T, EngError>,
+    ) -> Result<T, EngError> {
+        if self.flag.borrow().is_none() {
+            let raw = {
+                let _guard = DispatchGuard::enter(&TERMINAL);
+                native::buffer_new(&self.runtime, FLAG_BYTES)
+                    .map_err(|_| terminal_failure(ALLOCATE_OPERATION))?
+            };
+            self.note(&raw);
+            *self.flag.borrow_mut() = Some(raw);
+        }
+        let held = self.flag.borrow();
+        let flag = held
+            .as_ref()
+            .expect("the flag exists after the check above");
+        body(flag)
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // After a terminal failure no native call runs; the process exit reclaims the objects.
+        if TERMINAL.load(Ordering::Acquire) {
+            return;
+        }
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        if let Some(flag) = self.flag.get_mut().take() {
+            native::release(flag.pointer());
+        }
+        native::release(self.runtime.pointer());
+    }
+}
+
+/// A refusal from inside this module, where the caller's input passed the checks: a bug of the
+/// adapter, reported without making the backend terminal.
+pub(super) fn adapter_bug(what: &str) -> EngError {
+    EngError::Backend {
+        operation: ADAPTER_OPERATION,
+        message: format!("{what}: refused inside the Metal module, an error of the adapter"),
+    }
+}
+
+impl DeviceBuffer {
+    pub(crate) fn bytes(&self) -> usize {
+        self.raw.bytes()
+    }
+
+    /// The `bytes` bytes of the buffer from `offset` on.
+    pub(crate) fn range(&self, offset: usize, bytes: usize) -> Result<DeviceRange<'_>, EngError> {
+        let inside = offset
+            .checked_add(bytes)
+            .is_some_and(|end| end <= self.bytes());
+        if bytes == 0 || !inside {
+            return Err(EngError::BadRequest(format!(
+                "the Metal range of {bytes} bytes at offset {offset} does not fit a buffer of {} bytes",
+                self.bytes()
+            )));
+        }
+        Ok(DeviceRange {
+            buffer: self,
+            offset,
+            bytes,
+        })
+    }
+
+    /// Copies `bytes` bytes of the buffer from `offset` on. A host copy: no native call can
+    /// fail.
+    pub(crate) fn read(&self, offset: usize, bytes: usize) -> Result<Vec<u8>, EngError> {
+        let _ = self.range(offset, bytes)?;
+        native::buffer_read(&self.raw, offset, bytes)
+            .map_err(|_| adapter_bug("the host read of a Metal buffer"))
+    }
+
+    /// Copies `data` into the buffer at `offset`.
+    pub(crate) fn write(&self, offset: usize, data: &[u8]) -> Result<(), EngError> {
+        let _ = self.range(offset, data.len())?;
+        native::buffer_write(&self.raw, offset, data)
+            .map_err(|_| adapter_bug("the host write into a Metal buffer"))
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        // After a terminal failure no native call runs; the process exit reclaims the buffer.
+        if TERMINAL.load(Ordering::Acquire) {
+            return;
+        }
+        let _guard = DispatchGuard::enter(&TERMINAL);
+        native::release(self.raw.pointer());
+        self.shared
+            .live_bytes
+            .fetch_sub(self.raw.bytes(), Ordering::AcqRel);
+        self.shared.live_buffers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Identity and text for the tests and the logs: a range is its context, its offset and its
+/// length.
+impl PartialEq for DeviceRange<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner() == other.owner() && self.offset == other.offset && self.bytes == other.bytes
+    }
+}
+
+impl Eq for DeviceRange<'_> {}
+
+impl std::fmt::Debug for DeviceRange<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceRange")
+            .field("offset", &self.offset)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'b> DeviceRange<'b> {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(super) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// The identity of the context that owns the buffer.
+    pub(super) fn owner(&self) -> usize {
+        Rc::as_ptr(&self.buffer.shared) as usize
+    }
+
+    /// The first address the range covers, in the buffer's storage.
+    pub(super) fn address(&self) -> usize {
+        native::contents(&self.buffer.raw) as usize + self.offset
+    }
+
+    pub(super) fn binding(&self) -> Binding {
+        Binding {
+            pointer: self.buffer.raw.pointer(),
+            offset: self.offset,
+        }
+    }
+
+    pub(crate) fn read(&self) -> Result<Vec<u8>, EngError> {
+        self.buffer.read(self.offset, self.bytes)
+    }
+
+    /// Writes the whole range; `data` must have the range's length.
+    pub(crate) fn write(&self, data: &[u8]) -> Result<(), EngError> {
+        if data.len() != self.bytes {
+            return Err(EngError::BadRequest(format!(
+                "the Metal range holds {} bytes, the write carries {}",
+                self.bytes,
+                data.len()
+            )));
+        }
+        self.buffer.write(self.offset, data)
+    }
+}

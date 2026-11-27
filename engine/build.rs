@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/kernels/mlx/native/guard.cpp");
     println!("cargo:rerun-if-changed=src/kernels/mlx/native/device_caps.mm");
     println!("cargo:rerun-if-changed=src/kernels/decision/anebridge.mm");
+    println!("cargo:rerun-if-changed=src/kernels/metal/bridge.mm");
     println!("cargo:rerun-if-env-changed=INFERENCE_NATIVE_COVERAGE");
     build_cuda();
     let macos_arm = matches!(
@@ -32,6 +33,20 @@ fn main() {
         ane.compile("inference_ane_bridge");
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=IOSurface");
+    }
+    if macos_arm && std::env::var("CARGO_FEATURE_NATIVE_METAL").is_ok() {
+        let mut metal = cc::Build::new();
+        metal
+            .cpp(true)
+            .std("c++17")
+            .compiler("/usr/bin/clang++")
+            .file("src/kernels/metal/bridge.mm")
+            .flag("-fobjc-arc")
+            .flag("-Wno-deprecated-declarations")
+            .warnings_into_errors(true);
+        metal.compile("inference_metal_bridge");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=Foundation");
     }
     if !macos_arm || std::env::var_os("CARGO_FEATURE_NATIVE_MLX").is_none() {
         return;
