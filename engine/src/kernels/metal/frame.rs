@@ -24,6 +24,9 @@ use super::{TERMINAL, ensure_usable};
 /// The dispatches one command buffer of a frame holds before it is committed.
 pub(super) const DISPATCHES_PER_BUFFER: usize = 64;
 
+/// The command buffers in flight at most: the one the GPU runs and one ahead of it.
+pub(super) const BUFFERS_IN_FLIGHT: usize = 2;
+
 /// The command buffer being filled, with the buffers bound so far, each once.
 struct Open {
     command: RawCommand,

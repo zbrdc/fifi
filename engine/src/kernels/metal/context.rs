@@ -8,8 +8,9 @@
 //! Memory is unified, so a buffer is host memory the GPU reads: [`MetalContext::upload`] fills
 //! a new buffer with no copy stage, and a [`DeviceBuffer`] reads and writes through the same
 //! storage. The host may touch a buffer only while no command buffer that uses it is in
-//! flight. A launch waits for its command buffer; a frame keeps one command buffer ahead, and
-//! the context waits for it before a host read or write of a buffer it binds.
+//! flight. A launch waits for its command buffer; a frame keeps one command buffer ahead of the
+//! one the GPU runs, and the context waits for the command buffers in flight before a host read
+//! or write of a buffer one of them binds.
 //!
 //! A failed free latches the backend terminal. Drop never panics. After a terminal failure no
 //! native call runs, so the remaining buffers are left to the process exit.
@@ -27,7 +28,7 @@ use std::{
 
 use crate::EngError;
 
-use super::frame::{DISPATCHES_PER_BUFFER, Frame};
+use super::frame::{BUFFERS_IN_FLIGHT, DISPATCHES_PER_BUFFER, Frame};
 use super::guard::{DispatchGuard, Lease, SLOTS};
 use super::native::{self, Binding, RawBuffer, RawCommand, RawKernel, RawRuntime};
 use super::{
@@ -274,8 +275,9 @@ impl Shared {
         self.settled_gpu_ns.replace(0)
     }
 
-    /// Commits `command`, which binds `bound`. One command buffer stays ahead: the one in
-    /// flight, if any, is waited for first.
+    /// Commits `command`, which binds `bound`. At most `BUFFERS_IN_FLIGHT` command buffers are
+    /// in flight: the one the GPU runs and one ahead of it. A further commit waits for the
+    /// oldest first, so the GPU takes the next buffer from the queue, without a stop.
     pub(super) fn commit_ahead(
         &self,
         command: RawCommand,
@@ -283,7 +285,9 @@ impl Shared {
     ) -> Result<(), EngError> {
         ensure_usable(&TERMINAL)?;
         let _guard = DispatchGuard::enter(&TERMINAL);
-        self.wait_oldest()?;
+        while self.in_flight.borrow().len() >= BUFFERS_IN_FLIGHT {
+            self.wait_oldest()?;
+        }
         native::commit(&command).map_err(launch_failure)?;
         self.in_flight
             .borrow_mut()

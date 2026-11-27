@@ -156,9 +156,19 @@ fn a_host_touch_waits_for_the_command_buffer_that_binds_its_buffer() {
 fn one_command_buffer_stays_ahead_of_the_gpu() {
     let rig = Rig::new();
     let mut frame = rig.ctx.frame_of(1);
-    for _ in 0..3 {
+    rig.step(&mut frame, 0.75);
+    assert_eq!(
+        frame.in_flight(),
+        1,
+        "the first command buffer is committed, not waited for"
+    );
+    for _ in 0..2 {
         rig.step(&mut frame, 0.75);
-        assert_eq!(frame.in_flight(), 1, "one command buffer ahead, never two");
+        assert_eq!(
+            frame.in_flight(),
+            2,
+            "the one the GPU runs and one ahead, never three"
+        );
     }
     frame.drain().expect("the drain");
     assert_eq!(frame.in_flight(), 0);
