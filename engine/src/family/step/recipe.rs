@@ -42,6 +42,36 @@ pub(crate) enum Site {
     /// Four streams mixed by learned weights. `halves` names the mix, base and scale tensors of
     /// each half.
     Mixed { halves: [[String; 3]; 2] },
+    /// Attention residuals over depth: one current row and an append-only list of sealed,
+    /// RMS-normed block rows. Each half reads a softmax mix of the sealed rows and the normed
+    /// current row under its learned query; a `None` query means that half reads the current
+    /// row as it stands, with no mix (a first layer has no sealed rows for its attention half to
+    /// mix). The forward half's branch adds onto the current row. The mixer half's branch adds
+    /// onto it too unless `seal` is set: then the current row is sealed (appended, normed) and
+    /// the branch output becomes the new current row, so a block starts at its first visit's
+    /// attention. `repeat` places the visit in a range of layers the model visits more than
+    /// once. A site with no query, no seal and no place in a repeat is [`Site::Plain`], and
+    /// [`Layer::check`] refuses it.
+    DepthAttention {
+        queries: [Option<String>; 2],
+        seal: bool,
+        repeat: Repeat,
+    },
+}
+
+/// Where a visit stands in a range of layers that the model visits more than once (passes over
+/// the same weights). A fact of the layer list, carried by the site that needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Repeat {
+    /// Any visit not at a pass boundary, inside the range or outside it.
+    Step,
+    /// The first visit of the first pass: the state held here is the state every pass starts
+    /// from.
+    Mark,
+    /// The first visit of a later pass: the state goes back to the one held at the mark.
+    Rewind,
+    /// The first visit after the last pass.
+    Leave,
 }
 
 pub(crate) enum Mixer {
@@ -56,10 +86,6 @@ pub(crate) enum Mixer {
         slot: usize,
     },
     /// A mixer of the model's own.
-    #[expect(
-        dead_code,
-        reason = "no model on the walk has a mixer the step lacks; a port may hold one for a slice"
-    )]
     Own,
 }
 
@@ -68,7 +94,6 @@ pub(crate) enum Forward {
     Dense([String; 3]),
     Routed(moe::Names),
     /// A feed-forward of the model's own.
-    #[expect(dead_code, reason = "Inkling's walk is its first reader")]
     Own,
 }
 
@@ -90,7 +115,10 @@ impl Layer {
         match &self.site {
             Site::Routed { routers, .. } => names.extend(routers.iter().flatten().cloned()),
             Site::Mixed { halves } => names.extend(halves.iter().flatten().cloned()),
-            _ => {}
+            Site::DepthAttention { queries, .. } => {
+                names.extend(queries.iter().flatten().cloned());
+            }
+            Site::Plain => {}
         }
         match &self.mixer {
             Mixer::Delta { names: delta, .. } => {
@@ -135,6 +163,18 @@ impl Layer {
             Site::Plain => Vec::new(),
             Site::Routed { routers, .. } => routers.iter().flatten().collect(),
             Site::Mixed { halves } => halves.iter().flatten().collect(),
+            Site::DepthAttention {
+                queries: [None, None],
+                seal: false,
+                repeat: Repeat::Step,
+            } => {
+                return Err(EngError::BadRequest(format!(
+                    "{}: a depth-attention site with no query, no seal and no repeat is a plain \
+                     site",
+                    map.family
+                )));
+            }
+            Site::DepthAttention { queries, .. } => queries.iter().flatten().collect(),
         };
         for name in raws {
             map.raw(name)?;
@@ -313,6 +353,9 @@ impl<M: Model> Visits for Walk<'_, M> {
                 mixed.read(&io, weights, cur, n)?;
                 (mixed.input.range(0, n * h * 4)?, None)
             }
+            Site::DepthAttention { .. } => {
+                return unsupported(m.family(), "a depth-attention site on the device walk");
+            }
         };
         if let Some(weight) = &layer.norms[half as usize] {
             let norm = Norm {
@@ -405,6 +448,9 @@ impl<M: Model> Visits for Walk<'_, M> {
                 let mixed = m.mixed_site()?;
                 mixed.apply(&io, &core.resid[cur], &core.resid[next], branch, n)?;
                 core.cur.set(next);
+            }
+            Site::DepthAttention { .. } => {
+                return unsupported(m.family(), "a depth-attention site on the device walk");
             }
         }
         m.tap(visit, half, Stage::Apply)

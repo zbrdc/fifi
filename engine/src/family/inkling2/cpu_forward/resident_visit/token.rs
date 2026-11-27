@@ -63,38 +63,9 @@ pub(in super::super) struct TokenWorkspace {
 }
 
 impl TokenWorkspace {
-    #[allow(clippy::type_complexity)]
-    fn layout(f: &CpuForward) -> Vec<(bool, bool, usize, Option<(usize, usize)>, usize)> {
-        let c = &f.spec.core;
-        let width = c.core_end - c.core_start;
-        let suffix = c.core_start + width * c.num_passes;
-        let (mut blocks, mut pre, mut bank, mut active) = (0, 0, None, 0);
-        f.visits
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let save = i == c.core_start;
-                if save {
-                    pre = blocks;
-                }
-                let restart =
-                    i > c.core_start && i < suffix && (i - c.core_start).is_multiple_of(width);
-                if restart {
-                    bank = Some((blocks, pre + 1));
-                    blocks = pre;
-                    active ^= 1;
-                }
-                if i == suffix {
-                    bank = None;
-                }
-                let info = (save, restart, blocks, bank, active);
-                blocks += usize::from(
-                    v.weight_layer
-                        .is_multiple_of(f.spec.n_layers_per_attn_res_block),
-                );
-                info
-            })
-            .collect()
+    fn layout(f: &CpuForward) -> Vec<crate::family::inkling2::recipe::Visit> {
+        use crate::family::inkling2::recipe;
+        recipe::token_layout(&recipe::layers(&f.spec))
     }
 
     fn eligible(cuda: &GgufCuda, v: LayerVisit, pos: usize, banked: bool) -> bool {

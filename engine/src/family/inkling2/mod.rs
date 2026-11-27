@@ -20,6 +20,12 @@ mod gguf_weights;
 #[cfg(target_pointer_width = "64")]
 mod phase_profile;
 #[cfg(all(
+    feature = "native-cuda",
+    target_os = "linux",
+    target_pointer_width = "64"
+))]
+mod recipe;
+#[cfg(all(
     target_pointer_width = "64",
     any(test, all(feature = "native-cuda", target_os = "linux"))
 ))]

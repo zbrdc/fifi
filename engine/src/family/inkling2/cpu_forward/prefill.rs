@@ -181,73 +181,8 @@ impl DeviceRun {
 /// The most sealed blocks a state holds over the visits from `index`, starting from `blocks`.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn peak_blocks(forward: &CpuForward, index: usize, blocks: usize) -> usize {
-    let core = &forward.spec.core;
-    count_peak_blocks(
-        forward.visits[index..]
-            .iter()
-            .map(|visit| (visit.state_slot, visit.weight_layer)),
-        (
-            core.core_start,
-            core.core_end - core.core_start,
-            core.num_passes,
-        ),
-        forward.spec.n_layers_per_attn_res_block,
-        blocks,
-    )
-}
-
-/// [`peak_blocks`] over (state slot, weight layer) visits: a visit whose weight layer is a
-/// multiple of `block` seals one, and each core pass after the first restarts from the blocks
-/// at the first pass's start, as `PromptRow::begin_pass` does.
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-fn count_peak_blocks(
-    visits: impl Iterator<Item = (usize, usize)>,
-    (start, width, passes): (usize, usize, usize),
-    block: usize,
-    blocks: usize,
-) -> usize {
-    let (mut now, mut peak, mut prelude) = (blocks, blocks, None);
-    for (slot, layer) in visits {
-        if (start..start + width * passes).contains(&slot) && (slot - start).is_multiple_of(width) {
-            match prelude {
-                None => prelude = Some(now),
-                Some(blocks) => now = blocks,
-            }
-        }
-        if layer.is_multiple_of(block) {
-            now += 1;
-            peak = peak.max(now);
-        }
-    }
-    peak
-}
-
-#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-mod peak_tests {
-    use super::count_peak_blocks;
-
-    /// Six prelude visits, three passes over twelve core layers, six coda layers.
-    fn visits() -> impl Iterator<Item = (usize, usize)> {
-        let prelude = (0..6).map(|layer| (layer, layer));
-        let core = (0..36).map(|i| (6 + i, 6 + i % 12));
-        let coda = (0..6).map(|i| (42 + i, 18 + i));
-        prelude.chain(core).chain(coda)
-    }
-
-    #[test]
-    fn peak_blocks_restart_each_pass_from_the_prelude() {
-        // Seals at layers 0, 4 (prelude), 8, 12, 16 (each pass) and 20 (coda): two before the
-        // passes, five at each pass's end, six after the coda.
-        assert_eq!(count_peak_blocks(visits(), (6, 12, 3), 4, 0), 6);
-        assert_eq!(count_peak_blocks(visits(), (6, 12, 3), 4, 3), 9);
-        // From the second pass's start the prelude is that pass's own start.
-        assert_eq!(count_peak_blocks(visits().skip(18), (6, 12, 3), 4, 2), 6);
-        // One pass: no restart.
-        let one = (0..6)
-            .map(|layer| (layer, layer))
-            .chain((0..12).map(|i| (6 + i, 6 + i)));
-        assert_eq!(count_peak_blocks(one, (6, 12, 1), 4, 0), 5);
-    }
+    use crate::family::inkling2::recipe;
+    recipe::peak_blocks(recipe::layers(&forward.spec)[index..].iter(), blocks)
 }
 
 struct MlpRow {
