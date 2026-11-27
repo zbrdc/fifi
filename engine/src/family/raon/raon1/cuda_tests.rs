@@ -139,6 +139,69 @@ fn the_device_writes_its_greedy_sequence_and_logits() {
     eprintln!("device sequence {tokens:?}");
 }
 
+/// Accuracy probe, not a gate, device half. Writes a stream of `RAON_ACC_TOKENS` tokens (default
+/// 48: the fixture prompt, then the device's greedy choices) to `<RAON_ACC_OUT>.ids`, and the
+/// device's logits row of every position twice: fed one token at a time (`.decode`) and fed as
+/// one chunk (`.prefill`). Rows are little-endian f32, one vocabulary each.
+#[test]
+#[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
+fn the_device_writes_rows_for_an_accuracy_comparison() {
+    let out = PathBuf::from(std::env::var("RAON_ACC_OUT").expect("RAON_ACC_OUT names the output"));
+    let count: usize = std::env::var("RAON_ACC_TOKENS")
+        .map(|v| v.parse().expect("a token count"))
+        .unwrap_or(48);
+    require_device("the_device_writes_rows_for_an_accuracy_comparison");
+    let mut device = Raon1Device::load(&model_path(), Some(4096), &mut |_| {}).expect("load");
+    device.reset().expect("reset");
+    let mut tokens: Vec<u32> = Vec::with_capacity(count);
+    let mut decode: Vec<Vec<f32>> = Vec::with_capacity(count);
+    for pos in 0..count {
+        let token = match PROMPT.get(pos) {
+            Some(&token) => token,
+            None => top_k(decode.last().expect("a logits row"), 1)[0] as u32,
+        };
+        let mut row = device.feed(&[token], pos, HeadRows::Last).expect("a step");
+        tokens.push(token);
+        decode.append(&mut row);
+    }
+    device.reset().expect("reset");
+    let prefill = device.feed(&tokens, 0, HeadRows::All).expect("the chunk");
+    let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    std::fs::write(out.with_extension("ids"), ids).expect("write the ids");
+    write_rows(&out.with_extension("decode"), &decode);
+    write_rows(&out.with_extension("prefill"), &prefill);
+    eprintln!("{count} positions written for the decode and the prefill route");
+}
+
+/// Accuracy probe, host half, no device. Reads `<RAON_ACC_OUT>.ids` and writes the host
+/// reference's rows under each rule of `RAON_ACC_RULES` (default `exact,fork,q8_1`) to
+/// `<RAON_ACC_OUT>.host-<rule>`. `exact` reads f32 activations and is the reference of the
+/// comparison; `fork` rounds as the fork's CPU path does; `q8_1` as the device does.
+#[test]
+#[ignore = "needs RAON_Q4_KM; minutes per rule on the host"]
+fn the_host_writes_rows_for_an_accuracy_comparison() {
+    let out = PathBuf::from(std::env::var("RAON_ACC_OUT").expect("RAON_ACC_OUT names the output"));
+    let rules = std::env::var("RAON_ACC_RULES").unwrap_or("exact,fork,q8_1".to_owned());
+    let model = open_raon_1_mini_preview(&model_path(), None).expect("open");
+    let tokens = read_u32s(&std::fs::read(out.with_extension("ids")).expect("the ids"));
+    for name in rules.split(',') {
+        let rule = match name {
+            "exact" => ActivationRule::Exact,
+            "fork" => ActivationRule::ForkCpu,
+            "q8_1" => ActivationRule::Q8_1Blocks,
+            other => panic!("unknown rule {other}"),
+        };
+        let t0 = std::time::Instant::now();
+        let rows = with_activation_rule(rule, || host_logits(&model, &tokens));
+        write_rows(&out.with_extension(format!("host-{name}")), &rows);
+        eprintln!(
+            "host rule {name}: {} rows in {:.0} s",
+            rows.len(),
+            t0.elapsed().as_secs_f64()
+        );
+    }
+}
+
 /// The logits rows of `tokens` on the host reference under `rule`, kept in `cache` when it is
 /// given (the host reference takes minutes).
 fn host_rows_cached(

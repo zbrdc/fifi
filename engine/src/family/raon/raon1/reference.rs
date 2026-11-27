@@ -174,6 +174,9 @@ pub(crate) enum ActivationRule {
     /// The device rule: blocks of 32 for every quantized weight, scale `amax / 127` stored as
     /// f16, codes rounded from the unrounded scale.
     Q8_1Blocks,
+    /// No rounding: every dot reads the f32 activation. The reference the rounding rules are
+    /// measured against.
+    Exact,
 }
 
 #[cfg(test)]
@@ -219,6 +222,10 @@ fn quantize_q8_1_blocks(x: &[f32]) -> Vec<f32> {
 /// its detail that the codes use the reciprocal of the unrounded scale while
 /// the stored (f16-rounded) scale dequantizes them.
 fn quantize_activation_column(ty: GgufType, x: &[f32]) -> Vec<f32> {
+    #[cfg(test)]
+    if ACTIVATION_RULE.with(std::cell::Cell::get) == ActivationRule::Exact {
+        return x.to_vec();
+    }
     #[cfg(test)]
     if ACTIVATION_RULE.with(std::cell::Cell::get) == ActivationRule::Q8_1Blocks
         && !matches!(ty, GgufType::F16 | GgufType::F32)
