@@ -91,6 +91,11 @@ impl State {
         }
     }
 
+    /// The number of sequence positions the cache planes hold.
+    pub(crate) fn rows(&self) -> usize {
+        self.slots.rows
+    }
+
     /// The buffers a sequence cannot cut back to an earlier position: the rings and the records.
     pub(crate) fn running(&self) -> impl Iterator<Item = &DeviceBuffer> {
         self.ring.iter().chain(self.record.iter())

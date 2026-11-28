@@ -374,6 +374,8 @@ struct Reuse {
     budget: u64,
     /// Asks the host whether one more copy of this many bytes fits now.
     admit: HostAdmit,
+    /// True while every prefill piece since reset or restore landed on the `piece` lattice.
+    on_lattice: bool,
 }
 
 /// The host admission of one kept state: a `MemoryPlan` refusal skips the save.
@@ -413,6 +415,7 @@ impl<S: TokenStepper> SerialDecode<S> {
                 piece,
                 budget: budget.unwrap_or(u64::MAX),
                 admit,
+                on_lattice: true,
             });
         }
         self
@@ -431,11 +434,22 @@ impl<S: TokenStepper> ExecutorOps for SerialDecode<S> {
     }
 
     fn reset(&mut self, st: &mut Self::Session) -> Result<()> {
+        if let Some(reuse) = self.reuse.as_mut() {
+            reuse.on_lattice = true;
+        }
         st.reset(&mut self.step)
     }
 
     fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()> {
-        st.prefill(&mut self.step, toks, self.context_limit)
+        let start = st.history().len();
+        st.prefill(&mut self.step, toks, self.context_limit)?;
+        if let Some(reuse) = self.reuse.as_mut() {
+            let end = st.history().len();
+            if !start.is_multiple_of(reuse.piece) || !end.is_multiple_of(reuse.piece) {
+                reuse.on_lattice = false;
+            }
+        }
+        Ok(())
     }
 
     fn decode(
@@ -469,25 +483,23 @@ impl<S: TokenStepper> ExecutorOps for SerialDecode<S> {
         let (Some(reuse), Some(incoming)) = (self.reuse.as_mut(), self.step.kept_bytes()) else {
             return Ok(false);
         };
-        if !key.len().is_multiple_of(reuse.piece) {
+        if !reuse.on_lattice || !key.len().is_multiple_of(reuse.piece) {
             return Ok(false);
         }
         let path = (self.step.kept_generation(), reuse.piece);
         // The states of an earlier generation never match again: their bytes go first.
         reuse.store.retain_path(&path);
-        match (reuse.admit)(usize::try_from(incoming).unwrap_or(usize::MAX)) {
-            Ok(()) => {}
-            Err(EngError::MemoryPlan(_)) => return Ok(false),
-            Err(other) => return Err(other),
-        }
         let budget = SnapshotBudget {
             limit: reuse.budget,
             incoming,
             size: &Kept::bytes,
         };
+        let admit = reuse.admit;
+        let need = usize::try_from(incoming).unwrap_or(usize::MAX);
         let step = &mut self.step;
         let fed = step.fed();
         st.save_prefix_budgeted(&mut reuse.store, key, path, fed, kind, budget, || {
+            admit(need)?;
             step.keep()
         })
     }
@@ -503,6 +515,7 @@ impl<S: TokenStepper> ExecutorOps for SerialDecode<S> {
         let Some(reuse) = self.reuse.as_mut() else {
             return Ok(0);
         };
+        reuse.on_lattice = true;
         let path = (self.step.kept_generation(), reuse.piece);
         reuse.store.retain_path(&path);
         let below = &prompt[..tip.min(prompt.len())];
@@ -1071,5 +1084,106 @@ mod tests {
         served.request(&first);
         let (_, _, reused) = served.request(&first);
         assert_eq!(reused, 0);
+    }
+
+    /// Restoring a shallower entry in the same generation drops every deeper entry so a later
+    /// request cannot match rows that were written over, even though `generation` did not change.
+    #[test]
+    fn restoring_a_shallower_entry_drops_deeper_entries_in_the_same_generation() {
+        let log = Arc::new(std::sync::Mutex::new(Chunks::default()));
+        let mut exec = SerialDecode::new(Chunky::new(1024, &log), vec![], 1, 1024).with_reuse(
+            64,
+            None,
+            |_| Ok(()),
+        );
+        let mut st = DecodeSession::default();
+        let prompt = ids(256, 7);
+        exec.reset(&mut st).unwrap();
+        exec.prefill(&mut st, &prompt[..64]).unwrap();
+        assert!(
+            exec.save_prefix(&st, &prompt[..64], SaveKind::Block)
+                .unwrap()
+        );
+        exec.prefill(&mut st, &prompt[64..128]).unwrap();
+        assert!(
+            exec.save_prefix(&st, &prompt[..128], SaveKind::Tip)
+                .unwrap()
+        );
+        // Fork at 96: restores 64 (below tip 96) and must drop the 128 entry.
+        let mut fork = prompt[..96].to_vec();
+        fork.extend(ids(32, 8));
+        exec.reset(&mut st).unwrap();
+        assert_eq!(exec.restore_prefix_under(&mut st, &fork, 96).unwrap(), 64);
+        exec.prefill(&mut st, &fork[64..128]).unwrap();
+        // Returning to the original 256-token prompt must NOT restore the overwritten 128 entry.
+        exec.reset(&mut st).unwrap();
+        assert_eq!(
+            exec.restore_prefix_under(&mut st, &prompt, 200).unwrap(),
+            64
+        );
+    }
+
+    /// Host budget enforcement, `admit` MemoryPlan skips vs non-MemoryPlan errors, and off-lattice
+    /// prefill cuts refusing later on-lattice saves.
+    #[test]
+    fn reuse_enforces_budget_admit_errors_and_piece_lattice_cuts() {
+        let log = Arc::new(std::sync::Mutex::new(Chunks::default()));
+        let prompt = ids(256, 11);
+        // Budget smaller than one 8-byte kept state: save is skipped without calling admit.
+        let mut under_budget = SerialDecode::new(Chunky::new(512, &log), vec![], 1, 512)
+            .with_reuse(64, Some(4), |_| {
+                panic!("admit should not run when incoming exceeds budget")
+            });
+        let mut st = DecodeSession::default();
+        under_budget.reset(&mut st).unwrap();
+        under_budget.prefill(&mut st, &prompt[..64]).unwrap();
+        assert!(
+            !under_budget
+                .save_prefix(&st, &prompt[..64], SaveKind::Block)
+                .unwrap()
+        );
+
+        // admit returning MemoryPlan skips the save cleanly.
+        let mut denied = SerialDecode::new(Chunky::new(512, &log), vec![], 1, 512).with_reuse(
+            64,
+            Some(64),
+            |_| Err(EngError::MemoryPlan("host tight".into())),
+        );
+        let mut st = DecodeSession::default();
+        denied.reset(&mut st).unwrap();
+        denied.prefill(&mut st, &prompt[..64]).unwrap();
+        assert!(
+            !denied
+                .save_prefix(&st, &prompt[..64], SaveKind::Block)
+                .unwrap()
+        );
+
+        // admit returning a non-MemoryPlan error propagates.
+        let mut fatal = SerialDecode::new(Chunky::new(512, &log), vec![], 1, 512).with_reuse(
+            64,
+            Some(64),
+            |_| Err(EngError::BadRequest("bad admit".into())),
+        );
+        let mut st = DecodeSession::default();
+        fatal.reset(&mut st).unwrap();
+        fatal.prefill(&mut st, &prompt[..64]).unwrap();
+        assert!(matches!(
+            fatal.save_prefix(&st, &prompt[..64], SaveKind::Block),
+            Err(EngError::BadRequest(_))
+        ));
+
+        // An off-lattice prefill cut (0..96 then 96..128) refuses an on-lattice save at 128.
+        let mut off_cut =
+            SerialDecode::new(Chunky::new(512, &log), vec![], 1, 512)
+                .with_reuse(64, None, |_| Ok(()));
+        let mut st = DecodeSession::default();
+        off_cut.reset(&mut st).unwrap();
+        off_cut.prefill(&mut st, &prompt[..96]).unwrap();
+        off_cut.prefill(&mut st, &prompt[96..128]).unwrap();
+        assert!(
+            !off_cut
+                .save_prefix(&st, &prompt[..128], SaveKind::Tip)
+                .unwrap()
+        );
     }
 }

@@ -37,18 +37,32 @@ pub(crate) fn keep(state: &State, stream: &DeviceStream, rows: usize) -> Result<
     Ok(Kept { rows, parts })
 }
 
-/// Writes a kept state back. One of another shape is refused before the first write.
+/// Writes a kept state back. One of another shape or depth is refused before the first write.
+/// Copies enqueue directly from the host's pageable `Vec<u8>` (consumed before return, no host
+/// staging allocation); if a write fails mid-way, the running state is zeroed again so a fallback
+/// cold start never sees partial bytes.
 pub(crate) fn put_back(state: &State, stream: &DeviceStream, kept: &Kept) -> Result<(), EngError> {
+    if kept.rows > state.rows() {
+        return Err(EngError::BadRequest(format!(
+            "a kept step state at {} rows exceeds the step capacity of {}",
+            kept.rows,
+            state.rows()
+        )));
+    }
     let sizes = state.running().map(|buffer| buffer.bytes());
     if !sizes.eq(kept.parts.iter().map(Vec::len)) {
         return Err(EngError::BadRequest(
             "a kept step state has another shape than the step".to_owned(),
         ));
     }
-    state
+    let result = state
         .running()
         .zip(&kept.parts)
-        .try_for_each(|(buffer, part)| buffer.write_at(stream, 0, part))
+        .try_for_each(|(buffer, part)| buffer.write_at_enqueue(stream, 0, part));
+    if result.is_err() {
+        let _ = reset_running(state, stream);
+    }
+    result
 }
 
 /// Queues the zeros of a new sequence for the running state alone. The cache planes keep their

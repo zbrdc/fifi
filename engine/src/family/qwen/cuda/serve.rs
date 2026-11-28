@@ -339,12 +339,20 @@ impl TokenStepper for CardStep {
 
     fn keep(&mut self) -> Result<Kept, EngError> {
         let kept = self.step.keep(self.pos);
-        self.checked(kept)
+        // Host-memory denial during a D2H snapshot leaves device state untouched.
+        if !matches!(kept, Err(EngError::MemoryPlan(_))) {
+            return self.checked(kept);
+        }
+        kept
     }
 
     fn put_back(&mut self, kept: &Kept) -> Result<(), EngError> {
         let put = self.step.put_back(kept);
-        self.checked(put)?;
+        if !matches!(put, Err(EngError::MemoryPlan(_))) {
+            self.checked(put)?;
+        } else {
+            put?;
+        }
         self.pos = kept.rows;
         Ok(())
     }
