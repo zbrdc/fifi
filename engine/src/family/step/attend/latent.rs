@@ -193,7 +193,13 @@ pub(crate) fn mix(
         rope: d.rot_dims,
         rank: d.rank,
     };
-    io.run(BlockOp::mla_q_absorb(
+    let tiled = !io.exact && n > FEW_ROWS;
+    let absorb = if tiled {
+        BlockOp::mla_q_absorb_chunk
+    } else {
+        BlockOp::mla_q_absorb
+    };
+    io.run(absorb(
         shape,
         rows.query.range(0, n * d.heads * query_row * 4)?,
         rows.key_factor,
@@ -208,7 +214,12 @@ pub(crate) fn mix(
         rows.part.range(0, part_bytes(d, n, splits))?,
         rows.mixed.range(0, n * d.heads * d.rank * 4)?,
     )?)?;
-    io.run(BlockOp::mla_project(
+    let project = if tiled {
+        BlockOp::mla_project_chunk
+    } else {
+        BlockOp::mla_project
+    };
+    io.run(project(
         n,
         d.heads,
         d.rank,

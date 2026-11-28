@@ -442,7 +442,8 @@ impl<'a> StepIo<'a> {
     }
 
     /// The projection `y[t] = W x[t]` of `n` f32 rows through the F16 matrix `w`, `rows` by
-    /// `cols`.
+    /// `cols`. Larger non-exact chunks run on f16 tensor cores with f32 accumulation; few-row
+    /// steps and the exact route keep the scalar f32 matvec.
     pub(crate) fn f16_project(
         &self,
         w: DeviceRange<'_>,
@@ -452,6 +453,16 @@ impl<'a> StepIo<'a> {
         rows: usize,
         cols: usize,
     ) -> Result<(), EngError> {
+        if !self.exact && n > FEW_ROWS {
+            return self.run(BlockOp::f16_gemm(
+                n,
+                rows,
+                cols,
+                x.range(0, n * cols * 4)?,
+                w,
+                y.range(0, n * rows * 4)?,
+            )?);
+        }
         self.ctx.dense_gemv(
             self.stream,
             DenseGemvCall {

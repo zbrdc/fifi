@@ -1062,3 +1062,126 @@ fn the_decode_latent_score_and_step_kv_prep_match_the_row_path() {
         assert_close("decode mix", &got, &want, 5e-3);
     }
 }
+
+/// Batched f16 tensor-core GEMM against the host f32 reference across aligned, Raon-like, and
+/// ragged odd dimensions.
+#[test]
+fn the_f16_gemm_matches_the_host_across_aligned_and_ragged_shapes() {
+    let Some(r) = rig("block_ops f16 gemm") else {
+        return;
+    };
+    for (n, rows, cols) in [
+        (64usize, 64usize, 256usize),
+        (37, 40, 256),
+        (19, 35, 77),
+        (5, 7, 13),
+    ] {
+        let x_host = data(101 + n as u64, n * cols, 0.5);
+        let w_raw = data(102 + rows as u64, rows * cols, 0.5);
+        let w_f16: Vec<f32> = w_raw
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let x_dev = r.up(&x_host);
+        let w_dev = r.up_bytes(&f16_bytes(&w_raw));
+        let y_dev = r.up(&vec![f32::NAN; n * rows]);
+        r.run(
+            BlockOp::f16_gemm(n, rows, cols, whole(&x_dev), whole(&w_dev), whole(&y_dev))
+                .expect("f16_gemm"),
+        );
+        let got = r.read(&y_dev, n * rows);
+        let mut want = Vec::with_capacity(n * rows);
+        for t in 0..n {
+            let xr = &x_host[t * cols..(t + 1) * cols];
+            for row in 0..rows {
+                let wr = &w_f16[row * cols..(row + 1) * cols];
+                let sum: f32 = xr.iter().zip(wr.iter()).map(|(a, b)| a * b).sum();
+                want.push(sum);
+            }
+        }
+        assert!(got.iter().all(|v| v.is_finite()), "f16_gemm output finite");
+        // x rounds to f16 on load into shared memory (~1e-3 relative per product over cols).
+        assert_close("f16_gemm", &got, &want, 2e-2);
+    }
+}
+
+/// Batched tf32 tensor-core MLA absorb and project against the scalar row ops, covering full
+/// aligned chunks, ragged token counts, and odd head value widths.
+#[test]
+fn the_chunk_latent_absorb_and_project_match_the_row_path() {
+    let Some(r) = rig("block_ops mla chunk gemm") else {
+        return;
+    };
+    let (nope, rope, rank) = (128usize, 64usize, 512usize);
+    for (n, heads, v_dim) in [(64usize, 16usize, 128usize), (37, 8, 128), (19, 4, 13)] {
+        let shape = MlaShape {
+            n,
+            heads,
+            nope,
+            rope,
+            rank,
+        };
+        let qb = r.up(&data(111 + n as u64, n * heads * (nope + rope), 0.5));
+        let wk = r.up(&data(112 + heads as u64, heads * rank * nope, 0.25));
+        let qeff_ref = r.up(&vec![f32::NAN; n * heads * (rank + rope)]);
+        let qeff_tc = r.up(&vec![f32::NAN; n * heads * (rank + rope)]);
+        r.run(
+            BlockOp::mla_q_absorb(shape, whole(&qb), whole(&wk), whole(&qeff_ref))
+                .expect("absorb ref"),
+        );
+        r.run(
+            BlockOp::mla_q_absorb_chunk(shape, whole(&qb), whole(&wk), whole(&qeff_tc))
+                .expect("absorb chunk"),
+        );
+        let got_q = r.read(&qeff_tc, n * heads * (rank + rope));
+        let want_q = r.read(&qeff_ref, n * heads * (rank + rope));
+        assert!(got_q.iter().all(|v| v.is_finite()), "absorb chunk finite");
+        assert_close("mla_q_absorb_chunk", &got_q, &want_q, 2e-2);
+        // The trailing rope lanes are copied bit-for-bit.
+        for t in 0..n {
+            for h in 0..heads {
+                let off = (t * heads + h) * (rank + rope) + rank;
+                for j in 0..rope {
+                    assert_eq!(
+                        got_q[off + j].to_bits(),
+                        want_q[off + j].to_bits(),
+                        "rope bits mismatch at t={t} h={h} j={j}"
+                    );
+                }
+            }
+        }
+
+        let mix = r.up(&data(113 + n as u64, n * heads * rank, 0.5));
+        let wv = r.up(&data(114 + v_dim as u64, heads * v_dim * rank, 0.25));
+        let out_ref = r.up(&vec![f32::NAN; n * heads * v_dim]);
+        let out_tc = r.up(&vec![f32::NAN; n * heads * v_dim]);
+        r.run(
+            BlockOp::mla_project(
+                n,
+                heads,
+                rank,
+                v_dim,
+                whole(&mix),
+                whole(&wv),
+                whole(&out_ref),
+            )
+            .expect("project ref"),
+        );
+        r.run(
+            BlockOp::mla_project_chunk(
+                n,
+                heads,
+                rank,
+                v_dim,
+                whole(&mix),
+                whole(&wv),
+                whole(&out_tc),
+            )
+            .expect("project chunk"),
+        );
+        let got_o = r.read(&out_tc, n * heads * v_dim);
+        let want_o = r.read(&out_ref, n * heads * v_dim);
+        assert!(got_o.iter().all(|v| v.is_finite()), "project chunk finite");
+        assert_close("mla_project_chunk", &got_o, &want_o, 2e-2);
+    }
+}

@@ -261,6 +261,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/attn_prep.h",
     "src/kernels/cuda/native/resident/attn_split_reduce.cuh",
     "src/kernels/cuda/native/resident/block_ops.h",
+    "src/kernels/cuda/native/resident/block_gemm.cuh",
     "src/kernels/cuda/native/resident/mla_attn_chunk.cuh",
     "src/kernels/cuda/native/resident/correct_draft_logits_bf16.h",
     "src/kernels/cuda/native/resident/draft_attention_bf16.h",

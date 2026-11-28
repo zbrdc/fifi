@@ -170,6 +170,27 @@ impl<'b> BlockOp<'b> {
         wk_b: DeviceRange<'b>,
         qeff: DeviceRange<'b>,
     ) -> Result<Self, EngError> {
+        Self::mla_q_absorb_op(7, shape, qb, wk_b, qeff)
+    }
+
+    /// Batched [`Self::mla_q_absorb`] on tf32 tensor cores (f32 accumulation; falls back to the
+    /// scalar path on older architectures).
+    pub(crate) fn mla_q_absorb_chunk(
+        shape: MlaShape,
+        qb: DeviceRange<'b>,
+        wk_b: DeviceRange<'b>,
+        qeff: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        Self::mla_q_absorb_op(21, shape, qb, wk_b, qeff)
+    }
+
+    fn mla_q_absorb_op(
+        op: i32,
+        shape: MlaShape,
+        qb: DeviceRange<'b>,
+        wk_b: DeviceRange<'b>,
+        qeff: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
         let MlaShape {
             n,
             heads,
@@ -177,7 +198,7 @@ impl<'b> BlockOp<'b> {
             rope,
             rank,
         } = shape;
-        Ok(Self::new(7, &[n, heads, nope, rope, rank], &[])?
+        Ok(Self::new(op, &[n, heads, nope, rope, rank], &[])?
             .read(0, qb, bytes(&[n, heads, nope + rope, 4])?)
             .read(1, wk_b, bytes(&[heads, rank, nope, 4])?)
             .write(2, qeff, bytes(&[n, heads, rank + rope, 4])?))
@@ -378,10 +399,54 @@ impl<'b> BlockOp<'b> {
         wv_b: DeviceRange<'b>,
         out: DeviceRange<'b>,
     ) -> Result<Self, EngError> {
-        Ok(Self::new(11, &[n, heads, rank, v], &[])?
+        Self::mla_project_op(11, n, heads, rank, v, mix, wv_b, out)
+    }
+
+    /// Batched [`Self::mla_project`] on tf32 tensor cores (f32 accumulation; falls back to the
+    /// scalar path on older architectures).
+    pub(crate) fn mla_project_chunk(
+        n: usize,
+        heads: usize,
+        rank: usize,
+        v: usize,
+        mix: DeviceRange<'b>,
+        wv_b: DeviceRange<'b>,
+        out: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        Self::mla_project_op(22, n, heads, rank, v, mix, wv_b, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mla_project_op(
+        op: i32,
+        n: usize,
+        heads: usize,
+        rank: usize,
+        v: usize,
+        mix: DeviceRange<'b>,
+        wv_b: DeviceRange<'b>,
+        out: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        Ok(Self::new(op, &[n, heads, rank, v], &[])?
             .read(0, mix, bytes(&[n, heads, rank, 4])?)
             .read(1, wv_b, bytes(&[heads, v, rank, 4])?)
             .write(2, out, bytes(&[n, heads, v, 4])?))
+    }
+
+    /// Batched projection `y[n][rows] = x[n][cols] * w[rows][cols]^T` of f32 rows through an f16
+    /// matrix on f16 tensor cores (f32 accumulation; scalar fallback on older architectures).
+    pub(crate) fn f16_gemm(
+        n: usize,
+        rows: usize,
+        cols: usize,
+        x: DeviceRange<'b>,
+        w: DeviceRange<'b>,
+        y: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        Ok(Self::new(20, &[n, rows, cols], &[])?
+            .read(0, x, bytes(&[n, cols, 4])?)
+            .read(1, w, bytes(&[rows, cols, 2])?)
+            .write(2, y, bytes(&[n, rows, 4])?))
     }
 
     /// The SiTU activation of gate and up rows, written as q8_1 rows, f32 rows, or both.

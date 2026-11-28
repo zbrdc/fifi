@@ -4,8 +4,9 @@
  * -use_fast_math). Reductions run in a fixed order (warp shuffle tree, then the warp
  * partials summed in index order), so a launch repeats bit for bit. q8_1 blocks follow the
  * vendored quantize rule: d = amax / 127, q = roundf(x / d), s = the raw sum of the inputs.
- * The chunk and single-row decode forms of the latent score (resident/mla_attn_chunk.cuh) alone
- * multiply f16 operands on tensor cores; their sums are f32 and in a fixed order too. */
+ * The chunk and single-row decode forms of the latent score (resident/mla_attn_chunk.cuh) and
+ * the chunk projection GEMMs (resident/block_gemm.cuh) multiply f16 or tf32 operands on tensor
+ * cores; their sums are f32 and in a fixed order too. */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -531,6 +532,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float *qeff, const 
 }
 
 #include "resident/mla_attn_chunk.cuh"
+#include "resident/block_gemm.cuh"
 
 __global__ void __launch_bounds__(128) mla_reduce_kernel(const float *part, float *mix, int heads,
                                                          int splits) {
@@ -722,7 +724,9 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                 (float *)p[8], (int)heads, f[0]);
             return launch_status(out_stage);
         }
-        case INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB: {
+        case INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB:
+        case INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB_CHUNK: {
+            const bool chunk = args->op == INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB_CHUNK;
             const long long n = i[0], heads = i[1], nope = i[2], rope = i[3], rank = i[4];
             if (n < 1 || n > 65536 || heads < 1 || heads > 256 || nope != 128 || rope != kMlaRope ||
                 rank != kMlaRank)
@@ -731,6 +735,31 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(1, heads * rank * nope * 4, false);
             slots.use(2, n * heads * (rank + rope) * 4, true);
             if (!slots.valid() || !aligned(p[1], 16)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            if (chunk) {
+                int device = 0;
+                if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
+                static int arm[16] = {};
+                if (arm[device] == 0) {
+                    Failure failure;
+                    cudaFuncAttributes attr = {};
+                    failure.record(cudaFuncGetAttributes(&attr, tf32_batched_gemm_kernel),
+                                   INFERENCE_CUDA_STAGE_LAUNCH);
+                    report_stage(out_stage, failure.stage);
+                    if (!failure.ok()) return (int)failure.err;
+                    arm[device] = attr.ptxVersion >= 80 ? 1 : 2;
+                }
+                if (arm[device] == 1) {
+                    const dim3 grid((unsigned)((rank + kTf32Bn - 1) / kTf32Bn),
+                                    (unsigned)((n + kTf32Bm - 1) / kTf32Bm), (unsigned)heads);
+                    const int a_hs = (int)(nope + rope);
+                    const int c_hs = (int)(rank + rope);
+                    tf32_batched_gemm_kernel<<<grid, 256, 0, s>>>(
+                        (const float *)p[0], (const float *)p[1], (float *)p[2], (int)n, (int)rank,
+                        (int)nope, (int)rope, a_hs, (int)(heads * a_hs), c_hs,
+                        (int)(heads * c_hs));
+                    return launch_status(out_stage);
+                }
+            }
             mla_q_absorb_kernel<<<dim3((unsigned)n, (unsigned)heads), 128, (size_t)nope * 4, s>>>(
                 (const float *)p[0], (const float *)p[1], (float *)p[2], (int)heads, (int)nope,
                 (int)rope, (int)rank);
@@ -914,7 +943,9 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                 (const float *)p[0], (float *)p[1], (int)heads, (int)splits);
             return launch_status(out_stage);
         }
-        case INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT: {
+        case INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT:
+        case INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT_CHUNK: {
+            const bool chunk = args->op == INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT_CHUNK;
             const long long n = i[0], heads = i[1], rank = i[2], v = i[3];
             if (n < 1 || n > 65536 || heads < 1 || heads > 256 || rank != kMlaRank || v < 1 ||
                 v > 1024)
@@ -923,9 +954,65 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(1, heads * v * rank * 4, false);
             slots.use(2, n * heads * v * 4, true);
             if (!slots.valid() || !aligned(p[1], 16)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            if (chunk) {
+                int device = 0;
+                if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
+                static int arm[16] = {};
+                if (arm[device] == 0) {
+                    Failure failure;
+                    cudaFuncAttributes attr = {};
+                    failure.record(cudaFuncGetAttributes(&attr, tf32_batched_gemm_kernel),
+                                   INFERENCE_CUDA_STAGE_LAUNCH);
+                    report_stage(out_stage, failure.stage);
+                    if (!failure.ok()) return (int)failure.err;
+                    arm[device] = attr.ptxVersion >= 80 ? 1 : 2;
+                }
+                if (arm[device] == 1) {
+                    const dim3 grid((unsigned)((v + kTf32Bn - 1) / kTf32Bn),
+                                    (unsigned)((n + kTf32Bm - 1) / kTf32Bm), (unsigned)heads);
+                    tf32_batched_gemm_kernel<<<grid, 256, 0, s>>>(
+                        (const float *)p[0], (const float *)p[1], (float *)p[2], (int)n, (int)v,
+                        (int)rank, 0, (int)rank, (int)(heads * rank), (int)v, (int)(heads * v));
+                    return launch_status(out_stage);
+                }
+            }
             mla_project_kernel<<<dim3((unsigned)n, (unsigned)heads), 128, (size_t)rank * 4, s>>>(
                 (const float *)p[0], (const float *)p[1], (float *)p[2], (int)heads, (int)rank,
                 (int)v);
+            return launch_status(out_stage);
+        }
+        case INFERENCE_CUDA_BLOCK_OP_F16_GEMM: {
+            const long long n = i[0], rows = i[1], cols = i[2];
+            if (n < 1 || n > 65536 || rows < 1 || rows > 1048576 || cols < 1 || cols > 65536)
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.use(0, n * cols * 4, false);
+            slots.use(1, rows * cols * 2, false);
+            slots.use(2, n * rows * 4, true);
+            if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            int device = 0;
+            if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
+            static int arm[16] = {};
+            if (arm[device] == 0) {
+                Failure failure;
+                cudaFuncAttributes attr = {};
+                failure.record(cudaFuncGetAttributes(&attr, f16_gemm_tc_kernel),
+                               INFERENCE_CUDA_STAGE_LAUNCH);
+                report_stage(out_stage, failure.stage);
+                if (!failure.ok()) return (int)failure.err;
+                arm[device] = attr.ptxVersion >= 80 ? 1 : 2;
+            }
+            if (arm[device] == 1) {
+                const dim3 grid((unsigned)((rows + kF16GemmBn - 1) / kF16GemmBn),
+                                (unsigned)((n + kF16GemmBm - 1) / kF16GemmBm));
+                f16_gemm_tc_kernel<<<grid, 128, 0, s>>>((const float *)p[0], (const __half *)p[1],
+                                                        (float *)p[2], (int)n, (int)rows,
+                                                        (int)cols);
+            } else {
+                const dim3 grid((unsigned)((rows + 7) / 8), (unsigned)n);
+                f16_gemm_fallback_kernel<<<grid, 256, 0, s>>>(
+                    (const float *)p[0], (const __half *)p[1], (float *)p[2], (int)n, (int)rows,
+                    (int)cols);
+            }
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_SITU_QUANT: {

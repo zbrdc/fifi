@@ -75,6 +75,13 @@ extern "C" {
  * 19 MLA_KV_PREP_STEP single-row MLA_KV_PREP reading pos from device i32 word p3 (for graph
  *             capture). p0 kv f32 [576]; p1 w f32 [512]; p2 cache f16 [cells][576] (W);
  *             p3 pos_ptr i32 [1]. i0 rank (512); i1 rope (64); i2 cells; f0 eps.
+ * 20 F16_GEMM batched projection Y[n][rows] = X[n][cols] * W[rows][cols]^T on f16 tensor cores
+ *             (f32 accumulation; scalar fallback on < sm_80). p0 x f32 [n][cols];
+ *             p1 w f16 [rows][cols]; p2 y f32 [n][rows] (W). i0 n; i1 rows; i2 cols.
+ * 21 MLA_Q_ABSORB_CHUNK batched MLA_Q_ABSORB on tf32 tensor cores (f32 accumulation; falls back
+ *             to MLA_Q_ABSORB on < sm_80). Same slots and integers as MLA_Q_ABSORB.
+ * 22 MLA_PROJECT_CHUNK batched MLA_PROJECT on tf32 tensor cores (f32 accumulation; falls back
+ *             to MLA_PROJECT on < sm_80). Same slots and integers as MLA_PROJECT.
  */
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,
@@ -91,7 +98,10 @@ enum {
     INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_CHUNK = 16,
     INFERENCE_CUDA_BLOCK_OP_HC_BROADCAST = 17,
     INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_DECODE = 18,
-    INFERENCE_CUDA_BLOCK_OP_MLA_KV_PREP_STEP = 19
+    INFERENCE_CUDA_BLOCK_OP_MLA_KV_PREP_STEP = 19,
+    INFERENCE_CUDA_BLOCK_OP_F16_GEMM = 20,
+    INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB_CHUNK = 21,
+    INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT_CHUNK = 22
 };
 
 typedef struct inference_cuda_block_ops_args {
