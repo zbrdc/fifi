@@ -1,9 +1,10 @@
 //! One F32 decode step for grouped attention with learned relative logits, the contract of the
 //! CUDA adapter's `relative_attention`. Q, K, V, the relative coefficients, the bias table, the
-//! sinks and the gates are F32 planes. The step fills the current row's slot of the two rings
-//! the caller owns and orders, scores the ring's rows, adds the learned bias by distance (distance
-//! zero is the current token), includes one zero-value sink a query head and applies a sigmoid
-//! gate to each output channel.
+//! sinks and the gates are F32 planes. The two rings hold their rows in the call's `format`: F32,
+//! F16, or Int8 by the CUDA adapter's rule, 128 codes then four half scales a K/V head. The step
+//! fills the current row's slot of the two rings the caller owns and orders, scores their rows,
+//! adds the learned bias by distance (distance zero is the current token), includes one
+//! zero-value sink a query head and applies a sigmoid gate to each output channel.
 //!
 //! [`Frame::relative_attention`] encodes three dispatches into the open command buffer of a
 //! frame: the commit of the current row, the partials of the splits and the finish. The partials
@@ -17,6 +18,7 @@
 //! call changes nothing.
 
 use crate::EngError;
+use crate::kernels::cuda::resident::relative_attention::RelativeKvFormat;
 
 use super::super::context::Shared;
 use super::super::frame::Frame;
@@ -28,9 +30,22 @@ use super::{RANGE_ALIGN, overlaps, require_range};
 mod tests;
 
 const SOURCE: &str = include_str!("../native/relative_attention.metal");
-const COMMIT_KERNEL: &str = "relative_attention_commit";
-const PARTIALS_KERNEL: &str = "relative_attention_partials";
 const FINISH_KERNEL: &str = "relative_attention_finish";
+
+/// The commit and the partials entry points of a ring format; the F32 ones carry no suffix.
+fn kernels(format: RelativeKvFormat) -> (&'static str, &'static str) {
+    match format {
+        RelativeKvFormat::F32 => ("relative_attention_commit", "relative_attention_partials"),
+        RelativeKvFormat::F16 => (
+            "relative_attention_commit_f16",
+            "relative_attention_partials_f16",
+        ),
+        RelativeKvFormat::Int8 => (
+            "relative_attention_commit_int8",
+            "relative_attention_partials_int8",
+        ),
+    }
+}
 
 /// The one head dimension the step serves.
 pub(crate) const HEAD_DIM: usize = 128;
@@ -66,6 +81,8 @@ pub(crate) struct RelativeAttentionShape {
     pub(crate) relative_extent: usize,
     /// The cells of each ring.
     pub(crate) capacity: usize,
+    /// The layout of a ring row: F32, F16 or Int8.
+    pub(crate) format: RelativeKvFormat,
 }
 
 impl RelativeAttentionShape {
@@ -82,14 +99,16 @@ impl RelativeAttentionShape {
             return None;
         }
         let q = self.query_heads * HEAD_DIM * 4;
-        let kv = self.kv_heads * HEAD_DIM * 4;
-        let cache = self.capacity.checked_mul(kv)?;
+        let row = self.kv_heads * HEAD_DIM * 4;
+        let cache = self
+            .capacity
+            .checked_mul(self.kv_heads * self.format.head_bytes())?;
         let relative = self.query_heads * self.relative_dims * 4;
         let table = (self.relative_dims * 4).checked_mul(self.relative_extent)?;
         let sinks = self.query_heads * 4;
         let word = 4;
         Some([
-            q, cache, cache, word, q, kv, kv, relative, table, sinks, q, word,
+            q, cache, cache, word, q, row, row, relative, table, sinks, q, word,
         ])
     }
 }
@@ -101,8 +120,8 @@ pub(crate) struct RelativeAttentionCall<'b> {
     pub(crate) shape: RelativeAttentionShape,
     /// F32 `[query_heads][HEAD_DIM]`: the result.
     pub(crate) out: DeviceRange<'b>,
-    /// F32 `[capacity][kv_heads][HEAD_DIM]`: the rings, which the step fills at the current
-    /// position's slot.
+    /// `[capacity][kv_heads]` rows in the shape's format: the rings, which the step fills at the
+    /// current position's slot.
     pub(crate) k_cache: DeviceRange<'b>,
     pub(crate) v_cache: DeviceRange<'b>,
     /// One `i32` the step ORs a mark into.
@@ -232,8 +251,9 @@ impl Frame {
     ) -> Result<(), EngError> {
         let shared = self.shared();
         let plan = plan_relative_attention(shared, &call)?;
-        let commit = shared.kernel(COMMIT_KERNEL, SOURCE)?;
-        let partials = shared.kernel(PARTIALS_KERNEL, SOURCE)?;
+        let (commit_kernel, partials_kernel) = kernels(call.shape.format);
+        let commit = shared.kernel(commit_kernel, SOURCE)?;
+        let partials = shared.kernel(partials_kernel, SOURCE)?;
         let finish = shared.kernel(FINISH_KERNEL, SOURCE)?;
         let pointer = shared.partials_pointer()?;
         let bindings = plan.bindings(Binding { pointer, offset: 0 });

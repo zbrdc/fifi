@@ -16,6 +16,7 @@ use super::{
     HEAD_DIM, RANGES, RelativeAttentionCall, RelativeAttentionShape, STATUS_INVALID_STEP_STATE,
 };
 use crate::EngError;
+use crate::kernels::cuda::resident::relative_attention::RelativeKvFormat;
 use crate::kernels::metal::context::PARTIALS_BYTES;
 use crate::kernels::metal::testkit::{Padded, Rig, Rng, f32_bytes, floats, sentinel};
 use crate::kernels::metal::{DeviceRange, MetalContext};
@@ -61,6 +62,7 @@ fn shape(
         relative_dims,
         relative_extent,
         capacity,
+        format: RelativeKvFormat::F32,
     }
 }
 
@@ -208,12 +210,21 @@ struct Buffers {
 }
 
 fn buffers(rig: &Rig, c: &Case, extra: usize) -> Buffers {
+    buffers_with_rings(rig, c, extra, None)
+}
+
+/// The buffers of a case whose rings hold `rings` instead of the case's F32 rows: a ring in
+/// F16 or Int8.
+fn buffers_with_rings(rig: &Rig, c: &Case, extra: usize, rings: Option<(&[u8], &[u8])>) -> Buffers {
     let ctx = &rig.ctx;
     let bytes = c.shape.region_bytes().expect("the shape's bytes");
+    let f32_k = f32_bytes(&c.ring_k);
+    let f32_v = f32_bytes(&c.ring_v);
+    let (ring_k, ring_v) = rings.unwrap_or((&f32_k, &f32_v));
     Buffers {
         out: Padded::new(ctx, &sentinel(bytes[0]), extra),
-        ring_k: Padded::new(ctx, &f32_bytes(&c.ring_k), extra),
-        ring_v: Padded::new(ctx, &f32_bytes(&c.ring_v), extra),
+        ring_k: Padded::new(ctx, ring_k, extra),
+        ring_v: Padded::new(ctx, ring_v, extra),
         status: Padded::new(ctx, &0i32.to_le_bytes(), extra),
         q: Padded::new(ctx, &f32_bytes(&c.q), extra),
         k: Padded::new(ctx, &f32_bytes(&c.k), extra),
@@ -586,6 +597,12 @@ fn time_step(rig: &Rig, rng: &mut Rng, shape: RelativeAttentionShape, position: 
     let c = Case::new(rng, shape, position);
     check(rig, &c, 0);
     let b = buffers(rig, &c, 0);
+    time_buffers(rig, &b, shape, position);
+}
+
+/// The time of one step over the uploaded buffers `b`: the median of 21 single steps and the
+/// mean of 16 back to back, with the rate of the bytes of K and V the step reads.
+fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position: i32) {
     let one = || {
         rig.ctx
             .relative_attention_timed(call(&b, shape, None), 1)
@@ -603,10 +620,11 @@ fn time_step(rig: &Rig, rng: &mut Rng, shape: RelativeAttentionShape, position: 
         .expect("sixteen timed steps")
         / 16;
     let rows = (position + 1).min(shape.capacity as i32) as usize;
-    let bytes = rows * shape.kv_heads * HEAD_DIM * 8;
+    let bytes = rows * shape.kv_heads * shape.format.head_bytes() * 2;
     let rate = |ns: u64| bytes as f64 / (ns as f64 / 1e9) / 1e9;
     println!(
-        "relative attention {} over {} heads, ring {} at position {position} ({rows} rows, {:.1} MB of K and V): one step {} us at {:.0} GB/s, sixteen back to back {} us a step at {:.0} GB/s",
+        "relative attention, ring format {:?}, {} over {} heads, ring {} at position {position} ({rows} rows, {:.1} MB of K and V): one step {} us at {:.0} GB/s, sixteen back to back {} us a step at {:.0} GB/s",
+        shape.format,
         shape.query_heads,
         shape.kv_heads,
         shape.capacity,
@@ -731,5 +749,279 @@ fn relative_attention_dispatches_are_timed() {
             step - both,
             both - partials,
         );
+    }
+}
+
+/// An Int8 ring row of one K/V head: groups of 32 values, a half scale a group.
+const INT8_GROUP: usize = 32;
+const INT8_SCALES: usize = HEAD_DIM / INT8_GROUP;
+const INT8_HEAD_BYTES: usize = HEAD_DIM + 2 * INT8_SCALES;
+
+fn half16(bytes: &[u8]) -> half::f16 {
+    half::f16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+/// One K/V head of a row as a ring of `format` stores it. The Int8 rule is the shader's commit,
+/// which is the CUDA adapter's, ported here value for value and sharing no code with it: the
+/// greatest magnitude of a group, a NaN over every value; that over 127, rounded to half and
+/// stored; the value over the stored half's value, rounded to the nearest even and clamped, 0
+/// when the scale's bits are 0 or the quotient is not a number.
+fn ring_head(format: RelativeKvFormat, head: &[f32]) -> Vec<u8> {
+    match format {
+        RelativeKvFormat::F32 => f32_bytes(head),
+        RelativeKvFormat::F16 => head
+            .iter()
+            .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+            .collect(),
+        RelativeKvFormat::Int8 => {
+            let mut out = Vec::with_capacity(INT8_HEAD_BYTES);
+            let mut scales = [0u16; INT8_SCALES];
+            for (g, group) in head.chunks_exact(INT8_GROUP).enumerate() {
+                let mut amax = 0.0f32;
+                for &x in group {
+                    let a = x.abs();
+                    amax = if a.is_nan() || amax.is_nan() {
+                        f32::NAN
+                    } else {
+                        amax.max(a)
+                    };
+                }
+                let stored = half::f16::from_f32(amax / 127.0);
+                scales[g] = stored.to_bits();
+                for &x in group {
+                    let quotient = x / stored.to_f32();
+                    let code = if scales[g] == 0 || quotient.is_nan() {
+                        0.0
+                    } else {
+                        quotient.round_ties_even().clamp(-127.0, 127.0)
+                    };
+                    out.push(code as i8 as u8);
+                }
+            }
+            for bits in scales {
+                out.extend_from_slice(&bits.to_le_bytes());
+            }
+            out
+        }
+    }
+}
+
+/// The rows of a ring, K or V, in `format`.
+fn ring_bytes(format: RelativeKvFormat, rows: &[f32]) -> Vec<u8> {
+    rows.chunks_exact(HEAD_DIM)
+        .flat_map(|head| ring_head(format, head))
+        .collect()
+}
+
+/// The values the step reads from a ring in `format`: the halfs widened, or a code over its
+/// group's scale.
+fn ring_values(format: RelativeKvFormat, bytes: &[u8]) -> Vec<f32> {
+    match format {
+        RelativeKvFormat::F32 => floats(bytes),
+        RelativeKvFormat::F16 => bytes.chunks_exact(2).map(|b| half16(b).to_f32()).collect(),
+        RelativeKvFormat::Int8 => {
+            let mut out = Vec::with_capacity(bytes.len() / INT8_HEAD_BYTES * HEAD_DIM);
+            for head in bytes.chunks_exact(INT8_HEAD_BYTES) {
+                let mut scales = [0.0f32; INT8_SCALES];
+                for (g, b) in head[HEAD_DIM..].chunks_exact(2).enumerate() {
+                    scales[g] = half16(b).to_f32();
+                }
+                for (d, &code) in head[..HEAD_DIM].iter().enumerate() {
+                    out.push(code as i8 as f32 * scales[d / INT8_GROUP]);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// The case the step reads when its rings are in `format`: every ring row, and the current row
+/// at distance zero, are the values the ring's bytes decode to.
+fn decoded(mut c: Case, format: RelativeKvFormat, ring_k: &[u8], ring_v: &[u8]) -> Case {
+    c.k = ring_values(format, &ring_bytes(format, &c.k));
+    c.v = ring_values(format, &ring_bytes(format, &c.v));
+    c.ring_k = ring_values(format, ring_k);
+    c.ring_v = ring_values(format, ring_v);
+    c
+}
+
+/// Two rings in `format` hold the same rows. A NaN scale matches any NaN scale: its bits are
+/// not the rule's.
+fn assert_ring_eq(format: RelativeKvFormat, got: &[u8], want: &[u8], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: the length");
+    if format != RelativeKvFormat::Int8 {
+        assert_eq!(got, want, "{what}");
+        return;
+    }
+    for (g, w) in got
+        .chunks_exact(INT8_HEAD_BYTES)
+        .zip(want.chunks_exact(INT8_HEAD_BYTES))
+    {
+        assert_eq!(&g[..HEAD_DIM], &w[..HEAD_DIM], "{what}: the codes");
+        for (a, b) in g[HEAD_DIM..]
+            .chunks_exact(2)
+            .zip(w[HEAD_DIM..].chunks_exact(2))
+        {
+            let (a, b) = (half16(a), half16(b));
+            assert!(
+                a == b || (a.is_nan() && b.is_nan()),
+                "{what}: the scales {a:?} and {b:?}"
+            );
+        }
+    }
+}
+
+/// A step over an F16 ring and over an Int8 ring: the slot the commit writes holds the rule's
+/// bytes of the call's row, every other slot keeps the bytes it had, the status stays clear,
+/// and the result lies within its bound of the f64 step over the values the ring decodes to,
+/// which are the values the step reads.
+#[test]
+fn the_f16_and_int8_rings_match_the_rule_and_the_reference() {
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x1D_6E_88_0B);
+    for format in [RelativeKvFormat::F16, RelativeKvFormat::Int8] {
+        for (base, position) in [(shape(4, 2, 8, 64, 40), 39), (decode_geometry(8192), 8191)] {
+            let s = RelativeAttentionShape { format, ..base };
+            let c = Case::new(&mut rng, s, position);
+            let row = s.kv_heads * s.format.head_bytes();
+            let ring_k = ring_bytes(format, &c.ring_k);
+            let ring_v = ring_bytes(format, &c.ring_v);
+            let row_k = ring_bytes(format, &c.k);
+            let row_v = ring_bytes(format, &c.v);
+            let b = buffers_with_rings(&rig, &c, 0, Some((&ring_k, &ring_v)));
+            rig.ctx
+                .relative_attention(call(&b, s, None))
+                .expect("a valid call");
+            let mut worst = 0.0f64;
+            let out = floats(&b.out.read("out"));
+            let decoded = decoded(c, format, &ring_k, &ring_v);
+            for (i, (&value, &(want, bound))) in out.iter().zip(&decoded.reference()).enumerate() {
+                assert!(
+                    value.is_finite(),
+                    "{format:?}: the output {i} is not finite: {value}"
+                );
+                let off = (f64::from(value) - want).abs();
+                assert?(
+                    off <= bound,
+                    "{format:?}: the output {i} is {value} against {want}: off {off} over the bound {bound}",
+                );
+                worst = worst.max(off / bound);
+            }
+            let slot = position as usize % s.capacity;
+            let (got_k, got_v) = (b.ring_k.read("key ring"), b.ring_v.read("value ring"));
+            for cell in 0..s.capacity {
+                let at = cell * row..(cell + 1) * row;
+                let (want_k, want_v) = if cell == slot {
+                    (&row_k, &row_v)
+                } else {
+                    (&ring_k[at.clone()], &ring_v[at.clone()])
+                };
+                assert_ring_eq(
+                    format,
+                    &got_k[at.clone()],
+                    want_k,
+                    "the key ring's slot {cell}",
+                );
+                assert_ring_eq(
+                    format,
+                    &got_v[at.clone()],
+                    want_v,
+                    "the value ring's slot {cell}",
+                );
+            }
+            assert_eq!(status(&b), 0, "the status after a valid step");
+            println?(
+                "{format:?} over {} heads, ring {}, position {position}: the worst error is {worst:.3} of the bound",
+                s.query_heads,
+                s.capacity,
+            );
+        }
+    }
+}
+
+/// An Int8 row with a group of zeros, a group with a NaN, a group with infinities and a group
+/// of tiny values, whose scale is a subnormal half: the commit stores the rule's bytes. A NaN
+/// group and an infinite group decode to values that are not finite, since a code of zero
+/// over an infinite scale is not a number, and mark the status, as they do on CUDA.
+#[test]
+fn the_int8_commit_stores_zero_nan_and_infinite_groups_by_the_rule() {
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x5C_3A_91_E4);
+    let s = RelativeAttentionShape {
+        format: RelativeKvFormat::Int8,
+        ..shape(2, 1, 4, 16, 1)
+    };
+    let mut head = vec![0.5f32; HEAD_DIM];
+    head[INT8_GROUP] = f32::NAN;
+    for x in &mut head[2 * INT8_GROUP..2 * INT8_GROUP + 3] {
+        *x = f32::INFINITY;
+    }
+    for (i, x) in head[3 * INT8_GROUP..].iter_mut().enumerate() {
+        *x = if i % 2 == 0 { 3e-9 } else { -2e-9 };
+    }
+    for (with_nan, with_infinite) in [(true, false), (false, true), (false, false)] {
+        let mut c = Case::new(&mut rng, s, 0);
+        c.k = head.clone();
+        if !with_nan {
+            c.k[INT8_GROUP] = 0.5;
+        }
+        if !with_infinite {
+            for x in &mut c.k[2 * INT8_GROUP..2 * INT8_GROUP + 3] {
+                *x = 2.0;
+            }
+        }
+        let rings = (
+            ring_bytes(RelativeKvFormat::Int8, &c.ring_k),
+            ring_bytes(RelativeKvFormat::Int8, &c.ring_v),
+        );
+        let b = buffers_with_rings(&rig, &c, 0, Some((&rings.0, &rings.1)));
+        rig.ctx
+            .relative_attention(call(&b, s, None))
+            .expect("a valid call");
+        assert_ring_eq(
+            RelativeKvFormat::Int8,
+            &b.ring_k.read("key ring"),
+            &ring_bytes(RelativeKvFormat::Int8, &c.k),
+            "the key ring",
+        );
+        assert_ring_eq(
+            RelativeKvFormat::Int8,
+            &b.ring_v.read("value ring"),
+            &ring_bytes(RelativeKvFormat::Int8, &c.v),
+            "the value ring",
+        );
+        let marked = status(&b) == STATUS_INVALID_STEP_STATE;
+        assert_eq!(
+            marked,
+            with_nan || with_infinite,
+            "the status, nan {with_nan}"
+        );
+        if !marked {
+            assert!(floats(&b.out.read("out")).iter().all(f32::is_finite));
+        }
+    }
+}
+/// Prints the step's time over each ring format at the context caps 8192 and 65536: from F32
+/// the bytes of the rings fall to a half in F16 and to a quarter in Int8.
+#[test]
+#[ignore = "prints the step's time on this device"]
+fn the_ring_formats_are_timed() {
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x8A_7E_11_05);
+    for format in [
+        RelativeKvFormat::F32,
+        RelativeKvFormat::F16,
+        RelativeKvFormat::Int8,
+    ] {
+        for (capacity, position) in [(8192usize, 8191i32), (65536, 65535)] {
+            let s = RelativeAttentionShape {
+                format,
+                ..decode_geometry(capacity)
+            };
+            let c = Case::new(&mut rng, s, position);
+            let rings = (ring_bytes(format, &c.ring_k), ring_bytes(format, &c.ring_v));
+            let b = buffers_with_rings(&rig, &c, 0, Some((&rings.0, &rings.1)));
+            time_buffers(&rig, &b, s, position);
+        }
     }
 }
