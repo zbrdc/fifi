@@ -26,6 +26,12 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_quantize_q8_1_rounded_launch"]
+    fn quantize_q8_1_rounded_launch_raw(
+        args: *const QuantizeArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
 }
 
 /// Mirror of `inference_cuda_quantize_q8_1_args` (`quantize_q8_1.h`), field for field.
@@ -96,7 +102,13 @@ pub(in crate::kernels::cuda) fn quantize_q8_1_launch(
     // addresses. The allocations stay valid until the queued launch finishes because
     // `inference_cuda_free` synchronizes the device first. `stream` is live for the call and
     // `args` is a plain value the entry reads.
-    let status = unsafe { quantize_q8_1_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe {
+        if super::rounded_q8_1() {
+            quantize_q8_1_rounded_launch_raw(&args, stream.0.as_ptr(), &mut stage)
+        } else {
+            quantize_q8_1_launch_raw(&args, stream.0.as_ptr(), &mut stage)
+        }
+    };
     checked(status, stage)
 }
 

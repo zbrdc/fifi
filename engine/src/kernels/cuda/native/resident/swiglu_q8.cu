@@ -30,13 +30,20 @@ constexpr int kMaxWidth = 32768;
 constexpr int64_t kMatrixRowPadding = 512; // common.cuh, the MMVQ activation padding
 constexpr int64_t kQk8_1 = 32;             // QK8_1
 
-/* silu with the fast __expf of swiglu_pack_k (ops.cu), kept on purpose: the numerics
- * statement of the swiglu_pack doc is the domain, and the tests state the tolerance. */
-__device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
+/* silu with the fast __expf of swiglu_pack_k (ops.cu) or IEEE expf when ExactExp is set. */
+template <bool ExactExp>
+__device__ __forceinline__ float silu(float x) {
+  if constexpr (ExactExp) {
+    return x / (1.f + expf(-x));
+  } else {
+    return x / (1.f + __expf(-x));
+  }
+}
 
 /* The batched producer: one block per slot, one warp per 32-value block of the padded width.
  * With glu_done set the first half of each slot row already holds the activation (the fused
  * gate+up matvec wrote it), so only the quantize applies. */
+template <bool ExactExp, bool RoundedQ8>
 __global__ void swiglu_q8_k(const float *gu, int n_ff, int64_t slot_stride, block_q8_1 *y,
                             int glu_done) {
   const float *g = gu + (int64_t)blockIdx.x * slot_stride;
@@ -49,8 +56,8 @@ __global__ void swiglu_q8_k(const float *gu, int n_ff, int64_t slot_stride, bloc
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   for (int64_t b = warp; b < padded / kQk8_1; b += nwarps) {
     const int i = (int)(b * kQk8_1) + lane;
-    const float xi = i < n_ff ? (glu_done ? g[i] : silu(g[i]) * g[n_ff + i]) : 0.0f;
-    store_q8_1_block(&row[b], xi);
+    const float xi = i < n_ff ? (glu_done ? g[i] : silu<ExactExp>(g[i]) * g[n_ff + i]) : 0.0f;
+    store_q8_1_block_mode<RoundedQ8>(&row[b], xi);
   }
 }
 
@@ -62,11 +69,13 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 
 }  // namespace
 
-extern "C" int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_args *args,
-                                               void *stream, int *out_stage) {
+extern "C" int inference_cuda_swiglu_q8_launch_mode(const inference_cuda_swiglu_q8_args *args,
+                                                    void *stream, int *out_stage, int exact_exp,
+                                                    int rounded_q8) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        if (args == NULL || stream == NULL || args->gu == NULL || args->q8 == NULL) {
+        if (args == NULL || stream == NULL || args->gu == NULL || args->q8 == NULL ||
+            (exact_exp != 0 && exact_exp != 1) || (rounded_q8 != 0 && rounded_q8 != 1)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const int n_ff = args->n_ff;
@@ -88,8 +97,20 @@ extern "C" int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_ar
                    (size_t)(gu_floats * (int64_t)sizeof(float)))) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        swiglu_q8_k<<<slots, kThreads, 0, (cudaStream_t)stream>>>(
-            (const float *)args->gu, n_ff, stride, (block_q8_1 *)args->q8, args->glu_done);
+        const cudaStream_t s = (cudaStream_t)stream;
+        if (exact_exp && rounded_q8) {
+            swiglu_q8_k<true, true><<<slots, kThreads, 0, s>>>(
+                (const float *)args->gu, n_ff, stride, (block_q8_1 *)args->q8, args->glu_done);
+        } else if (exact_exp) {
+            swiglu_q8_k<true, false><<<slots, kThreads, 0, s>>>(
+                (const float *)args->gu, n_ff, stride, (block_q8_1 *)args->q8, args->glu_done);
+        } else if (rounded_q8) {
+            swiglu_q8_k<false, true><<<slots, kThreads, 0, s>>>(
+                (const float *)args->gu, n_ff, stride, (block_q8_1 *)args->q8, args->glu_done);
+        } else {
+            swiglu_q8_k<false, false><<<slots, kThreads, 0, s>>>(
+                (const float *)args->gu, n_ff, stride, (block_q8_1 *)args->q8, args->glu_done);
+        }
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
@@ -97,4 +118,9 @@ extern "C" int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_ar
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+extern "C" int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_args *args,
+                                               void *stream, int *out_stage) {
+    return inference_cuda_swiglu_q8_launch_mode(args, stream, out_stage, 0, 0);
 }

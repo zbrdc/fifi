@@ -35,6 +35,11 @@ typedef struct inference_cuda_gdn_conv_args {
 int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args *args, void *stream,
                                    int *out_stage);
 
+/* In-house IEEE expf variant of conv_silu (same validation, layout and tap order as above,
+ * replacing ops.cu's fast-math __expf with expf). */
+int inference_cuda_gdn_conv_ieee_launch(const inference_cuda_gdn_conv_args *args, void *stream,
+                                        int *out_stage);
+
 /* The same step on the prefill kernel (conv_silu_rows_k of gdn_conv.cu): bytes of out and state
  * identical to the entry above for every valid call. Each thread owns one channel for
  * rows_per_thread rows (16, 32 or 64; any other value is INVALID_ARGUMENT), so a call of many
@@ -42,6 +47,10 @@ int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args *args, voi
  * snapshot range. The arguments, limits and overlap rules are those of the entry above. */
 int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv_args *args, void *stream,
                                         int *out_stage, int rows_per_thread);
+
+/* IEEE expf prefill variant matching inference_cuda_gdn_conv_ieee_launch. */
+int inference_cuda_gdn_conv_rows_ieee_launch(const inference_cuda_gdn_conv_args *args, void *stream,
+                                             int *out_stage, int rows_per_thread);
 
 #ifdef __cplusplus
 }

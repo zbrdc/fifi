@@ -18,11 +18,27 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "quantize.cuh"
 #pragma GCC diagnostic pop
+#include "resident/q8_1_store.cuh"
 
 namespace {
 
 /* k is padded up to this before the launch (MATRIX_ROW_PADDING, common.cuh). */
 const int64_t kMatrixRowPadding = 512;
+const int kThreads = 256;
+
+__global__ void quantize_q8_1_rounded_k(const float *x, block_q8_1 *y, int k, int64_t blocks) {
+    const int64_t r = blockIdx.x;
+    const float *xrow = x + r * (int64_t)k;
+    block_q8_1 *yrow = y + r * blocks;
+    const int nwarps = (int)blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    for (int64_t b = warp; b < blocks; b += nwarps) {
+        const int i = (int)(b * QK8_1) + lane;
+        const float xi = i < k ? xrow[i] : 0.0f;
+        store_q8_1_block_rounded(&yrow[b], xi);
+    }
+}
 
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
 
@@ -30,10 +46,9 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
     return (uintptr_t)a + a_bytes <= (uintptr_t)b || (uintptr_t)b + b_bytes <= (uintptr_t)a;
 }
 
-}  // namespace
-
-extern "C" int inference_cuda_quantize_q8_1_launch(const inference_cuda_quantize_q8_1_args *args,
-                                                   void *stream, int *out_stage) {
+template <bool RoundedQ8>
+int launch_quantize_q8_1(const inference_cuda_quantize_q8_1_args *args, void *stream,
+                         int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || stream == NULL) {
@@ -58,14 +73,32 @@ extern "C" int inference_cuda_quantize_q8_1_launch(const inference_cuda_quantize
         }
         // One launch over the padded width; the kernel writes the zero tail itself.
         Failure failure;
-        failure.record(quantize_row_q8_1_cuda(
-                           (const float *)args->x, NULL, args->y, GGML_TYPE_F32,
-                           k, /*s01=*/k, /*s02=*/(int64_t)k * ncols, /*s03=*/(int64_t)k * ncols,
-                           ne0, ncols, /*ne2=*/1, /*ne3=*/1, (cudaStream_t)stream),
-                       INFERENCE_CUDA_STAGE_LAUNCH);
+        if constexpr (RoundedQ8) {
+            quantize_q8_1_rounded_k<<<(unsigned)ncols, kThreads, 0, (cudaStream_t)stream>>>(
+                (const float *)args->x, (block_q8_1 *)args->y, k, blocks);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        } else {
+            failure.record(quantize_row_q8_1_cuda(
+                               (const float *)args->x, NULL, args->y, GGML_TYPE_F32,
+                               k, /*s01=*/k, /*s02=*/(int64_t)k * ncols, /*s03=*/(int64_t)k * ncols,
+                               ne0, ncols, /*ne2=*/1, /*ne3=*/1, (cudaStream_t)stream),
+                           INFERENCE_CUDA_STAGE_LAUNCH);
+        }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+}  // namespace
+
+extern "C" int inference_cuda_quantize_q8_1_launch(const inference_cuda_quantize_q8_1_args *args,
+                                                   void *stream, int *out_stage) {
+    return launch_quantize_q8_1<false>(args, stream, out_stage);
+}
+
+extern "C" int inference_cuda_quantize_q8_1_rounded_launch(
+    const inference_cuda_quantize_q8_1_args *args, void *stream, int *out_stage) {
+    return launch_quantize_q8_1<true>(args, stream, out_stage);
 }

@@ -49,6 +49,11 @@ typedef struct inference_cuda_gdn_delta_args {
 int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_args *args, void *stream,
                                     int *out_stage);
 
+/* In-house IEEE expf variant of gated_delta (same AddEps L2 norm and 128-thread head layout as
+ * ops.cu, replacing fast-math __expf with IEEE expf to match prefill gdn_scan_seq). */
+int inference_cuda_gdn_delta_ieee_launch(const inference_cuda_gdn_delta_args *args, void *stream,
+                                         int *out_stage);
+
 /* Qualification-only 256-thread partition; same validation and layout, different sum order.
  * Serving callers keep the entries above/below. */
 int inference_cuda_gdn_delta_partition_launch(const inference_cuda_gdn_delta_args *args, void *stream,

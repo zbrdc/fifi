@@ -69,6 +69,12 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_gdn_delta_ieee_launch"]
+    fn gdn_delta_ieee_launch_raw(
+        args: *const GdnDeltaArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[cfg(any(test, fifi_gdn_partition_qualification))]
     #[link_name = "inference_cuda_gdn_delta_partition_launch"]
     fn gdn_delta_partition_launch_raw(
@@ -226,12 +232,17 @@ pub(in crate::kernels::cuda) fn gdn_delta_launch(
         eps: io.eps,
     };
     let mut stage = STAGE_NONE;
-    let launch = gdn_delta_launch_raw;
+    let launch: unsafe extern "C" fn(*const GdnDeltaArgsRaw, *mut c_void, *mut c_int) -> c_int =
+        if super::exact_transcendentals() {
+            gdn_delta_ieee_launch_raw
+        } else {
+            gdn_delta_launch_raw
+        };
     #[cfg(any(test, fifi_gdn_partition_qualification))]
     let launch = if partitioned_for_tests() {
         gdn_delta_partition_launch_raw
     } else {
-        launch as unsafe extern "C" fn(_, _, _) -> _
+        launch
     };
     // SAFETY: `check_delta` proved every range inside its live allocation, large enough for the
     // call and 4-byte aligned, and `state` and `out` disjoint from every other range, so each

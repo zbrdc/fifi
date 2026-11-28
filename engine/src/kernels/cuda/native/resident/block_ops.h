@@ -123,6 +123,10 @@ _Static_assert(sizeof(inference_cuda_block_ops_args) == 264 && offsetof(inferenc
 int inference_cuda_block_ops_launch(const inference_cuda_block_ops_args *args, void *stream,
                                     int *out_stage);
 
+/* Mode-selectable block_ops launch: rounded_q8 (0 = legacy unrounded ds.y, 1 = rounded ds.y). */
+int inference_cuda_block_ops_launch_mode(const inference_cuda_block_ops_args *args, void *stream,
+                                         int *out_stage, int rounded_q8);
+
 #ifdef __cplusplus
 }
 #endif

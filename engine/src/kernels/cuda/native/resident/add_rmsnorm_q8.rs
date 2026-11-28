@@ -28,6 +28,12 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_add_rmsnorm_q8_rounded_launch"]
+    fn add_rmsnorm_q8_rounded_launch_raw(
+        args: *const AddNormQ8ArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
 }
 
 /// Mirror of `inference_cuda_add_rmsnorm_q8_args` (`add_rmsnorm_q8.h`), field for field.
@@ -167,7 +173,13 @@ pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
     // checks on the addresses. The allocations stay valid until the queued launch finishes
     // because `inference_cuda_free` synchronizes the device first. `stream` is live for the call
     // and `args` is a plain value the entry reads.
-    let status = unsafe { add_rmsnorm_q8_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe {
+        if super::rounded_q8_1() {
+            add_rmsnorm_q8_rounded_launch_raw(&args, stream.0.as_ptr(), &mut stage)
+        } else {
+            add_rmsnorm_q8_launch_raw(&args, stream.0.as_ptr(), &mut stage)
+        }
+    };
     checked(status, stage)
 }
 

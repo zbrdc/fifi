@@ -53,9 +53,38 @@ bool valid(const inference_cuda_gdn_conv_args &a, void *stream) {
 
 constexpr int kBlock = 256;
 
-// silu as in the vendored ops.cu (the same expression, so the same instructions under the same
-// build flags); the device tests compare the two kernels bit for bit.
-__device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
+// silu as in the vendored ops.cu (false) or in IEEE expf (true).
+template <bool ExactExp>
+__device__ __forceinline__ float silu_f(float x) {
+    if constexpr (ExactExp) {
+        return x / (1.f + expf(-x));
+    } else {
+        return x / (1.f + __expf(-x));
+    }
+}
+
+__global__ void __launch_bounds__(kBlock)
+conv_silu_ieee_k(const float *__restrict__ proj, int ld, int m, int n,
+                 const float4 *__restrict__ w, float *state, float *__restrict__ out) {
+    const int c = blockIdx.x * kBlock + threadIdx.x;
+    if (c >= n) return;
+    float s0 = state[c];
+    float s1 = state[n + c];
+    float s2 = state[2 * n + c];
+    const float4 wc = w[c];
+    for (int t = 0; t < m; ++t) {
+        const float x = proj[(size_t)t * ld + c];
+        const float v = __fmaf_rn(x, wc.w,
+                                  __fmaf_rn(s2, wc.z, __fmaf_rn(s1, wc.y, __fmul_rn(s0, wc.x))));
+        out[(size_t)t * n + c] = silu_f<true>(v);
+        s0 = s1;
+        s1 = s2;
+        s2 = x;
+    }
+    state[c] = s0;
+    state[n + c] = s1;
+    state[2 * n + c] = s2;
+}
 
 // The prefill variant of conv_silu_k. One thread owns channel c for the rows [t0, t0 + R) of its
 // CTA row, t0 = blockIdx.y * R. The window entering row t is the three inputs of rows t - 3 .. t - 1,
@@ -67,7 +96,7 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x))
 // The state after the m rows is the last three inputs (or the state shifted, for m < 3). Only the
 // CTA row 0 reads the state (R >= 3 gives every other CTA row a full window in proj), and the same
 // thread of that CTA row writes it back, after reading it, so no CTA reads what another writes.
-template <int R>
+template <int R, bool ExactExp>
 __global__ void __launch_bounds__(kBlock)
 conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
                  const float4 *__restrict__ w, float *state, float *__restrict__ out GDN_MUTANT_PARAM) {
@@ -104,7 +133,7 @@ conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
                                 __fmaf_rn(x[j + 2], wc.z,
                                           __fmaf_rn(x[j + 1], wc.y, __fmul_rn(x[j], wc.x))));
             if (mutant == 1) v = x[j] * wc.x + x[j + 1] * wc.y + x[j + 2] * wc.z + x[j + 3] * wc.w;
-            if (!(mutant == 5 && j == rows - 1)) out[(size_t)(t0 + j) * n + c] = silu_f(v);
+            if (!(mutant == 5 && j == rows - 1)) out[(size_t)(t0 + j) * n + c] = silu_f<ExactExp>(v);
         }
     }
     if (mutant == 4 ? blockIdx.y == 0 : blockIdx.y != 0) return;
@@ -132,13 +161,37 @@ conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
     state[2 * n + c] = f2;
 }
 
-template <int R>
+template <int R, bool ExactExp>
 cudaError_t launch_rows(const inference_cuda_gdn_conv_args &a, cudaStream_t stream) {
     const dim3 grid((a.channels + kBlock - 1) / kBlock, (a.m + R - 1) / R);
-    conv_silu_rows_k<R><<<grid, kBlock, 0, stream>>>(
+    conv_silu_rows_k<R, ExactExp><<<grid, kBlock, 0, stream>>>(
         (const float *)a.proj, a.ld, a.m, a.channels, (const float4 *)a.w, (float *)a.state,
         (float *)a.out GDN_MUTANT_ARG);
     return cudaGetLastError();
+}
+
+template <bool ExactExp>
+int conv_rows_launch_impl(const inference_cuda_gdn_conv_args *args, void *stream, int *out_stage,
+                          int rows_per_thread) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid(*args, stream)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        cudaError_t launched;
+        switch (rows_per_thread) {
+        case 16: launched = launch_rows<16, ExactExp>(*args, (cudaStream_t)stream); break;
+        case 32: launched = launch_rows<32, ExactExp>(*args, (cudaStream_t)stream); break;
+        case 64: launched = launch_rows<64, ExactExp>(*args, (cudaStream_t)stream); break;
+        default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        failure.record(launched, INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
 }
 
 }  // namespace
@@ -163,28 +216,36 @@ extern "C" int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args
     }
 }
 
-extern "C" int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv_args *args,
-                                                   void *stream, int *out_stage,
-                                                   int rows_per_thread) {
+extern "C" int inference_cuda_gdn_conv_ieee_launch(const inference_cuda_gdn_conv_args *args,
+                                                   void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || !valid(*args, stream)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        cudaError_t launched;
-        switch (rows_per_thread) {
-        case 16: launched = launch_rows<16>(*args, (cudaStream_t)stream); break;
-        case 32: launched = launch_rows<32>(*args, (cudaStream_t)stream); break;
-        case 64: launched = launch_rows<64>(*args, (cudaStream_t)stream); break;
-        default: return INFERENCE_CUDA_INVALID_ARGUMENT;
-        }
+        const unsigned grid = (unsigned)((args->channels + kBlock - 1) / kBlock);
+        conv_silu_ieee_k<<<grid, kBlock, 0, (cudaStream_t)stream>>>(
+            (const float *)args->proj, args->ld, args->m, args->channels, (const float4 *)args->w,
+            (float *)args->state, (float *)args->out);
         Failure failure;
-        failure.record(launched, INFERENCE_CUDA_STAGE_LAUNCH);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+extern "C" int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv_args *args,
+                                                   void *stream, int *out_stage,
+                                                   int rows_per_thread) {
+    return conv_rows_launch_impl<false>(args, stream, out_stage, rows_per_thread);
+}
+
+extern "C" int inference_cuda_gdn_conv_rows_ieee_launch(const inference_cuda_gdn_conv_args *args,
+                                                        void *stream, int *out_stage,
+                                                        int rows_per_thread) {
+    return conv_rows_launch_impl<true>(args, stream, out_stage, rows_per_thread);
 }
 
 #ifdef INFERENCE_CUDA_GDN_MUTANTS

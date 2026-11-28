@@ -59,6 +59,7 @@ __device__ __forceinline__ float block_sum(float v) {
  * weight — a whole per-head or per-batch norm loop collapses into one launch. With 1024
  * threads the same block code runs a quarter of the strided rounds per row: the q8 blocks are
  * independent, but the sum of squares adds in another float order, so the last bits differ. */
+template <bool RoundedQ8>
 __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const float *w, int n,
                                  float eps, float *base_norm_out, block_q8_1 *base_y, int64_t h_stride) {
   const int64_t padded =
@@ -84,7 +85,7 @@ __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const f
     const int i = (int)(b * kQk8_1) + lane;
     const float xi = i < n ? h[i] * rstd * w[i] : 0.0f;
     if (i < n) norm_out[i] = xi;
-    store_q8_1_block(&y[b], xi);
+    store_q8_1_block_mode<RoundedQ8>(&y[b], xi);
   }
 }
 
@@ -99,10 +100,9 @@ struct Extent {
     size_t bytes;
 };
 
-}  // namespace
-
-extern "C" int inference_cuda_add_rmsnorm_q8_launch(
-    const inference_cuda_add_rmsnorm_q8_args *args, void *stream, int *out_stage) {
+template <bool RoundedQ8>
+int launch_add_rmsnorm_q8(const inference_cuda_add_rmsnorm_q8_args *args, void *stream,
+                          int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || stream == NULL) {
@@ -143,7 +143,7 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
                 }
             }
         }
-        add_rmsnorm_q8_k<<<dim3((unsigned)rows), dim3((unsigned)(args->threads ? args->threads : kThreads)), 0, (cudaStream_t)stream>>>(
+        add_rmsnorm_q8_k<RoundedQ8><<<dim3((unsigned)rows), dim3((unsigned)(args->threads ? args->threads : kThreads)), 0, (cudaStream_t)stream>>>(
             (float *)args->h, (const float *)args->delta, (const float *)args->w, n, args->eps,
             (float *)args->norm_out, (block_q8_1 *)args->q8, h_stride);
         Failure failure;
@@ -153,4 +153,16 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+}  // namespace
+
+extern "C" int inference_cuda_add_rmsnorm_q8_launch(
+    const inference_cuda_add_rmsnorm_q8_args *args, void *stream, int *out_stage) {
+    return launch_add_rmsnorm_q8<false>(args, stream, out_stage);
+}
+
+extern "C" int inference_cuda_add_rmsnorm_q8_rounded_launch(
+    const inference_cuda_add_rmsnorm_q8_args *args, void *stream, int *out_stage) {
+    return launch_add_rmsnorm_q8<true>(args, stream, out_stage);
 }

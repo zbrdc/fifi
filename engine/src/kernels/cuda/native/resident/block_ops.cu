@@ -255,6 +255,7 @@ __global__ void hc_broadcast_kernel(const unsigned *src, unsigned *dst, int stre
 
 /* ---- quantize -------------------------------------------------------------------------- */
 
+template <bool RoundedQ8>
 __global__ void __launch_bounds__(256) gated_quant_kernel(const float *x, const float *g,
                                                           unsigned char *q8, float *y, int w) {
     const int t = blockIdx.x;
@@ -265,11 +266,15 @@ __global__ void __launch_bounds__(256) gated_quant_kernel(const float *x, const 
         float v = x[at];
         if (g != NULL) v *= sigmoid_f(g[at]);
         if (y != NULL) y[at] = v;
-        if (qrow != NULL) store_q8_1_block(reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), v);
+        if (qrow != NULL) {
+            store_q8_1_block_mode<RoundedQ8>(
+                reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), v);
+        }
     }
     if (qrow != NULL) zero_q8_tail(qrow, w);
 }
 
+template <bool RoundedQ8>
 __global__ void __launch_bounds__(256) situ_quant_kernel(const float *gate, const float *up,
                                                          unsigned char *q8, float *y, int w,
                                                          int ld_gate, int ld_up, float beta,
@@ -284,7 +289,10 @@ __global__ void __launch_bounds__(256) situ_quant_kernel(const float *gate, cons
         const float act = tanhf(g / beta) * beta * sigmoid_f(g);
         const float upq = lb > 0.0f ? tanhf(u / lb) * lb : u;
         if (y != NULL) y[(size_t)t * w + i] = act * upq;
-        if (qrow != NULL) store_q8_1_block(reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), act * upq);
+        if (qrow != NULL) {
+            store_q8_1_block_mode<RoundedQ8>(
+                reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), act * upq);
+        }
     }
     if (qrow != NULL) zero_q8_tail(qrow, w);
 }
@@ -664,11 +672,13 @@ int probe_sm80(Kernel kernel, int *out_stage, int *err_out) {
 
 }  // namespace
 
-extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_args *args,
-                                               void *stream, int *out_stage) {
+extern "C" int inference_cuda_block_ops_launch_mode(const inference_cuda_block_ops_args *args,
+                                                    void *stream, int *out_stage, int rounded_q8) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        if (args == NULL || stream == NULL) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (args == NULL || stream == NULL || (rounded_q8 != 0 && rounded_q8 != 1)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
         const cudaStream_t s = (cudaStream_t)stream;
         const int *i = args->ints;
         const float *f = args->floats;
@@ -1021,9 +1031,15 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.maybe(3, rows * w * 4, true);
             if (!slots.valid() || (p[2] == NULL && p[3] == NULL))
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
-            situ_quant_kernel<<<(unsigned)rows, 256, 0, s>>>(
-                (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
-                (int)w, (int)ldg, (int)ldu, f[0], f[1]);
+            if (rounded_q8) {
+                situ_quant_kernel<true><<<(unsigned)rows, 256, 0, s>>>(
+                    (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
+                    (int)w, (int)ldg, (int)ldu, f[0], f[1]);
+            } else {
+                situ_quant_kernel<false><<<(unsigned)rows, 256, 0, s>>>(
+                    (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
+                    (int)w, (int)ldg, (int)ldu, f[0], f[1]);
+            }
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_GATED_QUANT: {
@@ -1036,9 +1052,15 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.maybe(3, rows * w * 4, true);
             if (!slots.valid() || (p[2] == NULL && p[3] == NULL))
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
-            gated_quant_kernel<<<(unsigned)rows, 256, 0, s>>>(
-                (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
-                (int)w);
+            if (rounded_q8) {
+                gated_quant_kernel<true><<<(unsigned)rows, 256, 0, s>>>(
+                    (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
+                    (int)w);
+            } else {
+                gated_quant_kernel<false><<<(unsigned)rows, 256, 0, s>>>(
+                    (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
+                    (int)w);
+            }
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_FILL: {
@@ -1056,4 +1078,9 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_args *args,
+                                               void *stream, int *out_stage) {
+    return inference_cuda_block_ops_launch_mode(args, stream, out_stage, 0);
 }

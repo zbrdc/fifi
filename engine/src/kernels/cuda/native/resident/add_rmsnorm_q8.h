@@ -57,6 +57,10 @@ _Static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 64 && offsetof(infe
 int inference_cuda_add_rmsnorm_q8_launch(const inference_cuda_add_rmsnorm_q8_args *args,
                                          void *stream, int *out_stage);
 
+/* Scale-consistent, rounded-sum q8_1 variant (FIFI_CUDA_Q8_1_ROUNDED=1). */
+int inference_cuda_add_rmsnorm_q8_rounded_launch(const inference_cuda_add_rmsnorm_q8_args *args,
+                                                 void *stream, int *out_stage);
+
 #ifdef __cplusplus
 }
 #endif

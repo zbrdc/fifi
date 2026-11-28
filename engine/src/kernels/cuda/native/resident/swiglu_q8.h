@@ -50,6 +50,11 @@ _Static_assert(sizeof(inference_cuda_swiglu_q8_args) == 32 && offsetof(inference
 int inference_cuda_swiglu_q8_launch(const inference_cuda_swiglu_q8_args *args, void *stream,
                                     int *out_stage);
 
+/* Mode-selectable SwiGLU + q8_1 pack: exact_exp (0 = __expf, 1 = IEEE expf), rounded_q8
+ * (0 = legacy unrounded ds.y sum, 1 = f16-scale-aware q and rounded ds.y = d * sum(q)). */
+int inference_cuda_swiglu_q8_launch_mode(const inference_cuda_swiglu_q8_args *args, void *stream,
+                                         int *out_stage, int exact_exp, int rounded_q8);
+
 #ifdef __cplusplus
 }
 #endif

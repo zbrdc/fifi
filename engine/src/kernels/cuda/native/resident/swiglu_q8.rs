@@ -21,11 +21,20 @@ use std::mem::offset_of;
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
 unsafe extern "C" {
+    #[cfg(test)]
     #[link_name = "inference_cuda_swiglu_q8_launch"]
     fn swiglu_q8_launch_raw(
         args: *const SwigluQ8ArgsRepr,
         stream: *mut c_void,
         out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_swiglu_q8_launch_mode"]
+    fn swiglu_q8_launch_mode_raw(
+        args: *const SwigluQ8ArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        exact_exp: c_int,
+        rounded_q8: c_int,
     ) -> c_int;
 }
 
@@ -122,7 +131,11 @@ pub(in crate::kernels::cuda) fn swiglu_q8_launch(
     // addresses. The allocations stay valid until the queued launch finishes because
     // `inference_cuda_free` synchronizes the device first. `stream` is live for the call and
     // `args` is a plain value the entry reads.
-    let status = unsafe { swiglu_q8_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
+    let exact_exp = c_int::from(super::exact_transcendentals());
+    let rounded_q8 = c_int::from(super::rounded_q8_1());
+    let status = unsafe {
+        swiglu_q8_launch_mode_raw(&args, stream.0.as_ptr(), &mut stage, exact_exp, rounded_q8)
+    };
     checked(status, stage)
 }
 

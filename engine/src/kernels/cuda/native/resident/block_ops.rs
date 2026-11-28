@@ -20,11 +20,12 @@ pub(in crate::kernels::cuda) const INTS: usize = 12;
 pub(in crate::kernels::cuda) const FLOATS: usize = 4;
 
 unsafe extern "C" {
-    #[link_name = "inference_cuda_block_ops_launch"]
-    fn block_ops_launch_raw(
+    #[link_name = "inference_cuda_block_ops_launch_mode"]
+    fn block_ops_launch_mode_raw(
         args: *const BlockOpsArgsRepr,
         stream: *mut c_void,
         out_stage: *mut c_int,
+        rounded_q8: c_int,
     ) -> c_int;
 }
 
@@ -106,6 +107,8 @@ pub(in crate::kernels::cuda) fn block_ops_launch(
     // aligned, and disjoint in the write direction; the adapter repeats the per-operation checks
     // on the addresses. The allocations stay valid until the queued launch finishes because
     // inference_cuda_free synchronizes the device first.
-    let status = unsafe { block_ops_launch_raw(&args, stream.as_ptr(), &mut stage) };
+    let rounded_q8 = c_int::from(super::rounded_q8_1());
+    let status =
+        unsafe { block_ops_launch_mode_raw(&args, stream.as_ptr(), &mut stage, rounded_q8) };
     checked(status, stage)
 }

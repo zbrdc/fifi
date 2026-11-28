@@ -81,11 +81,83 @@ bool valid(const inference_cuda_gdn_delta_args &a, void *stream) {
     return true;
 }
 
+__device__ __forceinline__ float warp_sum_ieee(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+__device__ __forceinline__ float block_sum_ieee(float v) {
+    __shared__ float red[4];
+    v = warp_sum_ieee(v);
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    __syncthreads();
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    return warp_sum_ieee(lane < 4 ? red[lane] : 0.f);
+}
+
+__device__ __forceinline__ float softplus_ieee(float x) {
+    return x > 20.f ? x : log1pf(expf(x));
+}
+
+__global__ void __launch_bounds__(kern::kStateDim) gated_delta_ieee_k(kern::DeltaArgs a) {
+    constexpr int kDim = kern::kStateDim;
+    __shared__ float qs[kDim], ks[kDim];
+    const int h = blockIdx.x;
+    const int j = threadIdx.x;
+    const int kh = h % a.n_k_heads;
+    float *st = a.state + (size_t)h * kDim * kDim;
+    float s[kDim];
+#pragma unroll
+    for (int i = 0; i < kDim; ++i) s[i] = st[i * kDim + j];
+
+    for (int t = 0; t < a.m; ++t) {
+        const float *c = a.conv + (size_t)t * a.conv_ld;
+        const float *p = a.proj + (size_t)t * a.ld;
+        const float qv = c[kh * kDim + j];
+        const float kv = c[(a.n_k_heads + kh) * kDim + j];
+        const float vv = c[2 * a.n_k_heads * kDim + h * kDim + j];
+        const float qn = rsqrtf(block_sum_ieee(qv * qv) + a.eps) * rsqrtf((float)kDim);
+        const float kn = rsqrtf(block_sum_ieee(kv * kv) + a.eps);
+        qs[j] = qv * qn;
+        ks[j] = kv * kn;
+        __syncthreads();
+        const float decay = expf(softplus_ieee(p[a.alpha_off + h] + a.dt_bias[h]) * a.a[h]);
+        const float beta = 1.f / (1.f + expf(-p[a.beta_off + h]));
+        float sk = 0.f;
+#pragma unroll
+        for (int i = 0; i < kDim; ++i) {
+            s[i] *= decay;
+            sk += s[i] * ks[i];
+        }
+        const float d = (vv - sk) * beta;
+        float o = 0.f;
+#pragma unroll
+        for (int i = 0; i < kDim; ++i) {
+            s[i] += ks[i] * d;
+            o += s[i] * qs[i];
+        }
+        const float rstd = rsqrtf(block_sum_ieee(o * o) / (float)kDim + a.eps);
+        const float z = p[a.z_off + h * kDim + j];
+        a.out[(size_t)t * a.n_v_heads * kDim + h * kDim + j] =
+            o * rstd * a.norm_w[j] * (z / (1.f + expf(-z)));
+    }
+#pragma unroll
+    for (int i = 0; i < kDim; ++i) st[i * kDim + j] = s[i];
+}
+
+cudaError_t launch_ieee(const kern::DeltaArgs &call, cudaStream_t stream) {
+    gated_delta_ieee_k<<<call.n_v_heads, kern::kStateDim, 0, stream>>>(call);
+    return cudaGetLastError();
+}
+
 }  // namespace
 
-template <bool Partitioned>
+template <int Mode>
 int delta_launch(const inference_cuda_gdn_delta_args *args,
-                                               void *stream, int *out_stage) {
+                 void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || !valid(*args, stream)) {
@@ -111,8 +183,15 @@ int delta_launch(const inference_cuda_gdn_delta_args *args,
         call.n_v_heads = args->n_v_heads;
         call.eps = args->eps;
         Failure failure;
-        failure.record(Partitioned ? gdn_partition::launch(call, (cudaStream_t)stream)
-                                   : kern::gated_delta(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
+        cudaError_t err;
+        if constexpr (Mode == 1) {
+            err = gdn_partition::launch(call, (cudaStream_t)stream);
+        } else if constexpr (Mode == 2) {
+            err = launch_ieee(call, (cudaStream_t)stream);
+        } else {
+            err = kern::gated_delta(call, (cudaStream_t)stream);
+        }
+        failure.record(err, INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
@@ -122,10 +201,15 @@ int delta_launch(const inference_cuda_gdn_delta_args *args,
 
 extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_args *args,
                                                void *stream, int *out_stage) {
-    return delta_launch<false>(args, stream, out_stage);
+    return delta_launch<0>(args, stream, out_stage);
 }
 
 extern "C" int inference_cuda_gdn_delta_partition_launch(const inference_cuda_gdn_delta_args *args,
                                                          void *stream, int *out_stage) {
-    return delta_launch<true>(args, stream, out_stage);
+    return delta_launch<1>(args, stream, out_stage);
+}
+
+extern "C" int inference_cuda_gdn_delta_ieee_launch(const inference_cuda_gdn_delta_args *args,
+                                                    void *stream, int *out_stage) {
+    return delta_launch<2>(args, stream, out_stage);
 }

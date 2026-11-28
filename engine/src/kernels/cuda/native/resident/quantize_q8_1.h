@@ -38,6 +38,10 @@ _Static_assert(sizeof(inference_cuda_quantize_q8_1_args) == 24 && offsetof(infer
 int inference_cuda_quantize_q8_1_launch(const inference_cuda_quantize_q8_1_args *args, void *stream,
                                         int *out_stage);
 
+/* In-house IEEE scale-consistent rounded-sum q8_1 quantizer (FIFI_CUDA_Q8_1_ROUNDED=1). */
+int inference_cuda_quantize_q8_1_rounded_launch(const inference_cuda_quantize_q8_1_args *args,
+                                                void *stream, int *out_stage);
+
 #ifdef __cplusplus
 }
 #endif

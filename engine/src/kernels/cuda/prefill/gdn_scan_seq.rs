@@ -550,7 +550,11 @@ impl CudaContext {
         stream: &DeviceStream,
         call: GdnScanSeqCall<'_>,
     ) -> Result<(), EngError> {
-        self.gdn_scan_seq_form(stream, call, GdnForm::QWEN36_GGUF)
+        let mut form = GdnForm::QWEN36_GGUF;
+        if crate::kernels::cuda::native::resident::exact_transcendentals() {
+            form.l2 = GdnL2::AddEps;
+        }
+        self.gdn_scan_seq_form(stream, call, form)
     }
 
     /// Queues the sequential scan of `call` on `stream` with the rules of `form`: K1 (the

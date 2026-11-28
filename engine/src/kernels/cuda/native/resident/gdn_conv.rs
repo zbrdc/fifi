@@ -83,8 +83,21 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_gdn_conv_ieee_launch"]
+    fn gdn_conv_ieee_raw(
+        args: *const GdnConvArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_gdn_conv_rows_launch"]
     fn gdn_conv_rows_raw(
+        args: *const GdnConvArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        rows_per_thread: c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_gdn_conv_rows_ieee_launch"]
+    fn gdn_conv_rows_ieee_raw(
         args: *const GdnConvArgsRaw,
         stream: *mut c_void,
         out_stage: *mut c_int,
@@ -188,7 +201,13 @@ pub(in crate::kernels::cuda) fn gdn_conv_launch(
     // (`inference_cuda_free` synchronizes first). `args` is a live local that the entry reads
     // only during the call: the kernel arguments are copied at launch, so nothing keeps the
     // pointer. `stream` is a live handle for the call, and `stage` is a live, writable c_int.
-    let status = unsafe { gdn_conv_raw(&args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe {
+        if super::exact_transcendentals() {
+            gdn_conv_ieee_raw(&args, stream.0.as_ptr(), &mut stage)
+        } else {
+            gdn_conv_raw(&args, stream.0.as_ptr(), &mut stage)
+        }
+    };
     checked(status, stage)
 }
 
@@ -223,12 +242,21 @@ pub(in crate::kernels::cuda) fn gdn_conv_rows_launch(
     // the entry refuses any other. `args` is a live local the entry reads only during the call,
     // `stream` is a live handle for the call, and `stage` is a live, writable c_int.
     let status = unsafe {
-        gdn_conv_rows_raw(
-            &args,
-            stream.0.as_ptr(),
-            &mut stage,
-            rows_per_thread as c_int,
-        )
+        if super::exact_transcendentals() {
+            gdn_conv_rows_ieee_raw(
+                &args,
+                stream.0.as_ptr(),
+                &mut stage,
+                rows_per_thread as c_int,
+            )
+        } else {
+            gdn_conv_rows_raw(
+                &args,
+                stream.0.as_ptr(),
+                &mut stage,
+                rows_per_thread as c_int,
+            )
+        }
     };
     checked(status, stage)
 }
