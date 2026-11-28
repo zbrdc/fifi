@@ -1,6 +1,7 @@
 /*
  * Launch entry of the decode dq matvec: y = W . x for one f32 activation row over the file's
- * native Q4_K (144-byte) or Q6_K (210-byte) blocks (no repack, no quantize, no vendored code).
+ * native Q4_K (144-byte), Q6_K (210-byte), or Q8_0 (eight 34-byte blocks = 272 bytes per 256
+ * values) blocks (no repack, no quantize, no vendored code).
  * f32 arithmetic throughout. Launch-only: nothing here allocates, copies or synchronizes.
  * Per-kernel layout notes in native/resident/matvec_dq.cu.
  *
@@ -23,7 +24,7 @@ typedef struct inference_cuda_matvec_dq_args {
     float *y;      /* f32 out [rows], 4-byte aligned */
     int k;         /* a positive multiple of 256 */
     int rows;      /* any positive count (the kernel owns whole rows) */
-    int type;      /* INFERENCE_CUDA_TYPE_Q4_K or INFERENCE_CUDA_TYPE_Q6_K */
+    int type;      /* INFERENCE_CUDA_TYPE_Q4_K, INFERENCE_CUDA_TYPE_Q6_K or INFERENCE_CUDA_TYPE_Q8_0 */
 } inference_cuda_matvec_dq_args;
 
 /* One launch on stream (must not be NULL). Returns INFERENCE_CUDA_INVALID_ARGUMENT before

@@ -50,6 +50,25 @@ pub(crate) enum Role {
     SsmNorm,
 }
 
+impl Role {
+    /// Short projection tag matched by `FIFI_CUDA_DECODE_DQ_ROLES`.
+    pub(crate) fn dq_tag(self) -> &'static str {
+        match self {
+            Self::AttnQ => "attn_q",
+            Self::AttnK => "attn_k",
+            Self::AttnV => "attn_v",
+            Self::AttnOutput => "attn_output",
+            Self::AttnQkv => "attn_qkv",
+            Self::AttnGate => "attn_gate",
+            Self::SsmAlpha => "ssm_alpha",
+            Self::SsmBeta => "ssm_beta",
+            Self::SsmOut => "ssm_out",
+            Self::Output => "output",
+            _ => "",
+        }
+    }
+}
+
 const COMMON_ROLES: [Role; 10] = [
     Role::AttnNorm,
     Role::PostAttentionNorm,

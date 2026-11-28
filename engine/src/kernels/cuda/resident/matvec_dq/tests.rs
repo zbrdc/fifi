@@ -11,7 +11,7 @@ use crate::kernels::cuda::resident::matvec_q::tests::{assert_bad_request, refere
 use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::{DeviceBuffer, DeviceRange, testkit};
 
-const TYPES: [QuantType; 2] = [QuantType::Q4K, QuantType::Q6K];
+const TYPES: [QuantType; 3] = [QuantType::Q4K, QuantType::Q6K, QuantType::Q80];
 /// k on the kernel's grid, from one K block to the largest decode shape.
 const KS: [usize; 5] = [256, 512, 2048, 4096, 12288];
 /// Rows: one warp, one warp and a lane group, two blocks and a partly served third, 62 blocks
@@ -87,13 +87,15 @@ fn launch(ctx: &CudaContext, stream: &DeviceStream, rig: &Rig) -> Vec<f32> {
 /// `64 * 2^-24 * sum |w x|`; `max_ratio` keeps the worst error over tolerance.
 fn check_rows(rig: &Rig, got: &[f32], max_ratio: &mut f64) {
     let (ty, k, rows) = (rig.ty, rig.k, rig.rows);
-    let row_bytes = (k / 256) * ty.block_bytes();
+    let row_bytes = ty.weight_bytes(1, k).expect("row bytes");
+    let block_size = ty.block_size();
     for (row, got) in got.iter().enumerate() {
         let w_row = &rig.w_bytes[row * row_bytes..][..row_bytes];
-        let (x_blocks, x_tail) = rig.x.as_chunks::<256>();
-        debug_assert!(x_tail.is_empty(), "k is a multiple of 256");
         let (mut want, mut abs) = (0f64, 0f64);
-        for (block, x) in w_row.chunks_exact(ty.block_bytes()).zip(x_blocks) {
+        for (block, x) in w_row
+            .chunks_exact(ty.block_bytes())
+            .zip(rig.x.chunks_exact(block_size))
+        {
             for (i, x) in x.iter().enumerate() {
                 let term = reference::weight_value(ty, block, i) * f64::from(*x);
                 want += term;
@@ -323,7 +325,7 @@ fn matvec_dq_native_refuses_a_weight_the_kernel_does_not_serve() {
             y.range(0, rows * F32).expect("y range"),
         ),
         "a resident weight of a type the kernel does not serve",
-        "matvec_dq needs a Q4_K or Q6_K weight",
+        "matvec_dq needs a Q4_K, Q6_K or Q8_0 weight",
     );
     stream.synchronize().expect("drain");
     let y = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * F32));
@@ -343,7 +345,10 @@ fn matvec_dq_first_shape_against_the_matvec_bench() {
     if !testkit::device_present("matvec_dq_first_shape_against_the_matvec_bench") {
         return;
     }
-    for (ti, ty) in [QuantType::Q6K, QuantType::Q4K].into_iter().enumerate() {
+    for (ti, ty) in [QuantType::Q6K, QuantType::Q4K, QuantType::Q80]
+        .into_iter()
+        .enumerate()
+    {
         first_shape_against_the_matvec(ty, ti as u64);
     }
 }

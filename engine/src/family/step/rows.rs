@@ -278,6 +278,35 @@ impl<'a> StepIo<'a> {
     /// `y[t] = W x[t]` for `n` rows into `out`. One row, and up to 8 rows written back to back,
     /// use the quantized matvec on the q8_1 rows; other chunks use the batched product on the
     /// f32 rows. With [`Self::exact`] every weight takes a decoding route over the f32 rows.
+    /// Projection with an explicit role tag for opt-in `FIFI_CUDA_DECODE_DQ_ROLES` routing.
+    pub(crate) fn project_role_into(
+        &self,
+        role: &str,
+        weight: &NativeWeight,
+        x: Rows<'_>,
+        n: usize,
+        out: Out<'_>,
+    ) -> Result<(), EngError> {
+        let (k, rows) = (weight.k(), weight.n_rows());
+        let span = ((n - 1) * out.ld + rows) * 4;
+        let y = out
+            .dst
+            .buffer()
+            .range(out.dst.offset() + out.col_off * 4, span)?;
+        if !self.exact
+            && n == 1
+            && crate::kernels::cuda::resident::matvec_dq::decode_dq_role_enabled(role)
+            && crate::kernels::cuda::resident::matvec_dq::serves(weight.quant())
+            && k.is_multiple_of(256)
+            && let Some(f32_rows) = x.f32
+        {
+            return self
+                .ctx
+                .matvec_dq_native(self.stream, weight, f32_rows.range(0, k * 4)?, y);
+        }
+        self.project_into(weight, x, n, out)
+    }
+
     pub(crate) fn project_into(
         &self,
         weight: &NativeWeight,
@@ -303,7 +332,8 @@ impl<'a> StepIo<'a> {
         #[cfg(not(test))]
         let exact = self.exact;
         if exact
-            && matches!(weight.quant(), QuantType::Q4K | QuantType::Q6K)
+            && crate::kernels::cuda::resident::matvec_dq::serves(weight.quant())
+            && k.is_multiple_of(256)
             && let Some(f32_rows) = x.f32
         {
             if n == 1 {
@@ -314,24 +344,26 @@ impl<'a> StepIo<'a> {
                     y,
                 );
             }
-            let row_bytes = weight.quant().weight_bytes(1, k).ok_or_else(|| {
-                EngError::MemoryPlan("the dense projection size overflows".to_owned())
-            })?;
-            return self.ctx.gemm_dq(
-                self.stream,
-                weight.quant(),
-                GemmDqTypedCall {
-                    w: weight.buffer().range(0, rows * row_bytes)?,
-                    x: f32_rows.range(0, n * k * 4)?,
-                    y,
-                    k,
-                    rows,
-                    ncols: n,
-                    x_col_stride: k,
-                    y_col_stride: out.ld,
-                    x_f32: true,
-                },
-            );
+            if matches!(weight.quant(), QuantType::Q4K | QuantType::Q6K) {
+                let row_bytes = weight.quant().weight_bytes(1, k).ok_or_else(|| {
+                    EngError::MemoryPlan("the dense projection size overflows".to_owned())
+                })?;
+                return self.ctx.gemm_dq(
+                    self.stream,
+                    weight.quant(),
+                    GemmDqTypedCall {
+                        w: weight.buffer().range(0, rows * row_bytes)?,
+                        x: f32_rows.range(0, n * k * 4)?,
+                        y,
+                        k,
+                        rows,
+                        ncols: n,
+                        x_col_stride: k,
+                        y_col_stride: out.ld,
+                        x_f32: true,
+                    },
+                );
+            }
         }
         // Every other type on the exact route: its blocks decoded per value over the f32 row.
         if exact && let Some(f32_rows) = x.f32 {

@@ -66,12 +66,10 @@ pub(in crate::kernels::cuda) struct MatvecDqRaw<'a> {
 
 fn check_matvec_dq(call: &MatvecDqRaw<'_>) -> Result<(), DeviceFailure> {
     let (k, rows) = (call.k, call.rows);
-    if !matches!(call.ty, QuantType::Q4K | QuantType::Q6K) {
+    if !matches!(call.ty, QuantType::Q4K | QuantType::Q6K | QuantType::Q80) {
         return Err(invalid_argument());
     }
-    let need_w = rows
-        .checked_mul(k / 256)
-        .and_then(|n| n.checked_mul(call.ty.block_bytes()));
+    let need_w = call.ty.weight_bytes(rows, k);
     let need_x = k.checked_mul(4);
     let need_y = rows.checked_mul(4);
     let ints = [c_int::try_from(k).ok(), c_int::try_from(rows).ok()];

@@ -200,13 +200,17 @@ pub(crate) fn mix(
         )));
     };
     let proj = floats(rows.proj, n * ld)?;
-    for (weight, col_off) in [(layer.q, 0), (layer.k, q_rows), (layer.v, q_rows + kv_rows)] {
+    for (role, weight, col_off) in [
+        ("attn_q", layer.q, 0),
+        ("attn_k", layer.k, q_rows),
+        ("attn_v", layer.v, q_rows + kv_rows),
+    ] {
         let out = Out {
             dst: proj,
             ld,
             col_off,
         };
-        io.project_into(weight, rows.input, n, out)?;
+        io.project_role_into(role, weight, rows.input, n, out)?;
     }
     let rope = RopeParams {
         eps: layer.eps,
@@ -392,5 +396,11 @@ pub(crate) fn mix(
             },
         )?;
     }
-    io.project_into(layer.o, rows.attended, n, Out::packed(rows.out, n, hidden)?)
+    io.project_role_into(
+        "attn_output",
+        layer.o,
+        rows.attended,
+        n,
+        Out::packed(rows.out, n, hidden)?,
+    )
 }

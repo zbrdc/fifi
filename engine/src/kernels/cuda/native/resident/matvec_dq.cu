@@ -183,7 +183,10 @@ __device__ __forceinline__ Window load_window(const unsigned char *p) {
     const uint4 *lines = reinterpret_cast<const uint4 *>(p - a);
     const uint4 l0 = lines[0];
     const uint4 l1 = lines[1];
-    const uint4 l2 = lines[2];
+    /* When p is already 16-byte aligned (a == 0, e.g. Q8_0 lane 7 at +240 of a 272-byte
+     * super-group), the 32-byte window fits inside l0 and l1 alone; skipping lines[2] avoids an
+     * out-of-bounds read past the end of the weight buffer. */
+    const uint4 l2 = a != 0u ? lines[2] : make_uint4(0u, 0u, 0u, 0u);
     const unsigned v[12] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w,
                             l2.x, l2.y, l2.z, l2.w};
     const unsigned sel = 0x3210u + 0x2222u * (unsigned)((a >> 1) & 1u);
@@ -247,6 +250,41 @@ struct Q6kSide {
     __device__ __forceinline__ float result() const { return sum; }
 };
 
+/* Q8_0 super-group of 8 consecutive 34-byte blocks (256 values, 272 = 17 * 16 bytes): each
+ * super-group starts 16-byte aligned when w is 16-byte aligned. Lane l (0..7) owns block l at
+ * raw + 34 * l: f16 d at +0, 32 signed int8 codes at +2..+34. Flipping the sign bit of each
+ * byte maps [-128..127] to [0..255] so code_at + (-8388736.0f) converts on the FMA pipe. */
+struct Q80Side {
+    static const bool kOffsetSum = false;
+    static const int kBlockBytes = 272;
+    float sum;
+
+    __device__ __forceinline__ void start() { sum = 0.0f; }
+
+    __device__ __forceinline__ void add(const unsigned char *raw, int l, const Run &x, float) {
+        const unsigned char *blk = raw + 34 * l;
+        const float d = __half2float(__ushort_as_half(load_half(blk)));
+        const Window q = load_window(blk + 2);
+        float sd = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const unsigned biased = q.w[i] ^ 0x80808080u;
+            const float4 xv = x.v[i];
+            sd = fmaf(code_at(biased, 0) - 8388736.0f, xv.x, sd);
+            sd = fmaf(code_at(biased, 1) - 8388736.0f, xv.y, sd);
+            sd = fmaf(code_at(biased, 2) - 8388736.0f, xv.z, sd);
+            sd = fmaf(code_at(biased, 3) - 8388736.0f, xv.w, sd);
+        }
+        sum = fmaf(d, sd, sum);
+    }
+
+    __device__ __forceinline__ void reduce(int bit) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, bit);
+    }
+
+    __device__ __forceinline__ float result() const { return sum; }
+};
+
 template <class Side>
 __global__ void __launch_bounds__(kWarps * 32) matvec_dq_kernel(const unsigned char *w,
                                                                 const float *x, float *y, int rows,
@@ -296,12 +334,15 @@ extern "C" int inference_cuda_matvec_dq_launch(const inference_cuda_matvec_dq_ar
         const int k = args->k;
         const int rows = args->rows;
         const bool q4k = args->type == INFERENCE_CUDA_TYPE_Q4_K;
+        const bool q6k = args->type == INFERENCE_CUDA_TYPE_Q6_K;
+        const bool q80 = args->type == INFERENCE_CUDA_TYPE_Q8_0;
         if (args->w == NULL || args->x == NULL || args->y == NULL || k <= 0 || k % kQK != 0 ||
-            rows <= 0 || !(q4k || args->type == INFERENCE_CUDA_TYPE_Q6_K)) {
+            rows <= 0 || !(q4k || q6k || q80)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const size_t blocks = (size_t)k / kQK;
-        const int block_bytes = q4k ? Q4kSide::kBlockBytes : Q6kSide::kBlockBytes;
+        const int block_bytes =
+            q4k ? Q4kSide::kBlockBytes : (q6k ? Q6kSide::kBlockBytes : Q80Side::kBlockBytes);
         const size_t w_bytes = (size_t)rows * blocks * (size_t)block_bytes;
         const size_t x_bytes = (size_t)k * sizeof(float);
         const size_t y_bytes = (size_t)rows * sizeof(float);
@@ -314,8 +355,11 @@ extern "C" int inference_cuda_matvec_dq_launch(const inference_cuda_matvec_dq_ar
         if (q4k) {
             matvec_dq_kernel<Q4kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
                 (const unsigned char *)args->w, (const float *)args->x, args->y, rows, (int)blocks);
-        } else {
+        } else if (q6k) {
             matvec_dq_kernel<Q6kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
+                (const unsigned char *)args->w, (const float *)args->x, args->y, rows, (int)blocks);
+        } else {
+            matvec_dq_kernel<Q80Side><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
                 (const unsigned char *)args->w, (const float *)args->x, args->y, rows, (int)blocks);
         }
         Failure failure;

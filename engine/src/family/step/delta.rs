@@ -330,15 +330,23 @@ pub(crate) fn mix(
         Rule::Heads { inputs } => (inputs.iter().flatten().map(|w| w.n_rows()).sum(), inputs),
         Rule::Channels(c) => (conv_dim, [Some(c.q), Some(c.k), Some(c.v), None]),
     };
+    let roles = match layer.rule {
+        Rule::Heads { .. } => ["attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha"],
+        Rule::Channels(_) => ["attn_qkv", "attn_qkv", "attn_qkv", ""],
+    };
     let proj = floats(rows.proj, n * ld)?;
     let mut col_off = 0;
-    for weight in parts.into_iter().flatten() {
+    for (role, weight) in roles
+        .into_iter()
+        .zip(parts)
+        .filter_map(|(r, w)| w.map(|w| (r, w)))
+    {
         let out = Out {
             dst: proj,
             ld,
             col_off,
         };
-        io.project_into(weight, rows.input, n, out)?;
+        io.project_role_into(role, weight, rows.input, n, out)?;
         col_off += weight.n_rows();
     }
     let conv_call = ConvCall {

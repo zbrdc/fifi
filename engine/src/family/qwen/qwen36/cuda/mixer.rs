@@ -52,7 +52,6 @@ use crate::{
             gdn_delta::{DeltaCall, DeltaWeights},
             kv_f16_append::{KvF16AppendData, KvF16AppendShape},
             kv8_append::Kv8Data,
-            matvec_q::MatvecCall,
             quantize_q8_1::QuantizeCall,
             sparse_decode::SparseDecodeData,
             sparse_decode::SparseDecodeShape,
@@ -570,18 +569,16 @@ impl<'a> Mixers<'a> {
                 role, x_q8, y, col, ..
             } => {
                 let weight = run.weights.native(role)?;
-                let ty = weight.quant();
-                ctx.matvec_q(
+                let x_f32 = (x_q8 == Slot::Q8Mix)
+                    .then(|| self.view(Slot::NormRow))
+                    .transpose()?;
+                ctx.project_1row_native(
                     stream,
-                    MatvecCall {
-                        ty,
-                        w: weight.buffer().range(0, weight.buffer().bytes())?,
-                        x_q8: self.view(x_q8)?,
-                        y: tail(self.view(y)?, col)?,
-                        k: weight.k(),
-                        rows: weight.n_rows(),
-                        ncols: BLOCK_ROWS,
-                    },
+                    role.dq_tag(),
+                    weight,
+                    x_f32,
+                    self.view(x_q8)?,
+                    tail(self.view(y)?, col)?,
                 )
             }
             BlockOp::QuantizeQ8 { x, q8, k, .. } => ctx.quantize_q8_1(
