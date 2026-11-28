@@ -278,3 +278,199 @@ mla_attn_chunk_kernel(const float *qeff, const __half *cache, float *part, int n
     __trap();
 #endif
 }
+
+/* Single-row shared-KV latent attention on tensor cores (sm_80 and later). One block covers up to
+ * 64 heads of the query token across one key split (4 row groups x 16 heads), so up to 64 heads
+ * share every KV tile load from DRAM while S = Q̂ K^T and O += P̂ V run on m16n8k16 tensor cores
+ * with the same f16 rounding and f32 accumulation as mla_attn_chunk_kernel. Reads the current
+ * position from pos_ptr when non-null for graph-captured decode steps. */
+__global__ void __launch_bounds__(kMlaChunkThreads, 1)
+mla_attn_decode_tc_kernel(const float *qeff, const __half *cache, float *part,
+                          const int *pos_ptr, int heads, int splits, int pos_host, int cells,
+                          float scale) {
+#if __CUDA_ARCH__ >= 800
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int ht = blockIdx.x, sp = blockIdx.y;
+    const int pos = pos_ptr != NULL ? *pos_ptr : pos_host;
+    const int visible = (pos >= 0 && pos < cells) ? (pos + 1) : 0;
+    const int per_split =
+        visible > 0
+            ? (((visible + splits - 1) / splits + kMlaTile - 1) / kMlaTile * kMlaTile)
+            : 0;
+    const int lo = sp * per_split;
+    const int hi = min(lo + per_split, visible);
+    const unsigned stages = smem_addr(smem);
+    if (lo < hi) mla_issue_tile(cache, lo, hi, stages);
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int rg = warp >> 2, dq = warp & 3;
+    const int g = lane >> 2, c = (lane & 3) * 2;
+    const bool active_rg = ht * 64 + 16 * rg < heads;
+    const int head[2] = {ht * 64 + 16 * rg + g, ht * 64 + 16 * rg + g + 8};
+    float4 *const xs = reinterpret_cast<float4 *>(smem + 2 * kMlaStageBytes) +
+                       rg * (kMlaGroupSlots * 32);
+    float *const xmax = reinterpret_cast<float *>(smem + 2 * kMlaStageBytes +
+                                                  4 * kMlaGroupSlots * kMlaSlotBytes) +
+                        rg * 64;
+    unsigned char *const xp = reinterpret_cast<unsigned char *>(xs);
+    float *const xsum = reinterpret_cast<float *>(xp + 16 * kMlaProbRow);
+
+    unsigned qf[kMlaScoreQuarter / 16][4];
+    if (active_rg) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const float *q = qeff + (size_t)head[i] * kMlaWidth + kMlaScoreQuarter * dq + c;
+#pragma unroll
+            for (int ks = 0; ks < kMlaScoreQuarter / 16; ++ks)
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    float2 v = make_float2(0.f, 0.f);
+                    if (head[i] < heads) v = *reinterpret_cast<const float2 *>(q + 16 * ks + 8 * hh);
+                    const __half2 h = __floats2half2_rn(v.x, v.y);
+                    qf[ks][i + 2 * hh] = *reinterpret_cast<const unsigned *>(&h);
+                }
+        }
+    }
+    const int mi = lane >> 3, rr = lane & 7;
+    const int k_key = 8 * (mi >> 1) + rr, k_chunk = (kMlaScoreQuarter / 8) * dq + (mi & 1);
+    const int v_key = 8 * (mi & 1) + rr, v_chunk = (kMlaValueQuarter / 8) * dq + (mi >> 1);
+
+    float o[kMlaValueQuarter / 8][4];
+#pragma unroll
+    for (int j = 0; j < kMlaValueQuarter / 8; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) o[j][e] = 0.f;
+    float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};
+
+    int it = 0;
+    for (int base = lo; base < hi; base += kMlaTile, ++it) {
+        cp_async_wait_all();
+        __syncthreads();
+        if (base + kMlaTile < hi)
+            mla_issue_tile(cache, base + kMlaTile, hi, stages + ((it + 1) & 1) * kMlaStageBytes);
+        if (!active_rg) continue;
+        const unsigned kst = stages + (it & 1) * kMlaStageBytes;
+
+        float sq[4][4];
+#pragma unroll
+        for (int nb = 0; nb < 4; ++nb)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) sq[nb][e] = 0.f;
+#pragma unroll
+        for (int ks = 0; ks < kMlaScoreQuarter / 16; ++ks)
+#pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                unsigned kb[4];
+                ldsm_x4(kst + mla_swizzle(16 * np + k_key, k_chunk + 2 * ks), kb);
+                mma_16816(sq[2 * np], qf[ks], kb[0], kb[1]);
+                mma_16816(sq[2 * np + 1], qf[ks], kb[2], kb[3]);
+            }
+
+        float4 own = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int nb = 0; nb < 4; ++nb) {
+            const float4 v = make_float4(sq[nb][0], sq[nb][1], sq[nb][2], sq[nb][3]);
+            if (nb == dq)
+                own = v;
+            else
+                xs[(3 * dq + nb - (nb > dq ? 1 : 0)) * 32 + lane] = v;
+        }
+        bar_row_group(rg);
+        float4 sum4 = dq == 0 ? own : xs[dq * 32 + lane - 32];
+#pragma unroll
+        for (int q = 1; q < 4; ++q) {
+            const float4 v = q == dq ? own : xs[(3 * q + dq - (dq > q ? 1 : 0)) * 32 + lane];
+            sum4.x += v.x;
+            sum4.y += v.y;
+            sum4.z += v.z;
+            sum4.w += v.w;
+        }
+        const int kpos = base + 8 * dq + c;
+        const bool full = base + kMlaTile <= hi;
+        const float s2[4] = {full || kpos < hi ? sum4.x * scale : -INFINITY,
+                             full || kpos + 1 < hi ? sum4.y * scale : -INFINITY,
+                             full || kpos < hi ? sum4.z * scale : -INFINITY,
+                             full || kpos + 1 < hi ? sum4.w * scale : -INFINITY};
+        float bm[2] = {fmaxf(s2[0], s2[1]), fmaxf(s2[2], s2[3])};
+#pragma unroll
+        for (int x = 1; x <= 2; x <<= 1) {
+            bm[0] = fmaxf(bm[0], __shfl_xor_sync(0xffffffffu, bm[0], x));
+            bm[1] = fmaxf(bm[1], __shfl_xor_sync(0xffffffffu, bm[1], x));
+        }
+        if (c == 0) {
+            xmax[g * 4 + dq] = bm[0];
+            xmax[(g + 8) * 4 + dq] = bm[1];
+        }
+        bar_row_group(rg);
+        const float4 mq0 = *reinterpret_cast<const float4 *>(xmax + g * 4);
+        const float4 mq1 = *reinterpret_cast<const float4 *>(xmax + (g + 8) * 4);
+        const float m_new[2] = {
+            fmaxf(m_run[0], fmaxf(fmaxf(mq0.x, mq0.y), fmaxf(mq0.z, mq0.w))),
+            fmaxf(m_run[1], fmaxf(fmaxf(mq1.x, mq1.y), fmaxf(mq1.z, mq1.w)))};
+        const float m_ref[2] = {m_new[0] == -INFINITY ? 0.f : m_new[0],
+                                m_new[1] == -INFINITY ? 0.f : m_new[1]};
+        const __half2 ph[2] = {
+            __floats2half2_rn(expf(s2[0] - m_ref[0]), expf(s2[1] - m_ref[0])),
+            __floats2half2_rn(expf(s2[2] - m_ref[1]), expf(s2[3] - m_ref[1]))};
+        const float2 pr[2] = {__half22float2(ph[0]), __half22float2(ph[1])};
+        float ps[2] = {pr[0].x + pr[0].y, pr[1].x + pr[1].y};
+#pragma unroll
+        for (int x = 1; x <= 2; x <<= 1) {
+            ps[0] += __shfl_xor_sync(0xffffffffu, ps[0], x);
+            ps[1] += __shfl_xor_sync(0xffffffffu, ps[1], x);
+        }
+        if (c == 0) {
+            xsum[g * 4 + dq] = ps[0];
+            xsum[(g + 8) * 4 + dq] = ps[1];
+        }
+        *reinterpret_cast<__half2 *>(xp + g * kMlaProbRow + 16 * dq + 2 * c) = ph[0];
+        *reinterpret_cast<__half2 *>(xp + (g + 8) * kMlaProbRow + 16 * dq + 2 * c) = ph[1];
+        const float corr[2] = {expf(m_run[0] - m_ref[0]), expf(m_run[1] - m_ref[1])};
+        bar_row_group(rg);
+        const float4 sq0 = *reinterpret_cast<const float4 *>(xsum + g * 4);
+        const float4 sq1 = *reinterpret_cast<const float4 *>(xsum + (g + 8) * 4);
+        l_run[0] = l_run[0] * corr[0] + (((sq0.x + sq0.y) + sq0.z) + sq0.w);
+        l_run[1] = l_run[1] * corr[1] + (((sq1.x + sq1.y) + sq1.z) + sq1.w);
+        m_run[0] = m_new[0];
+        m_run[1] = m_new[1];
+
+#pragma unroll
+        for (int j = 0; j < kMlaValueQuarter / 8; ++j) {
+            o[j][0] *= corr[0];
+            o[j][1] *= corr[0];
+            o[j][2] *= corr[1];
+            o[j][3] *= corr[1];
+        }
+        const unsigned p_lane = smem_addr(xp) + (rr + 8 * (mi & 1)) * kMlaProbRow + 16 * (mi >> 1);
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            unsigned pa[4];
+            ldsm_x4(p_lane + 32 * ks, pa);
+#pragma unroll
+            for (int jp = 0; jp < kMlaValueQuarter / 16; ++jp) {
+                unsigned vb[4];
+                ldsm_x4_trans(kst + mla_swizzle(16 * ks + v_key, v_chunk + 2 * jp), vb);
+                mma_16816(o[2 * jp], pa, vb[0], vb[1]);
+                mma_16816(o[2 * jp + 1], pa, vb[2], vb[3]);
+            }
+        }
+    }
+    if (!active_rg) return;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        if (head[i] >= heads) continue;
+        const int grp = head[i] / kMlaGroup, hg = head[i] % kMlaGroup;
+        float *dst = part + (((size_t)grp * splits + sp) * kMlaGroup + hg) * kMlaPartStride;
+#pragma unroll
+        for (int j = 0; j < kMlaValueQuarter / 8; ++j)
+            *reinterpret_cast<float2 *>(dst + kMlaValueQuarter * dq + 8 * j + c) =
+                make_float2(o[j][2 * i], o[j][2 * i + 1]);
+        if (dq == 0 && c == 0) {
+            dst[kMlaRank] = m_run[i];
+            dst[kMlaRank + 1] = l_run[i];
+        }
+    }
+#else
+    __trap();
+#endif
+}

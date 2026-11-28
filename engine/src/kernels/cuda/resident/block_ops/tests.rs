@@ -990,6 +990,7 @@ fn the_decode_latent_score_and_step_kv_prep_match_the_row_path() {
         (16, 300, 32, false),
         (40, 1500, 64, true),
         (64, 128, 16, true),
+        (72, 200, 16, true),
     ] {
         let shape = MlaShape {
             n: 1,
@@ -1057,6 +1058,6 @@ fn the_decode_latent_score_and_step_kv_prep_match_the_row_path() {
         let got = r.read(&mix_dec, heads * rank);
         let want = r.read(&mix_ref, heads * rank);
         assert!(got.iter().all(|v| v.is_finite()), "decode mix is finite");
-        assert_close("decode mix", &got, &want, 1e-4);
+        assert_close("decode mix", &got, &want, 5e-3);
     }
 }

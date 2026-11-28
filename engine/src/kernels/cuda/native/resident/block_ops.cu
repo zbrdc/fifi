@@ -4,15 +4,14 @@
  * -use_fast_math). Reductions run in a fixed order (warp shuffle tree, then the warp
  * partials summed in index order), so a launch repeats bit for bit. q8_1 blocks follow the
  * vendored quantize rule: d = amax / 127, q = roundf(x / d), s = the raw sum of the inputs.
- * The chunk form of the latent score (resident/mla_attn_chunk.cuh) alone multiplies f16
- * operands on tensor cores; its sums are f32 and in a fixed order too. */
+ * The chunk and single-row decode forms of the latent score (resident/mla_attn_chunk.cuh) alone
+ * multiply f16 operands on tensor cores; their sums are f32 and in a fixed order too. */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <type_traits>
 
 #include "abi.h"
 #include "device.h"
@@ -385,140 +384,78 @@ __global__ void __launch_bounds__(256) mla_kv_prep_step_kernel(const float *kv, 
     for (int i = threadIdx.x; i < rope; i += blockDim.x) dst[rank + i] = __float2half(kv[rank + i]);
 }
 
-/* Single-row shared-KV latent attention: one block per key split covers ALL heads together
- * (two heads per warp, pure f32 queries and accumulators in registers, double-buffered 16-key
- * KV tile in shared memory), so the KV cache is read once from DRAM across all heads. */
-constexpr int kMlaDecodeTile = 16;
-constexpr int kMlaDecodeStride = kMlaWidth + 8; /* 584 halfs = 1168 B (16B aligned, bank-free) */
-
-__device__ __forceinline__ void mla_decode_load_tile(__half *dst_stage, const __half *cache,
-                                                     int base, int cnt, int tid, int nthreads) {
-    constexpr int kVecsPerKey = kMlaWidth / 8; /* 576 / 8 = 72 uint4s (16 B each) */
-    const int total = cnt * kVecsPerKey;
-    for (int idx = tid; idx < total; idx += nthreads) {
-        const int p = idx / kVecsPerKey;
-        const int v = idx % kVecsPerKey;
-        const void *src = cache + (size_t)(base + p) * kMlaWidth + v * 8;
-        __half *dst = dst_stage + p * kMlaDecodeStride + v * 8;
-#if __CUDA_ARCH__ >= 800
-        inference::mma::cp_async16(inference::mma::smem_addr(dst), src, 16);
-#else
-        *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(src);
-#endif
-    }
-}
-
-__device__ __forceinline__ void mla_decode_cp_wait_one() {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_group 1;\n" ::: "memory");
-#endif
-}
-
-template <int kHpw>
-__global__ void __launch_bounds__(256, 1) mla_attn_decode_kernel(
-    const float *__restrict__ qeff, const __half *__restrict__ cache, float *__restrict__ part,
-    const int *__restrict__ pos_ptr, int splits, int pos_host, int cells, float scale) {
-    __shared__ __align__(16) __half kv_smem[2][kMlaDecodeTile * kMlaDecodeStride];
-    const int sp = blockIdx.x;
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int h_base = warp * kHpw;
+/* Fallback single-row decode latent attention for architectures older than sm_80 or without the
+ * tensor-core kernel's shared-memory budget: same layout and math as mla_attn_kernel, reading pos
+ * from pos_ptr when non-null. */
+__global__ void __launch_bounds__(256)
+mla_attn_decode_fallback_kernel(const float *qeff, const __half *cache, float *part,
+                                const int *pos_ptr, int splits, int pos_host, int cells,
+                                float scale) {
+    extern __shared__ unsigned char smem_raw[];
+    float *qs = reinterpret_cast<float *>(smem_raw);
+    __half *kv = reinterpret_cast<__half *>(qs + kMlaGroup * kMlaWidth);
+    float *pbuf = reinterpret_cast<float *>(kv + kMlaTile * kMlaRowHalves);
+    const int g = blockIdx.x, sp = blockIdx.y;
     const int pos = pos_ptr != NULL ? *pos_ptr : pos_host;
     const int visible = (pos >= 0 && pos < cells) ? (pos + 1) : 0;
     const int per_split =
-        visible > 0 ? (((visible + splits - 1) / splits + kMlaDecodeTile - 1) / kMlaDecodeTile *
-                       kMlaDecodeTile)
-                    : 0;
+        visible > 0
+            ? (((visible + splits - 1) / splits + kMlaTile - 1) / kMlaTile * kMlaTile)
+            : 0;
     const int lo = sp * per_split;
     const int hi = min(lo + per_split, visible);
-
-    float2 acc[kHpw][8];
-    float m[kHpw], l[kHpw];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float *qsrc = qeff + (size_t)g * kMlaGroup * kMlaWidth;
+    for (int i = tid; i < kMlaGroup * kMlaWidth; i += 256) qs[i] = qsrc[i];
+    float m = -INFINITY, l = 0.0f;
+    float acc[kMlaRank / 32];
 #pragma unroll
-    for (int hh = 0; hh < kHpw; ++hh) {
-        m[hh] = -INFINITY;
-        l[hh] = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) acc[hh][i] = make_float2(0.0f, 0.0f);
-    }
-
-    if (lo < hi) {
-        mla_decode_load_tile(kv_smem[0], cache, lo, min(kMlaDecodeTile, hi - lo), tid, 256);
-#if __CUDA_ARCH__ >= 800
-        inference::mma::cp_async_commit();
-#endif
-        int step = 0;
-        for (int base = lo; base < hi; base += kMlaDecodeTile, ++step) {
-            const int cur = step & 1;
-            const int cnt = min(kMlaDecodeTile, hi - base);
-            const int next_base = base + kMlaDecodeTile;
-            if (next_base < hi) {
-                mla_decode_load_tile(kv_smem[cur ^ 1], cache, next_base,
-                                     min(kMlaDecodeTile, hi - next_base), tid, 256);
-#if __CUDA_ARCH__ >= 800
-                inference::mma::cp_async_commit();
-#endif
-                mla_decode_cp_wait_one();
-            } else {
-#if __CUDA_ARCH__ >= 800
-                inference::mma::cp_async_wait_all();
-#endif
+    for (int i = 0; i < kMlaRank / 32; ++i) acc[i] = 0.0f;
+    for (int base = lo; base < hi; base += kMlaTile) {
+        const int cnt = min(kMlaTile, hi - base);
+        __syncthreads();
+        for (int idx = tid; idx < cnt * (kMlaWidth / 2); idx += 256) {
+            const int p = idx / (kMlaWidth / 2), wd = idx % (kMlaWidth / 2);
+            const unsigned v =
+                reinterpret_cast<const unsigned *>(cache + (size_t)(base + p) * kMlaWidth)[wd];
+            reinterpret_cast<unsigned *>(kv + p * kMlaRowHalves)[wd] = v;
+        }
+        __syncthreads();
+        float sc = -INFINITY;
+        if (lane < cnt) {
+            const float *qh = qs + warp * kMlaWidth;
+            const __half2 *kr = reinterpret_cast<const __half2 *>(kv + lane * kMlaRowHalves);
+            float a = 0.0f;
+#pragma unroll 4
+            for (int d2 = 0; d2 < kMlaWidth / 2; ++d2) {
+                const float2 kf = __half22float2(kr[d2]);
+                a += qh[2 * d2] * kf.x + qh[2 * d2 + 1] * kf.y;
             }
-            __syncthreads();
-
-            for (int p = 0; p < cnt; ++p) {
-                const __half2 *kr =
-                    reinterpret_cast<const __half2 *>(kv_smem[cur] + p * kMlaDecodeStride);
-                float2 kv[9];
+            sc = a * scale;
+        }
+        const float mt = warp_max(sc);
+        const float mnew = fmaxf(m, mt);
+        const float corr = m == -INFINITY ? 0.0f : expf(m - mnew);
+        const float p = lane < cnt ? expf(sc - mnew) : 0.0f;
+        l = l * corr + warp_sum(p);
+        m = mnew;
+        pbuf[warp * kMlaTile + lane] = p;
 #pragma unroll
-                for (int i = 0; i < 9; ++i) kv[i] = __half22float2(kr[lane + 32 * i]);
+        for (int i = 0; i < kMlaRank / 32; ++i) acc[i] *= corr;
+        __syncwarp();
+        for (int pp = 0; pp < cnt; ++pp) {
+            const float pw = pbuf[warp * kMlaTile + pp];
+            const __half *lat = kv + pp * kMlaRowHalves;
 #pragma unroll
-                for (int hh = 0; hh < kHpw; ++hh) {
-                    const float2 *qp =
-                        reinterpret_cast<const float2 *>(qeff + (size_t)(h_base + hh) * kMlaWidth);
-                    float d = 0.0f;
-#pragma unroll
-                    for (int i = 0; i < 9; ++i) {
-                        const float2 qv = __ldg(qp + lane + 32 * i);
-                        d = fmaf(qv.x, kv[i].x, fmaf(qv.y, kv[i].y, d));
-                    }
-                    const float s = warp_sum(d) * scale;
-                    /* !(s <= m) is true for both s > m and NaN s, so NaN propagates. */
-                    if (!(s <= m[hh])) {
-                        const float corr = m[hh] == -INFINITY ? 0.0f : expf(m[hh] - s);
-                        l[hh] = l[hh] * corr + 1.0f;
-                        m[hh] = s;
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            acc[hh][i].x = fmaf(acc[hh][i].x, corr, kv[i].x);
-                            acc[hh][i].y = fmaf(acc[hh][i].y, corr, kv[i].y);
-                        }
-                    } else if (m[hh] != -INFINITY) {
-                        const float pw = expf(s - m[hh]);
-                        l[hh] += pw;
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            acc[hh][i].x = fmaf(pw, kv[i].x, acc[hh][i].x);
-                            acc[hh][i].y = fmaf(pw, kv[i].y, acc[hh][i].y);
-                        }
-                    }
-                }
-            }
-            __syncthreads();
+            for (int i = 0; i < kMlaRank / 32; ++i) acc[i] += pw * __half2float(lat[lane + 32 * i]);
         }
     }
-
+    float *dst = part + (((size_t)g * splits + sp) * kMlaGroup + warp) * kMlaPartStride;
 #pragma unroll
-    for (int hh = 0; hh < kHpw; ++hh) {
-        const int h = h_base + hh;
-        const int g = h / kMlaGroup, hg = h % kMlaGroup;
-        float *dst = part + (((size_t)g * splits + sp) * kMlaGroup + hg) * kMlaPartStride;
-        float2 *dst2 = reinterpret_cast<float2 *>(dst);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) dst2[lane + 32 * i] = acc[hh][i];
-        if (lane == 0) {
-            dst[kMlaRank] = m[hh];
-            dst[kMlaRank + 1] = l[hh];
-        }
+    for (int i = 0; i < kMlaRank / 32; ++i) dst[lane + 32 * i] = acc[i];
+    if (lane == 0) {
+        dst[kMlaRank] = m;
+        dst[kMlaRank + 1] = l;
     }
 }
 
@@ -826,7 +763,7 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
         case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_DECODE: {
             const long long heads = i[0], rank = i[1], rope = i[2], splits = i[3];
             const long long pos = i[4], cells = i[5];
-            if (heads < kMlaGroup || heads > 64 || heads % kMlaGroup != 0 || rank != kMlaRank ||
+            if (heads < kMlaGroup || heads > 256 || heads % kMlaGroup != 0 || rank != kMlaRank ||
                 rope != kMlaRope || splits < 1 || splits > 64 || cells < 1 ||
                 (p[3] == NULL && (pos < 0 || pos >= cells)))
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
@@ -836,23 +773,56 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.maybe(3, 4, false);
             if (!slots.valid() || !aligned(p[0], 8) || !aligned(p[1], 16) || !aligned(p[2], 8))
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
-            const auto launch = [&](auto hpw_tag) {
-                constexpr int kHpw = decltype(hpw_tag)::value;
-                mla_attn_decode_kernel<kHpw><<<(unsigned)splits, 256, 0, s>>>(
-                    (const float *)p[0], (const __half *)p[1], (float *)p[2], (const int *)p[3],
-                    (int)splits, (int)pos, (int)cells, f[0]);
-            };
-            switch (heads / kMlaGroup) {
-            case 1: launch(std::integral_constant<int, 1>{}); break;
-            case 2: launch(std::integral_constant<int, 2>{}); break;
-            case 3: launch(std::integral_constant<int, 3>{}); break;
-            case 4: launch(std::integral_constant<int, 4>{}); break;
-            case 5: launch(std::integral_constant<int, 5>{}); break;
-            case 6: launch(std::integral_constant<int, 6>{}); break;
-            case 7: launch(std::integral_constant<int, 7>{}); break;
-            case 8: launch(std::integral_constant<int, 8>{}); break;
-            default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+            int device = 0;
+            if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
+            static int arm[16] = {};
+            if (arm[device] == 0) {
+                Failure failure;
+                cudaFuncAttributes attr = {};
+                int limit = 0;
+                failure.record(cudaFuncGetAttributes(&attr, mla_attn_decode_tc_kernel),
+                               INFERENCE_CUDA_STAGE_LAUNCH);
+                failure.record(cudaDeviceGetAttribute(
+                                   &limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device),
+                               INFERENCE_CUDA_STAGE_LAUNCH);
+                const bool fits =
+                    failure.ok() && attr.ptxVersion >= 80 && limit >= kMlaChunkSmem;
+                if (fits)
+                    failure.record(
+                        cudaFuncSetAttribute(mla_attn_decode_tc_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             kMlaChunkSmem),
+                        INFERENCE_CUDA_STAGE_LAUNCH);
+                report_stage(out_stage, failure.stage);
+                if (!failure.ok()) return (int)failure.err;
+                arm[device] = fits ? 1 : 2;
             }
+            if (arm[device] == 1) {
+                const unsigned head_tiles = (unsigned)((heads + 63) / 64);
+                mla_attn_decode_tc_kernel<<<dim3(head_tiles, (unsigned)splits), kMlaChunkThreads,
+                                            kMlaChunkSmem, s>>>(
+                    (const float *)p[0], (const __half *)p[1], (float *)p[2], (const int *)p[3],
+                    (int)heads, (int)splits, (int)pos, (int)cells, f[0]);
+                return launch_status(out_stage);
+            }
+            const size_t smem = (size_t)kMlaGroup * kMlaWidth * 4 +
+                                (size_t)kMlaTile * kMlaRowHalves * 2 +
+                                (size_t)kMlaGroup * kMlaTile * 4;
+            static bool fb_configured[16] = {};
+            if (!fb_configured[device]) {
+                Failure failure;
+                failure.record(cudaFuncSetAttribute(mla_attn_decode_fallback_kernel,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    (int)smem),
+                               INFERENCE_CUDA_STAGE_LAUNCH);
+                report_stage(out_stage, failure.stage);
+                if (!failure.ok()) return (int)failure.err;
+                fb_configured[device] = true;
+            }
+            mla_attn_decode_fallback_kernel<<<dim3((unsigned)(heads / kMlaGroup), (unsigned)splits),
+                                              256, smem, s>>>(
+                (const float *)p[0], (const __half *)p[1], (float *)p[2], (const int *)p[3],
+                (int)splits, (int)pos, (int)cells, f[0]);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN:

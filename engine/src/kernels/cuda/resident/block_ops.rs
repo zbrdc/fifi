@@ -228,9 +228,10 @@ impl<'b> BlockOp<'b> {
             .read(3, pos, 4))
     }
 
-    /// Single-row shared-KV partial softmax attention across all heads in one pass per key split.
-    /// Reads the current position from `pos_word` when given (for graph-captured decode steps),
-    /// else from `pos`.
+    /// Single-row shared-KV partial softmax attention across up to 64 heads per block on tensor
+    /// cores (falling back to the scalar row kernel when the device lacks the shared-memory
+    /// budget). Reads the current position from `pos_word` when given (for graph-captured decode
+    /// steps), else from `pos`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn mla_attn_decode(
         shape: MlaShape,
@@ -251,7 +252,7 @@ impl<'b> BlockOp<'b> {
             ..
         } = shape;
         if n != 1
-            || !(MLA_GROUP..=64).contains(&heads)
+            || !(MLA_GROUP..=256).contains(&heads)
             || !heads.is_multiple_of(MLA_GROUP)
             || !(1..=64).contains(&splits)
             || cells == 0
