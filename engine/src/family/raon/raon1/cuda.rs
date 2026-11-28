@@ -24,7 +24,9 @@ use crate::family::mem::DEVICE;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
+use crate::family::session::Kept;
 use crate::family::step::attend::latent;
+use crate::family::step::keep;
 use crate::family::step::recipe::{Forward, Layer, Mixer, Model, Site, Stage as WalkStage, Walk};
 use crate::family::step::replay::Replay;
 use crate::family::step::rows::{Map, Rows, StepIo};
@@ -447,11 +449,71 @@ impl Raon1Device {
         self.vocab
     }
 
-    /// Starts a new sequence: clears the delta-rule state and the convolution history. The
-    /// latent cache is position-addressed and needs no clearing.
+    /// Starts a new sequence: clears the delta-rule state, the convolution history and the latent
+    /// cache, and resets the residual cursor.
     pub(crate) fn reset(&mut self) -> Result<(), EngError> {
         self.state.reset(&self.stream)?;
+        self.cache.zero_at(&self.stream, 0, self.cache.bytes())?;
+        self.sc.core.cur.set(0);
         self.stream.synchronize()
+    }
+
+    /// Starts a new sequence on the rows the latent cache holds: the delta-rule records and the
+    /// convolution rings return to zeros and the latent cache stays. A step reads no cache row at
+    /// or above its position, so the new sequence has the bits it has after [`Self::reset`], and a
+    /// sequence that returns to a kept state finds its rows below that position.
+    pub(crate) fn reset_running(&mut self) -> Result<(), EngError> {
+        keep::reset_running(&self.state, &self.stream)?;
+        self.sc.core.cur.set(0);
+        Ok(())
+    }
+
+    /// The bytes of one [`Kept`] of this device.
+    pub(crate) fn kept_bytes(&self) -> u64 {
+        keep::bytes(&self.state)
+    }
+
+    /// The delta-rule records and the convolution rings after `rows` positions, once the queued
+    /// work ran.
+    pub(crate) fn keep(&self, rows: usize) -> Result<Kept, EngError> {
+        keep::keep(&self.state, &self.stream, rows)
+    }
+
+    /// Returns to a kept state. The copies land in the buffers the recorded steps name, so both
+    /// records stay valid: the next decode step replays.
+    pub(crate) fn put_back(&mut self, kept: &Kept) -> Result<(), EngError> {
+        keep::put_back(&self.state, &self.stream, kept)?;
+        self.sc.core.cur.set(0);
+        Ok(())
+    }
+
+    /// Fills every latent cache layer from row `from` on with the two bytes `word`, for the test
+    /// that shows a step reads no cache row at or above its position.
+    #[cfg(test)]
+    pub(crate) fn fill_cache(&self, from: usize, word: [u8; 2]) -> Result<(), EngError> {
+        let row_bytes = MLA_ROW * 2;
+        let layer_bytes = self.cells * row_bytes;
+        let fill: Vec<u8> = word.repeat((self.cells - from) * MLA_ROW);
+        for slot in 0..self.mla.len() {
+            self.cache
+                .write_at(&self.stream, slot * layer_bytes + from * row_bytes, &fill)?;
+        }
+        Ok(())
+    }
+
+    /// The logits row the last head evaluation left on the device, as little-endian bytes.
+    #[cfg(test)]
+    pub(crate) fn last_logits_bytes(&self) -> Result<Vec<u8>, EngError> {
+        let mut bytes = vec![0u8; self.vocab * 4];
+        self.sc.core.logits.read_at(&self.stream, 0, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Runs the output head on `row` of the chunk just walked and returns its logits as bytes.
+    #[cfg(test)]
+    pub(crate) fn chunk_last_logits_bytes(&self, row: usize) -> Result<Vec<u8>, EngError> {
+        self.queue_head(row)?;
+        self.last_logits_bytes()
     }
 
     /// Records the named stages of the next feed as f32 vectors (residual, norm and gated mixer

@@ -973,3 +973,470 @@ fn the_device_scores_teacher_forced_windows() {
     let mut stepper = Scored { device, pos: 0 };
     score_windows(&mut stepper, &run, 1024, sampler_vocab).expect("score");
 }
+
+fn reuse_ids(count: usize, salt: u32, vocab: usize) -> Vec<u32> {
+    (0..count as u32)
+        .map(|i| ((i ^ salt.wrapping_mul(0x9E37)).wrapping_mul(2_654_435_761) >> 7) % vocab as u32)
+        .collect()
+}
+
+fn walk_bytes(device: &mut Raon1Device, prompt: &[u32], forced: &[u32]) -> Vec<Vec<u8>> {
+    use super::cuda::CHUNK;
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for piece in prompt.chunks(CHUNK) {
+        let rows = device.feed(piece, pos, HeadRows::Last).expect("chunk");
+        pos += piece.len();
+        out.push(rows[0].iter().flat_map(|v| v.to_le_bytes()).collect());
+    }
+    for &token in forced {
+        let rows = device.feed(&[token], pos, HeadRows::Last).expect("decode");
+        pos += 1;
+        out.push(rows[0].iter().flat_map(|v| v.to_le_bytes()).collect());
+    }
+    out
+}
+
+fn first_diff(a: &[Vec<u8>], b: &[Vec<u8>]) -> Option<usize> {
+    assert_eq!(a.len(), b.len(), "the walks have other lengths");
+    a.iter().zip(b).position(|(x, y)| x != y)
+}
+
+/// Two facts prompt reuse stands on: a cold start repeats its bits after a full reset, and a step
+/// reads no latent cache row at or above its position (the same walk has the same bits over rows
+/// left by a longer sequence, and over cache planes filled with f16 NaN).
+#[test]
+#[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
+fn a_cold_start_repeats_its_bits_and_reads_no_cache_row_at_or_above_its_position() {
+    const PROMPT: usize = 1500;
+    const CACHE: usize = 2048;
+    let path = model_path();
+    require_device("a_cold_start_repeats_its_bits_and_reads_no_cache_row_at_or_above_its_position");
+    let mut device = Raon1Device::load(&path, Some(CACHE), &mut |_| {}).expect("device load");
+    let vocab = device.vocab();
+    let (prompt, forced) = (
+        reuse_ids(PROMPT, 1, vocab - 300),
+        reuse_ids(6, 2, vocab - 300),
+    );
+    device.reset().expect("reset");
+    let cold = walk_bytes(&mut device, &prompt, &forced);
+    assert!(
+        cold.iter().all(|row| row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|w| f32::from_le_bytes(*w).is_finite())),
+        "a cold row is not finite"
+    );
+
+    device.reset().expect("reset again");
+    let again = walk_bytes(&mut device, &prompt, &forced);
+    assert_eq!(first_diff(&cold, &again), None, "after a full reset");
+
+    device.reset().expect("reset longer");
+    walk_bytes(&mut device, &reuse_ids(CACHE - 8, 3, vocab - 300), &forced);
+    device.reset_running().expect("reset_running");
+    let over_rows = walk_bytes(&mut device, &prompt, &forced);
+    assert_eq!(
+        first_diff(&cold, &over_rows),
+        None,
+        "over the rows of another sequence"
+    );
+
+    device
+        .fill_cache(0, 0x7E00u16.to_le_bytes())
+        .expect("fill_cache");
+    device.reset_running().expect("reset_running nan");
+    let over_nan = walk_bytes(&mut device, &prompt, &forced);
+    assert_eq!(first_diff(&cold, &over_nan), None, "over planes of NaN");
+    eprintln!(
+        "raon cold start: {} rows of {} bytes repeat after a reset, over another sequence's rows \
+         and over NaN planes",
+        cold.len(),
+        cold[0].len()
+    );
+}
+
+/// Both recorded decode graphs (logits and device greedy token pick) survive `put_back` and
+/// replay bit-identically.
+#[test]
+#[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
+fn the_recorded_steps_survive_a_state_put_back() {
+    const PROMPT: usize = 300;
+    const STEPS: usize = 6;
+    const CACHE: usize = 2048;
+    let path = model_path();
+    require_device("the_recorded_steps_survive_a_state_put_back");
+    let mut device = Raon1Device::load(&path, Some(CACHE), &mut |_| {}).expect("device load");
+    assert!(device.takes_tokens(), "expected device embedding table");
+    let sampled = device.vocab() - 300;
+    let (prompt, forced, other) = (
+        reuse_ids(PROMPT, 1, sampled),
+        reuse_ids(STEPS, 2, sampled),
+        reuse_ids(2 * STEPS, 3, sampled),
+    );
+    device.reset().expect("reset fresh");
+    let fresh = walk_bytes(&mut device, &prompt, &forced);
+    let fresh = &fresh[1..];
+
+    device.reset().expect("reset keep");
+    device.feed(&prompt, 0, HeadRows::None).expect("prefill");
+    let kept = device.keep(PROMPT).expect("keep");
+    assert_eq!(kept.bytes(), device.kept_bytes());
+    let steps = |device: &mut Raon1Device, tokens: &[u32]| -> Vec<Vec<u8>> {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(at, &token)| {
+                let rows = device
+                    .feed(&[token], PROMPT + at, HeadRows::Last)
+                    .expect("decode");
+                rows[0].iter().flat_map(|v| v.to_le_bytes()).collect()
+            })
+            .collect()
+    };
+    let first = steps(&mut device, &forced);
+    assert!(
+        device.decode_replayed(),
+        "the decode step never replayed its record"
+    );
+    assert_eq!(first_diff(fresh, &first), None, "before a put back");
+    steps(&mut device, &other);
+    device.put_back(&kept).expect("put_back");
+    let row0: Vec<u8> = device
+        .feed(&forced[..1], PROMPT, HeadRows::Last)
+        .expect("decode replay")[0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert!(device.decode_replayed(), "the put back dropped the record");
+    assert_eq!(row0, first[0], "the replay after a put back");
+    device.put_back(&kept).expect("put_back 2");
+    let second = steps(&mut device, &forced);
+    assert_eq!(first_diff(&first, &second), None, "after a put back");
+
+    let token_steps = |device: &mut Raon1Device, tokens: &[u32]| -> (Vec<u32>, Vec<Vec<u8>>) {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(at, &token)| {
+                let picked = device
+                    .decode_token(token, PROMPT + at, sampled)
+                    .expect("decode_token");
+                (picked, device.last_logits_bytes().expect("last_logits"))
+            })
+            .unzip()
+    };
+    device.put_back(&kept).expect("put_back token");
+    let (picks, token_rows) = token_steps(&mut device, &forced);
+    assert!(
+        device.token_step_replayed(),
+        "the token step never replayed"
+    );
+    assert_eq!(first_diff(&first, &token_rows), None, "the token step");
+    token_steps(&mut device, &other);
+    device.put_back(&kept).expect("put_back token 2");
+    let picked = device
+        .decode_token(forced[0], PROMPT, sampled)
+        .expect("decode_token replay");
+    assert!(
+        device.token_step_replayed(),
+        "the put back dropped the token record"
+    );
+    assert_eq!(
+        (picked, device.last_logits_bytes().expect("logits")),
+        (picks[0], first[0].clone())
+    );
+    device.put_back(&kept).expect("put_back token 3");
+    let (again, again_rows) = token_steps(&mut device, &forced);
+    assert_eq!(again, picks, "the picks after a put back");
+    assert_eq!(first_diff(&first, &again_rows), None, "the token rows");
+    eprintln!(
+        "raon records: {STEPS} decode steps and {STEPS} token steps replay with their bits after a \
+         put back of {} bytes",
+        kept.bytes()
+    );
+}
+
+/// Prompt reuse served end-to-end through `SerialDecode::with_reuse`, `RaonStep`, and the real
+/// engine worker: a reused turn has the exact bits of its cold start with the same boundary mark,
+/// both on chunk logits and decoded tokens (including device greedy picks).
+#[test]
+#[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
+fn a_reused_turn_has_the_bits_of_its_cold_start_with_the_same_boundary_mark() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use super::cuda::CHUNK;
+    use super::serve::RaonStep;
+    use crate::EngError;
+    use crate::family::executor::{GenerationState, SerialDecode};
+    use crate::family::sampler::Sampler;
+    use crate::family::session::{DecodeSession, Kept, TokenStepper, block_spacing_for};
+    use crate::sched::job::{Job, JobEvent};
+    use crate::sched::worker::spawn_engine;
+    use crate::tokenizer::IncrementalDecoder;
+    use crate::tokenizer::gguf::bundle_from_lone_gguf;
+
+    const TAIL: usize = 4;
+    const DECODED: u32 = 8;
+
+    #[derive(Default, Clone, PartialEq)]
+    struct Ran {
+        chunks: Vec<(usize, usize, Vec<u8>)>,
+        decoded: Vec<(Vec<u8>, u32)>,
+        on_device: usize,
+    }
+
+    struct Tap {
+        step: RaonStep,
+        ran: Arc<Mutex<Ran>>,
+    }
+
+    impl TokenStepper for Tap {
+        const OPERATION: &'static str = RaonStep::OPERATION;
+
+        fn feed(&mut self, token: u32) -> Result<(), EngError> {
+            self.feed_rows(&[token])
+        }
+
+        fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+            let first = self.step.fed();
+            self.step.feed_rows(tokens)?;
+            let last_row = (tokens.len() - 1) % CHUNK;
+            let row = self.step.device().chunk_last_logits_bytes(last_row)?;
+            self.ran
+                .lock()
+                .unwrap()
+                .chunks
+                .push((first, tokens.len(), row));
+            Ok(())
+        }
+
+        fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+            self.step.logits(token)
+        }
+
+        fn next_token(
+            &mut self,
+            token: u32,
+            sampler: &mut Sampler,
+            sampler_vocab: usize,
+        ) -> Result<u32, EngError> {
+            let on_device = self.step.device().takes_tokens()
+                && sampler.is_greedy()
+                && !sampler.capture_armed()
+                && sampler.first_top2_margin().is_some();
+            let picked = self.step.next_token(token, sampler, sampler_vocab)?;
+            let row = self.step.device().last_logits_bytes()?;
+            let mut ran = self.ran.lock().unwrap();
+            ran.decoded.push((row, picked));
+            ran.on_device += usize::from(on_device);
+            Ok(picked)
+        }
+
+        fn fed(&self) -> usize {
+            self.step.fed()
+        }
+
+        fn reset(&mut self) -> Result<(), EngError> {
+            self.step.reset()
+        }
+
+        fn kept_bytes(&self) -> Option<u64> {
+            self.step.kept_bytes()
+        }
+
+        fn keep(&mut self) -> Result<Kept, EngError> {
+            self.step.keep()
+        }
+
+        fn put_back(&mut self, kept: &Kept) -> Result<(), EngError> {
+            self.step.put_back(kept)
+        }
+
+        fn kept_generation(&self) -> u64 {
+            self.step.kept_generation()
+        }
+    }
+
+    struct Answer {
+        ran: Ran,
+        tokens: Vec<u32>,
+        reused: usize,
+        first_token: f64,
+        whole: f64,
+    }
+
+    let path = model_path();
+    require_device("a_reused_turn_has_the_bits_of_its_cold_start_with_the_same_boundary_mark");
+    let length: usize = std::env::var("REUSE_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_600);
+    let turn = 300;
+    let bundle = bundle_from_lone_gguf(&path).expect("bundle");
+    let vocab = bundle.vocab_size() as usize;
+    let cache = (length + 2 * (turn + DECODED as usize) + 64)
+        .max(2048)
+        .next_multiple_of(256);
+    let ran = Arc::new(Mutex::new(Ran::default()));
+    let thread_ran = Arc::clone(&ran);
+    let load_path = path.clone();
+    let engine = spawn_engine(CHUNK, move |_| {
+        let device = Raon1Device::load(&load_path, Some(cache), &mut |_| {})?;
+        let tap = Tap {
+            step: RaonStep::new(device),
+            ran: thread_ran,
+        };
+        let executor = SerialDecode::new(tap, Vec::new(), vocab, cache).with_reuse(
+            CHUNK,
+            None,
+            crate::family::step::keep::admit,
+        );
+        Ok((executor, DecodeSession::default()))
+    })
+    .expect("spawn_engine");
+
+    let request = |prompt: &[u32], marked: bool| -> Answer {
+        *ran.lock().unwrap() = Ran::default();
+        let decoder = IncrementalDecoder::new(bundle.tokenizer());
+        let generation = GenerationState::new(decoder).with_max_tokens(DECODED);
+        let (mut job, mut handle) = Job::new(prompt.to_vec(), generation).unwrap();
+        if marked {
+            job = job.with_prefix_boundary(prompt.len() - TAIL).unwrap();
+        }
+        let began = Instant::now();
+        assert!(engine.handle().try_submit(job).is_ok(), "the job queues");
+        let (mut tokens, mut reused, mut first_token) = (Vec::new(), None, None);
+        while let Some(event) = handle.events.blocking_recv() {
+            match event {
+                JobEvent::Batch(batch) => {
+                    first_token.get_or_insert_with(|| began.elapsed().as_secs_f64());
+                    tokens.extend(batch.tokens);
+                }
+                JobEvent::Finished(usage) => reused = Some(usage.reused_tokens as usize),
+                JobEvent::Error(error) => panic!("{error:?}"),
+                JobEvent::Started => {}
+            }
+        }
+        Answer {
+            ran: ran.lock().unwrap().clone(),
+            tokens,
+            reused: reused.expect("the job finished"),
+            first_token: first_token.expect("a token"),
+            whole: began.elapsed().as_secs_f64(),
+        }
+    };
+    let cold = |prompt: &[u32]| -> Answer {
+        request(&reuse_ids(3, 99, vocab), false);
+        let answer = request(prompt, true);
+        assert_eq!(answer.reused, 0, "a cold start reuses nothing");
+        answer
+    };
+    let same_bits = |a: &Ran, b: &Ran| a.chunks == b.chunks && a.decoded == b.decoded;
+
+    let first = reuse_ids(length, 1, vocab);
+    let one = request(&first, true);
+    assert_eq!(one.reused, 0);
+    assert_eq!(one.tokens.len(), DECODED as usize);
+    let mut second = first.clone();
+    second.extend(&one.tokens);
+    second.extend(reuse_ids(turn, 2, vocab));
+
+    let cold_second = cold(&second);
+    let cold_again = cold(&second);
+    assert!(
+        same_bits(&cold_second.ran, &cold_again.ran),
+        "a cold start has other bits the second time"
+    );
+    assert_eq!(cold_second.tokens, cold_again.tokens);
+
+    let one_again = cold(&first);
+    assert!(
+        same_bits(&one.ran, &one_again.ran) && one.tokens == one_again.tokens,
+        "request 1 has other bits over the rows of other sequences"
+    );
+    let warm = request(&second, true);
+    let tip = first.len() - TAIL;
+    let kept = (tip - 1) / block_spacing_for(tip, 4_096) * block_spacing_for(tip, 4_096);
+    assert_eq!(
+        warm.reused, kept,
+        "the block boundary below request 1's tip"
+    );
+    assert_eq!(
+        warm.ran.chunks.first().map(|chunk| chunk.0),
+        Some(kept - 1),
+        "the first row a reused request feeds"
+    );
+    let above: Vec<_> = cold_second
+        .ran
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.0 + 1 >= kept)
+        .cloned()
+        .collect();
+    assert!(!above.is_empty() && above.len() < cold_second.ran.chunks.len());
+    assert!(
+        warm.ran.chunks == above,
+        "a reused request ran other chunks, or other bits, than its cold start"
+    );
+    assert!(
+        warm.ran.decoded == cold_second.ran.decoded,
+        "a reused request decoded from other bits than its cold start"
+    );
+    assert_eq!(warm.tokens, cold_second.tokens);
+    assert_eq!(warm.ran.on_device, cold_second.ran.on_device);
+
+    let mut third = second.clone();
+    third.extend(&warm.tokens);
+    third.extend(reuse_ids(turn, 3, vocab));
+    let warm_third = request(&third, true);
+    assert!(warm_third.reused >= kept);
+    let cold_third = cold(&third);
+    let above: Vec<_> = cold_third
+        .ran
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.0 + 1 >= warm_third.reused)
+        .cloned()
+        .collect();
+    assert!(
+        warm_third.ran.chunks == above && warm_third.ran.decoded == cold_third.ran.decoded,
+        "the third turn has other bits than its cold start"
+    );
+    assert_eq!(warm_third.tokens, cold_third.tokens);
+
+    let fed = |ran: &Ran| ran.chunks.iter().map(|chunk| chunk.1).sum::<usize>();
+    let row_bytes = cold_second.ran.decoded[0].0.len();
+    eprintln!(
+        "raon reused turn: prompt {} tokens, kept at {kept}; rows fed cold {} reused {}; \
+         {} chunk rows and {} decoded rows of {row_bytes} bytes equal; {} of {} tokens picked \
+         on the device",
+        second.len(),
+        fed(&cold_second.ran),
+        fed(&warm.ran),
+        warm.ran.chunks.len(),
+        warm.ran.decoded.len(),
+        warm.ran.on_device,
+        warm.tokens.len(),
+    );
+    eprintln!(
+        "raon reused turn: first token after {:.3} s cold, {:.3} s cold again, {:.3} s reused; \
+         whole request {:.3} s cold, {:.3} s reused",
+        cold_second.first_token,
+        cold_again.first_token,
+        warm.first_token,
+        cold_second.whole,
+        warm.whole,
+    );
+    eprintln!(
+        "raon third turn: prompt {} tokens, reused {}; first token after {:.3} s cold, {:.3} s \
+         reused",
+        third.len(),
+        warm_third.reused,
+        cold_third.first_token,
+        warm_third.first_token,
+    );
+    drop(engine.shutdown());
+}

@@ -32,8 +32,8 @@ use crate::family::project::cuda::{
 use crate::family::project::gguf::{GgufMatrix, GgufProjector};
 use crate::family::qwen::recipe::{Model, ROUTED_EXPERTS, layers, routed_experts, tensors};
 use crate::family::qwen::sensenova::weights::LoopWeights;
-use crate::family::sampler::Sampler;
-use crate::family::session::{DecodeSession, Kept, TokenStepper, sample_logits};
+use crate::family::session::{DecodeSession, Kept};
+use crate::family::step::stepper::{DeviceStep, DeviceStepper};
 use crate::family::step::tail::device_table;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::resident::embed::EmbedTable;
@@ -181,27 +181,25 @@ pub(crate) fn start(
     Ok((engine, context))
 }
 
-/// The model side of one session: the card step over the leaked load, the file's embedding
-/// table (it feeds the rows from the host) and the number of rows the card has consumed.
-pub(crate) struct CardStep {
+/// The model side of one session: the card step over the leaked load and the file's embedding
+/// table (it feeds the rows from the host when no device table is resident).
+pub(crate) struct CardDevice {
     step: LoopStep<'static>,
     embd: GgufMatrix,
     projector: GgufProjector,
-    pos: usize,
-    /// Counts the sequences that started at position 0 and the clears after a failure.
-    generation: u64,
-    /// A step failed since the last clear: what the planes hold is unknown.
-    failed: bool,
 }
+
+/// The served stepper of the Qwen lineage: shared position/generation/failure tracking over
+/// [`CardDevice`].
+pub(crate) type CardStep = DeviceStepper<CardDevice>;
 
 impl CardStep {
     pub(crate) fn new(
-        step: LoopStep<'static>,
+        mut step: LoopStep<'static>,
         file: &Arc<GgufWeights>,
         model: &Model,
     ) -> Result<Self, EngError> {
         let (vocab, hidden) = (model.shape.vocab, model.shape.hidden);
-        let mut step = step;
         // With the table on the device a greedy step picks its token there and the host reads
         // eight bytes; without it the host gathers the row and reads the logits.
         if let Some(table) =
@@ -209,75 +207,44 @@ impl CardStep {
         {
             step.set_embedding(table)?;
         }
-        Ok(Self {
+        Ok(DeviceStepper::new(CardDevice {
             step,
             embd: GgufMatrix::new(file.header(), "token_embd.weight", vocab, hidden)?,
             projector: GgufProjector::new(Arc::clone(file)),
-            pos: 0,
-            generation: 0,
-            failed: false,
-        })
-    }
-
-    /// Before a step at the stepper's position: a step at position 0 starts a sequence that
-    /// writes over the rows of the one before.
-    fn begin(&mut self) {
-        if self.pos == 0 {
-            self.generation += 1;
-        }
-    }
-
-    /// Notes a failed step, so the next reset clears everything the step carries.
-    fn checked<T>(&mut self, result: Result<T, EngError>) -> Result<T, EngError> {
-        self.failed |= result.is_err();
-        result
+        }))
     }
 
     /// The logits row the last step left on the device.
     #[cfg(test)]
     pub(crate) fn last_logits(&self) -> Result<Vec<u8>, EngError> {
-        let logits = self.step.logits_row();
+        let logits = self.device().step.logits_row();
         let mut bytes = vec![0u8; logits.bytes()];
-        logits.read_at(self.step.stream(), 0, &mut bytes)?;
+        logits.read_at(self.device().step.stream(), 0, &mut bytes)?;
         Ok(bytes)
     }
-}
 
-impl CardStep {
     /// Whether a greedy token of this stepper is picked on the device.
     #[cfg(test)]
     pub(crate) fn picks_on_device(&self) -> bool {
-        self.step.takes_tokens()
+        self.device().step.takes_tokens()
     }
 }
 
-impl TokenStepper for CardStep {
+impl DeviceStep for CardDevice {
     const OPERATION: &'static str = "lineage_logits";
 
-    fn feed(&mut self, token: u32) -> Result<(), EngError> {
-        self.feed_rows(&[token])
-    }
-
-    fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+    fn feed_rows(&mut self, tokens: &[u32], pos: usize) -> Result<(), EngError> {
         let rows = self.projector.rows(&self.embd, tokens)?;
-        self.begin();
-        let fed = self.step.prefill(&rows, self.pos);
-        self.checked(fed)?;
-        self.pos += tokens.len();
-        Ok(())
+        self.step.prefill(&rows, pos)
     }
 
-    fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+    fn logits(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngError> {
         let row = self.projector.rows(&self.embd, &[token])?;
-        self.begin();
-        let stepped = self.step.decode(&row, self.pos);
-        self.checked(stepped)?;
-        self.pos += 1;
+        self.step.decode(&row, pos)?;
         // The read is enqueued on the step's stream, behind its kernels.
         let logits = self.step.logits_row();
         let mut bytes = vec![0u8; logits.bytes()];
-        let read = logits.read_at(self.step.stream(), 0, &mut bytes);
-        self.checked(read)?;
+        logits.read_at(self.step.stream(), 0, &mut bytes)?;
         Ok(bytes
             .as_chunks::<4>()
             .0
@@ -286,79 +253,37 @@ impl TokenStepper for CardStep {
             .collect())
     }
 
-    /// A greedy pick is made on the device when the step holds the embedding table: the token
-    /// id goes in, the id of the largest logit comes out, and no row crosses the bus. Any other
-    /// sampling, and a request that captures its candidates, takes the logits row to the host;
-    /// so does the first token of a request, whose margin over the runner-up the sampler keeps
-    /// for the request's report.
-    fn next_token(
+    fn takes_tokens(&self) -> bool {
+        self.step.takes_tokens()
+    }
+
+    fn decode_token(
         &mut self,
         token: u32,
-        sampler: &mut Sampler,
+        pos: usize,
         sampler_vocab: usize,
     ) -> Result<u32, EngError> {
-        let on_device = self.step.takes_tokens()
-            && sampler.is_greedy()
-            && !sampler.capture_armed()
-            && sampler.first_top2_margin().is_some();
-        if !on_device {
-            let logits = self.logits(token)?;
-            let drawn = sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab);
-            return self.checked(drawn);
-        }
-        self.begin();
-        let picked = self.step.decode_token(token, self.pos, sampler_vocab);
-        let picked = self.checked(picked)?;
-        self.pos += 1;
-        sampler.record_device_greedy(picked);
-        Ok(picked)
+        self.step.decode_token(token, pos, sampler_vocab)
     }
 
-    fn fed(&self) -> usize {
-        self.pos
-    }
-
-    /// A new sequence: the running state returns to zeros and the cache rows stay, for a later
-    /// request that returns to a kept state. After a failed step everything is cleared and no
-    /// kept state matches any more.
     fn reset(&mut self) -> Result<(), EngError> {
-        if self.failed {
-            self.step.reset()?;
-            self.generation += 1;
-            self.failed = false;
-        } else {
-            self.step.reset_running()?;
-        }
-        self.pos = 0;
-        Ok(())
+        self.step.reset()
     }
 
-    fn kept_bytes(&self) -> Option<u64> {
-        Some(self.step.kept_bytes())
+    fn reset_running(&mut self) -> Result<(), EngError> {
+        self.step.reset_running()
     }
 
-    fn keep(&mut self) -> Result<Kept, EngError> {
-        let kept = self.step.keep(self.pos);
-        // Host-memory denial during a D2H snapshot leaves device state untouched.
-        if !matches!(kept, Err(EngError::MemoryPlan(_))) {
-            return self.checked(kept);
-        }
-        kept
+    fn kept_bytes(&self) -> u64 {
+        self.step.kept_bytes()
+    }
+
+    fn keep(&self, rows: usize) -> Result<Kept, EngError> {
+        self.step.keep(rows)
     }
 
     fn put_back(&mut self, kept: &Kept) -> Result<(), EngError> {
-        let put = self.step.put_back(kept);
-        if !matches!(put, Err(EngError::MemoryPlan(_))) {
-            self.checked(put)?;
-        } else {
-            put?;
-        }
-        self.pos = kept.rows;
-        Ok(())
-    }
-
-    fn kept_generation(&self) -> u64 {
-        self.generation
+        self.step.put_back(kept)
     }
 }
 

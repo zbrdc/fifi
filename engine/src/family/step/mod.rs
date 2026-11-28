@@ -39,5 +39,6 @@ pub(crate) mod rows;
 pub(crate) mod scratch;
 pub(crate) mod site;
 pub(crate) mod state;
+pub(crate) mod stepper;
 pub(crate) mod tail;
 pub(crate) mod walk;
