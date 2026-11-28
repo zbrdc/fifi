@@ -141,8 +141,9 @@ kernel void relative_attention_commit_f16(
     commit_body(p, keys, values, status, k, v, pos, gid, tid);
 }
 
-// The Int8 commit: the same grid, a column from the SIMD coordinates, so that the 32 lanes of a
-// SIMD group hold the 32 values of one group of one plane. A group's scale is its greatest
+// The Int8 commit: the same grid, a column from the SIMD coordinates modulo the head, so that
+// the 32 lanes of a SIMD group hold the 32 values of one group of one plane, and the value
+// plane's four groups take the key plane's columns. A group's scale is its greatest
 // magnitude over 127, NaN propagated, rounded to half and stored; a code is the value over the
 // stored scale's value, rounded to the nearest even and clamped, 0 when the scale's bits are 0
 // or the quotient is not a number. The library is built without fast math, so each division
@@ -169,9 +170,10 @@ kernel void relative_attention_commit_int8(
     const size_t slot = size_t(uint(position) % p.capacity);
     const uint d = simd * uint(kInt8Group) + lane;
     const bool value_plane = d >= uint(kHeadDim);
+    const uint col = d % uint(kHeadDim);
     device int8_t *rings = value_plane ? values : keys;
     device int8_t *base = rings + (slot * p.kv_heads + gid) * kInt8HeadBytes;
-    const float x = (value_plane ? v : k)[gid * kHeadDim + d];
+    const float x = (value_plane ? v : k)[gid * kHeadDim + col];
     // The greatest magnitude of the group, a NaN over every value, as the CUDA step's warp max.
     float magnitude = fabs(x);
     for (int offset = kInt8Group / 2; offset > 0; offset >>= 1) {
@@ -184,9 +186,9 @@ kernel void relative_attention_commit_int8(
     if (as_type<ushort>(stored) != 0 && !isnan(quotient)) {
         code = int(clamp(rint(quotient), -127.f, 127.f));
     }
-    base[d] = int8_t(code);
-    if (d % uint(kInt8Group) == 0) {
-        reinterpret_cast<device half *>(base + kHeadDim)[d / uint(kInt8Group)] = stored;
+    base[col] = int8_t(code);
+    if (col % uint(kInt8Group) == 0) {
+        reinterpret_cast<device half *>(base + kHeadDim)[col / uint(kInt8Group)] = stored;
     }
 }
 

@@ -605,7 +605,7 @@ fn time_step(rig: &Rig, rng: &mut Rng, shape: RelativeAttentionShape, position: 
 fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position: i32) {
     let one = || {
         rig.ctx
-            .relative_attention_timed(call(&b, shape, None), 1)
+            .relative_attention_timed(call(b, shape, None), 1)
             .expect("one timed step")
     };
     for _ in 0..3 {
@@ -616,7 +616,7 @@ fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position:
     let single = singles[singles.len() / 2];
     let chain = rig
         .ctx
-        .relative_attention_timed(call(&b, shape, None), 16)
+        .relative_attention_timed(call(b, shape, None), 16)
         .expect("sixteen timed steps")
         / 16;
     let rows = (position + 1).min(shape.capacity as i32) as usize;
@@ -776,7 +776,7 @@ fn ring_head(format: RelativeKvFormat, head: &[f32]) -> Vec<u8> {
         RelativeKvFormat::Int8 => {
             let mut out = Vec::with_capacity(INT8_HEAD_BYTES);
             let mut scales = [0u16; INT8_SCALES];
-            for (g, group) in head.chunks_exact(INT8_GROUP).enumerate() {
+            for (g, group) in head.as_chunks::<INT8_GROUP>().0.iter().enumerate() {
                 let mut amax = 0.0f32;
                 for &x in group {
                     let a = x.abs();
@@ -808,7 +808,8 @@ fn ring_head(format: RelativeKvFormat, head: &[f32]) -> Vec<u8> {
 
 /// The rows of a ring, K or V, in `format`.
 fn ring_bytes(format: RelativeKvFormat, rows: &[f32]) -> Vec<u8> {
-    rows.chunks_exact(HEAD_DIM)
+    rows.as_chunks::<HEAD_DIM>()
+        .0
         .flat_map(|head| ring_head(format, head))
         .collect()
 }
@@ -818,12 +819,17 @@ fn ring_bytes(format: RelativeKvFormat, rows: &[f32]) -> Vec<u8> {
 fn ring_values(format: RelativeKvFormat, bytes: &[u8]) -> Vec<f32> {
     match format {
         RelativeKvFormat::F32 => floats(bytes),
-        RelativeKvFormat::F16 => bytes.chunks_exact(2).map(|b| half16(b).to_f32()).collect(),
+        RelativeKvFormat::F16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half16(b).to_f32())
+            .collect(),
         RelativeKvFormat::Int8 => {
             let mut out = Vec::with_capacity(bytes.len() / INT8_HEAD_BYTES * HEAD_DIM);
-            for head in bytes.chunks_exact(INT8_HEAD_BYTES) {
+            for head in bytes.as_chunks::<INT8_HEAD_BYTES>().0 {
                 let mut scales = [0.0f32; INT8_SCALES];
-                for (g, b) in head[HEAD_DIM..].chunks_exact(2).enumerate() {
+                for (g, b) in head[HEAD_DIM..].as_chunks::<2>().0.iter().enumerate() {
                     scales[g] = half16(b).to_f32();
                 }
                 for (d, &code) in head[..HEAD_DIM].iter().enumerate() {
@@ -854,13 +860,17 @@ fn assert_ring_eq(format: RelativeKvFormat, got: &[u8], want: &[u8], what: &str)
         return;
     }
     for (g, w) in got
-        .chunks_exact(INT8_HEAD_BYTES)
-        .zip(want.chunks_exact(INT8_HEAD_BYTES))
+        .as_chunks::<INT8_HEAD_BYTES>()
+        .0
+        .iter()
+        .zip(want.as_chunks::<INT8_HEAD_BYTES>().0)
     {
         assert_eq!(&g[..HEAD_DIM], &w[..HEAD_DIM], "{what}: the codes");
         for (a, b) in g[HEAD_DIM..]
-            .chunks_exact(2)
-            .zip(w[HEAD_DIM..].chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(w[HEAD_DIM..].as_chunks::<2>().0.iter())
         {
             let (a, b) = (half16(a), half16(b));
             assert!(
@@ -898,12 +908,14 @@ fn the_f16_and_int8_rings_match_the_rule_and_the_reference() {
             for (i, (&value, &(want, bound))) in out.iter().zip(&decoded.reference()).enumerate() {
                 assert!(
                     value.is_finite(),
-                    "{format:?}: the output {i} is not finite: {value}"
+                    "{format:?} over a ring of {} at position {position}: the output {i} is not finite: {value}",
+                    s.capacity,
                 );
                 let off = (f64::from(value) - want).abs();
                 assert!(
                     off <= bound,
-                    "{format:?}: the output {i} is {value} against {want}: off {off} over the bound {bound}",
+                    "{format:?} over a ring of {} at position {position}: the output {i} is {value} against {want}: off {off} over the bound {bound}",
+                    s.capacity,
                 );
                 worst = worst.max(off / bound);
             }
