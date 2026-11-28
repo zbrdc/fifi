@@ -74,7 +74,13 @@ pub(in crate::kernels::cuda) fn clip_queries(
         shape.region_bytes().ok_or_else(invalid_argument)?;
     let (first, floor, alpha) = match log {
         None => (0, 0, 0.0),
-        Some((log, first)) if log.valid() && c_int::try_from(first + rows).is_ok() => {
+        Some((log, first))
+            if log.valid()
+                && first
+                    .checked_add(rows)
+                    .and_then(|end| c_int::try_from(end).ok())
+                    .is_some() =>
+        {
             (first as c_int, log.floor as c_int, log.alpha)
         }
         Some(_) => return Err(invalid_argument()),

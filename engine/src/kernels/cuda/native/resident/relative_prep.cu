@@ -27,7 +27,7 @@ struct Args {
 // One block per head and plane. Use the host's reduction and tap order; these
 // short reductions run once per head, after parallel channel preparation.
 __global__ void relative_prep(Args a) {
-    __shared__ float squares[kWidth], scale;
+    __shared__ float squares[kWidth], scale, tau;
     const int d = threadIdx.x;
     int head = blockIdx.x;
     const int kv_words = a.kv * kWidth;
@@ -78,14 +78,14 @@ __global__ void relative_prep(Args a) {
         for (int i = 0; i < width; ++i) sum += squares[i];
         scale = rms ? 1.f / sqrtf(sum / width + a.eps)
                     : fminf(1.f, limit / (sqrtf(sum) + 1.e-6f));
+        tau = (a.log_floor > 0 && blockIdx.x < 2 * a.queries)
+                  ? log_query_scale(*a.pos, a.log_floor, a.log_alpha)
+                  : 1.f;
         valid &= isfinite(sum);
     }
     __syncthreads();
     float result = x * scale;
-    if (a.log_floor > 0 && blockIdx.x < 2 * a.queries) {
-        const float tau = log_query_scale(*a.pos, a.log_floor, a.log_alpha);
-        if (tau != 1.f) result = __fmul_rn(result, tau);
-    }
+    if (tau != 1.f) result = __fmul_rn(result, tau);
     const int invalid = __syncthreads_or(!valid || !isfinite(x) || !isfinite(result));
     if (d < width) *output = result;
     // Only one block writes status; per-head prep flags are distinct words.

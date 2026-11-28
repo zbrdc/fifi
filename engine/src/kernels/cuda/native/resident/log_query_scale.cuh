@@ -4,9 +4,11 @@
 // runs in double and is rounded once: --use_fast_math approximates only single precision.
 #pragma once
 
+#include <cmath>
+
 __device__ inline float log_query_scale(int pos, int floor, float alpha) {
-    const int n = pos + 1;
-    if (floor <= 0 || n <= floor) return 1.f;
-    const float ratio = __fdiv_rn(float(n), float(floor));
+    if (floor <= 0 || pos < floor) return 1.f;
+    const float n = float(static_cast<long long>(pos) + 1LL);
+    const float ratio = __fdiv_rn(n, float(floor));
     return __fadd_rn(1.f, __fmul_rn(alpha, float(log(double(ratio)))));
 }

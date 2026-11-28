@@ -1193,7 +1193,7 @@ impl TextMath {
             return Err(bad(format!("Inkling text context must be in 1..={max}")));
         }
         if self.log_scaling_n_floor == 0
-            || u32::try_from(self.log_scaling_n_floor).is_err()
+            || self.log_scaling_n_floor > (1 << 30) - 1
             || !self.log_scaling_alpha.is_finite()
             || self.log_scaling_alpha < 0.0
         {

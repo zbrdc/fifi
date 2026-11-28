@@ -615,7 +615,7 @@ __global__ void clip_prefill_queries(float *side, const float *scales, uint32_t 
     const int stride = 2 * query_words + gap + heads * (dims + 1);
     const int at = (relative ? query_words + gap : 0) + head * width + d;
     const int scale_at = (relative ? query_words : 0) + head * width + d;
-    __shared__ float squares[kHeadDim], factor;
+    __shared__ float squares[kHeadDim], factor, tau;
     float raw = 0.f, x = 0.f;
     if (d < width) {
         raw = side[row * stride + at];
@@ -628,10 +628,10 @@ __global__ void clip_prefill_queries(float *side, const float *scales, uint32_t 
         for (int i = 0; i < width; ++i) sum = __fadd_rn(sum, squares[i]);
         factor = fminf(1.f, __fdiv_rn(relative ? rel_limit : q_limit,
                                       __fadd_rn(__fsqrt_rn(sum), 1.e-6f)));
+        tau = log_query_scale(first + row, log_floor, log_alpha);
     }
     __syncthreads();
     float result = __fmul_rn(x, factor);
-    const float tau = log_query_scale(first + row, log_floor, log_alpha);
     if (tau != 1.f) result = __fmul_rn(result, tau);
     // Test the raw projection too: clipping and sigmoid must not mask errors
     // that used to be caught during the projection readback.
