@@ -14,6 +14,7 @@ pub(crate) mod dense_gemv;
 pub(crate) mod relative_attention;
 pub(crate) mod rms_norm;
 pub(crate) mod row_add;
+pub(crate) mod short_conv;
 pub(crate) mod softcap;
 pub(crate) mod swiglu_rows;
 
