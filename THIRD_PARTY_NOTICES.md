@@ -4,8 +4,8 @@
 
 - Source: https://github.com/ggml-org/llama.cpp, commit `fb4b2737a808a3fb7c2117a498f43815dc9be53e`.
 - File: `ggml/src/ggml-common.h`, sha256 `0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c`.
-- Taken: eight constant tables, as data only: `kmask_iq2xs`, `ksigns_iq2xs`, `iq2xxs_grid`, `iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `kvalues_iq4nl`.
-- Location: `engine/src/weights/gguf_tables.rs`. The tables were extracted from `ggml/src/ggml-common.h` at the commit above. The extraction script is not included in this repository.
+- Taken: ten constant tables, as data only: `kmask_iq2xs`, `ksigns_iq2xs`, `iq2xxs_grid`, `iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `kvalues_iq4nl`, `iq1s_grid`, `kvalues_fp4`.
+- Location: `engine/src/weights/gguf_tables.rs` on the host, and `engine/src/kernels/cuda/native/resident/iq_tables.cuh` on the device for eight of them (`ksigns_iq2xs`, `iq2xxs_grid`, `iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `iq1s_grid`, `kvalues_fp4`). The tables were extracted from `ggml/src/ggml-common.h` at the commit above. The extraction script is not included in this repository.
 - Also used as a test oracle only (not shipped, not copied): the expected outputs in `engine/tests/fixtures/gguf-dequant/` come from the reference dequantization functions of `ggml/src/ggml-quants.c` at the same commit, compiled into a small driver program.
   Neither `ggml-quants.c` nor the driver program is included in this repository. `engine/tests/fixtures/gguf-dequant/manifest.json` records the hashes of the llama.cpp source files and the compiler commands.
 

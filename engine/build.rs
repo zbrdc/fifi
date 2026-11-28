@@ -398,6 +398,8 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/relative_attention.h",
     "src/kernels/cuda/native/resident/relative_attention_tile.h",
     "src/kernels/cuda/native/resident/qsa_select.h",
+    "src/kernels/cuda/native/quant_blocks.h",
+    "src/kernels/cuda/native/resident/iq_tables.cuh",
 ];
 
 /// Compiles the CUDA adapter for the `native-cuda` feature on Linux.

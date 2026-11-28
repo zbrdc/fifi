@@ -1,6 +1,6 @@
 //! Constant lookup tables for the GGUF lattice quantization types.
 //!
-//! These nine tables are format data (the IQ1_S grid was added later from the same header,
+//! These ten tables are format data (the IQ1_S grid was added later from the same header,
 //! each entry a row of eight signed bytes in {-1, 0, 1}). They are copied from
 //! `ggml/src/ggml-common.h` at llama.cpp commit
 //! `fb4b2737a808a3fb7c2117a498f43815dc9be53e`

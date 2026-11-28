@@ -6,7 +6,7 @@
  * CPU oracle and the device tables cannot drift apart.
  *
  * Each table is a static __device__ array, one copy per translation unit that includes this
- * header, as the vendored ggml-common.h declared them before. None is a __constant__ array:
+ * header, as the vendored ggml-common.h defined them before. None is a __constant__ array:
  * see native/iq4_nl_values.cuh and native/constant_bank_guard.rs.
  */
 #ifndef INFERENCE_CUDA_RESIDENT_IQ_TABLES_CUH
