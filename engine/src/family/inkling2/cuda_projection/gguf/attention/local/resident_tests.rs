@@ -220,6 +220,7 @@ fn attention(context: &CudaContext, g: Geometry) -> ResidentAttention {
     Plan {
         visits: vec![Visit {
             shape,
+            kv_format: crate::kernels::cuda::resident::relative_attention::RelativeKvFormat::F32,
             table_at: 0,
             table_bytes,
             cache_at: table_bytes,

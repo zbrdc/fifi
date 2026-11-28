@@ -378,6 +378,7 @@ impl ResidentAttention {
             stream,
             RelativeAttentionCall {
                 shape: layout.shape,
+                kv_format: visit.kv_format,
                 q,
                 k,
                 v,
@@ -744,6 +745,7 @@ impl ResidentAttention {
                 },
                 rings: relative::Rings {
                     shape: visit.shape,
+                    kv_format: visit.kv_format,
                     table: ring(visit.table_at, visit.table_bytes)?,
                     k: ring(visit.cache_at, visit.cache_bytes)?,
                     v: ring(visit.cache_at + visit.cache_bytes, visit.cache_bytes)?,

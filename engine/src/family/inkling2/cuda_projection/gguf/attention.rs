@@ -19,7 +19,9 @@ use crate::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         resident::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape},
-            relative_attention::{HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape},
+            relative_attention::{
+                HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape, RelativeKvFormat,
+            },
             step_params::POS_MAX,
         },
     },
@@ -45,6 +47,7 @@ pub(in crate::family::inkling2) struct Config {
 #[derive(Clone, Copy)]
 struct Visit {
     shape: RelativeAttentionShape,
+    kv_format: RelativeKvFormat,
     table_at: usize,
     table_bytes: usize,
     cache_at: usize,
@@ -187,6 +190,7 @@ impl Plan {
             }
             visits.push(Visit {
                 shape,
+                kv_format: RelativeKvFormat::F32,
                 table_at: visit.weight_layer * table_bytes,
                 table_bytes,
                 cache_at,
@@ -211,42 +215,94 @@ impl Plan {
         }))
     }
 
+    fn arena_bytes_for(
+        &self,
+        kv_format: RelativeKvFormat,
+        align_projected_input: bool,
+    ) -> Result<usize, EngError> {
+        let mut cache_at = self.tables.len();
+        for visit in &self.visits {
+            let [_, cache_bytes, ..] = visit
+                .shape
+                .region_bytes_for(kv_format)
+                .ok_or_else(|| bad("CUDA relative attention cache overflows"))?;
+            cache_at = cache_at
+                .checked_add(cache_bytes)
+                .and_then(|at| at.checked_add(cache_bytes))
+                .ok_or_else(|| bad("CUDA relative attention cache overflows"))?;
+        }
+        cache_at
+            .checked_add(self.scratch_bytes)
+            .and_then(|n| n.checked_add(if align_projected_input { 12 } else { 0 }))
+            .ok_or_else(|| bad("CUDA relative attention arena overflows"))
+    }
+
+    fn apply_kv_format(&mut self, kv_format: RelativeKvFormat) -> Result<usize, EngError> {
+        let mut cache_at = self.tables.len();
+        for visit in &mut self.visits {
+            let [_, cache_bytes, ..] = visit
+                .shape
+                .region_bytes_for(kv_format)
+                .ok_or_else(|| bad("CUDA relative attention cache overflows"))?;
+            visit.kv_format = kv_format;
+            visit.cache_at = cache_at;
+            visit.cache_bytes = cache_bytes;
+            cache_at = cache_at
+                .checked_add(cache_bytes)
+                .and_then(|at| at.checked_add(cache_bytes))
+                .ok_or_else(|| bad("CUDA relative attention cache overflows"))?;
+        }
+        Ok(cache_at)
+    }
+
     pub(super) fn load(
-        self,
+        mut self,
         context: &CudaContext,
         charge_reserve: bool,
     ) -> Result<Option<ResidentAttention>, EngError> {
-        let last = self
-            .visits
-            .last()
-            .ok_or_else(|| bad("CUDA attention requires at least one visit"))?;
-        let scratch_at = last.cache_at + 2 * last.cache_bytes;
+        if self.visits.is_empty() {
+            return Err(bad("CUDA attention requires at least one visit"));
+        }
         let before = context.memory_info()?.free as u64;
-        let spare = |bytes: u64| {
-            before.saturating_sub(state_headroom(if charge_reserve { bytes } else { 0 }))
-        };
         // Keep status and the returned projection contiguous. Only the internal
         // attention row, consumed by the single-row weight kernel, needs padding.
         let align_projected_input = self.projected_rows.is_some() && Switch::DecodeSplit.on();
-        let bytes = scratch_at
-            .checked_add(self.scratch_bytes)
-            .and_then(|n| n.checked_add(if align_projected_input { 12 } else { 0 }))
-            .ok_or_else(|| bad("CUDA relative attention arena overflows"))?;
-        let proposed_credit = if charge_reserve { bytes as u64 } else { 0 };
-        let spare = spare(bytes as u64);
-        if before < VRAM_HEADROOM_BYTES || bytes as u64 > spare {
+        let requested = kv_dtype_override()?;
+        let candidates: &[RelativeKvFormat] = match &requested {
+            Some(fmt) => std::slice::from_ref(fmt),
+            None => &[
+                RelativeKvFormat::F32,
+                RelativeKvFormat::F16,
+                RelativeKvFormat::Int8,
+            ],
+        };
+        let sizes: Vec<(RelativeKvFormat, usize)> = candidates
+            .iter()
+            .map(|&fmt| Ok((fmt, self.arena_bytes_for(fmt, align_projected_input)?)))
+            .collect::<Result<_, EngError>>()?;
+        let Some((chosen_format, bytes, credit_reserve, min_headroom)) =
+            select_kv_format(before, charge_reserve, &sizes)
+        else {
+            let smallest = sizes.last().map_or(0, |&(_, b)| b);
+            let spare = before.saturating_sub(state_headroom(if charge_reserve {
+                smallest as u64
+            } else {
+                0
+            }));
             eprintln!(
-                "Inkling CUDA relative attention not admitted: needs {bytes} bytes, {spare} available"
+                "Inkling CUDA relative attention not admitted: needs {smallest} bytes, {spare} available"
             );
             return Ok(None);
-        }
+        };
+        let scratch_at = self.apply_kv_format(chosen_format)?;
+        let proposed_credit = if credit_reserve { bytes as u64 } else { 0 };
         let arena = context.allocate(bytes)?;
         let after = context.memory_info()?.free as u64;
         let device_bytes = before.saturating_sub(after);
         // Only this allocation's requested bytes count against the reserve.
         // CUDA padding still consumes the physical free-memory margin.
         let credit = device_bytes.min(proposed_credit);
-        let projection_headroom = state_headroom(credit);
+        let projection_headroom = state_headroom(credit).max(min_headroom);
         if after < projection_headroom {
             eprintln!(
                 "Inkling CUDA relative attention not admitted after device allocation rounding"
@@ -256,7 +312,7 @@ impl Plan {
         let stream = context.stream()?;
         arena.write_at(&stream, 0, &self.tables)?;
         let transfer = context.pinned_buf(self.scratch_bytes)?;
-        if charge_reserve {
+        if credit_reserve {
             let free = context.memory_info()?.free as u64;
             if free < projection_headroom {
                 eprintln!("Inkling CUDA relative attention not admitted after staging setup");
@@ -268,9 +324,10 @@ impl Plan {
         }
         let next_position = vec![None; self.visits.len()];
         eprintln!(
-            "Inkling CUDA relative attention admitted {} visits, {} device bytes",
+            "Inkling CUDA relative attention admitted {} visits, {} device bytes (kv={})",
             self.visits.len(),
-            bytes
+            bytes,
+            chosen_format.name(),
         );
         Ok(Some(ResidentAttention {
             visits: self.visits,
@@ -404,13 +461,7 @@ impl ResidentAttention {
             planes.push(
                 bytes
                     .chunks_exact(row_bytes)
-                    .map(|row| {
-                        row.as_chunks::<{ size_of::<f32>() }>()
-                            .0
-                            .iter()
-                            .map(|word| f32::from_ne_bytes(*word))
-                            .collect::<Vec<f32>>()
-                    })
+                    .map(|row| visit.kv_format.decode_row(row))
                     .collect::<Vec<Vec<f32>>>(),
             );
             debug_assert_eq!(planes[plane].len(), rows);
@@ -462,6 +513,7 @@ impl ResidentAttention {
         let attention_out = self.arena.range(attention_at, attention_bytes)?;
         let call = RelativeAttentionCall {
             shape: visit.shape,
+            kv_format: visit.kv_format,
             q: self.arena.range(q, k - q)?,
             k: self.arena.range(k, v - k)?,
             v: self.arena.range(v, relative - v)?,
@@ -540,6 +592,7 @@ impl ResidentAttention {
             return Ok(());
         }
         let row_bytes = visit.cache_bytes / capacity;
+        let row_words = visit.shape.kv_heads * HEAD_DIM;
         let splits = ring_splits(upload.start % capacity, upload.len(), capacity);
         let skip = history.position - upload.end;
         let rewind = device_cursor.is_some_and(|cursor| cursor > history.position);
@@ -549,10 +602,10 @@ impl ResidentAttention {
             }
             bytes.clear();
             for row in values.iter().skip(skip).take(upload.len()).rev() {
-                if f32_bytes(row.len())? != row_bytes {
+                if row.len() != row_words {
                     return Err(bad("invalid host row for CUDA relative attention restore"));
                 }
-                extend_words(bytes, row);
+                visit.kv_format.encode_row(row, bytes);
             }
             let base = visit.cache_at + plane * visit.cache_bytes;
             let mut read = 0;
@@ -689,6 +742,53 @@ impl Row<'_> {
 /// upload, and whether the device's K/V preparation fills it.
 type InputSlots<'a> = ([&'a [f32]; 6], [usize; 6], [bool; 6]);
 
+/// Minimum free VRAM kept after crediting the 3 GiB state reserve for a long-context ring,
+/// leaving room for 512-row prefill workspaces (~450 MiB).
+const LONG_CONTEXT_WORKSPACE_FLOOR: u64 = 768 * 1024 * 1024;
+
+fn kv_dtype_override() -> Result<Option<RelativeKvFormat>, EngError> {
+    const NAME: &str = "FIFI_INKLING_CUDA_KV_DTYPE";
+    let Some(raw) = std::env::var_os(NAME) else {
+        return Ok(None);
+    };
+    let text = raw
+        .to_str()
+        .ok_or_else(|| bad(format!("{NAME} must be valid UTF-8")))?;
+    RelativeKvFormat::parse_override(text).ok_or_else(|| {
+        bad(format!(
+            "{NAME} must be auto, f32, f16 or q8 (got {text:?})"
+        ))
+    })
+}
+
+/// Picks the first `(format, bytes)` that fits in `before` free VRAM. Pass 1 honors the requested
+/// reserve policy (`VRAM_HEADROOM_BYTES` unless `charge_reserve` is set). If nothing fits and
+/// `charge_reserve` was off, Pass 2 credits the state reserve while keeping at least
+/// [`LONG_CONTEXT_WORKSPACE_FLOOR`] free for prefill workspaces.
+fn select_kv_format(
+    before: u64,
+    charge_reserve: bool,
+    candidates: &[(RelativeKvFormat, usize)],
+) -> Option<(RelativeKvFormat, usize, bool, u64)> {
+    if before >= VRAM_HEADROOM_BYTES {
+        for &(fmt, bytes) in candidates {
+            let headroom = state_headroom(if charge_reserve { bytes as u64 } else { 0 });
+            if (bytes as u64) <= before.saturating_sub(headroom) {
+                return Some((fmt, bytes, charge_reserve, 0));
+            }
+        }
+    }
+    if !charge_reserve && before >= LONG_CONTEXT_WORKSPACE_FLOOR {
+        for &(fmt, bytes) in candidates {
+            let headroom = state_headroom(bytes as u64).max(LONG_CONTEXT_WORKSPACE_FLOOR);
+            if (bytes as u64) <= before.saturating_sub(headroom) {
+                return Some((fmt, bytes, true, LONG_CONTEXT_WORKSPACE_FLOOR));
+            }
+        }
+    }
+    None
+}
+
 fn ring_splits(first_slot: usize, rows: usize, capacity: usize) -> [(usize, usize); 2] {
     let until_wrap = rows.min(capacity - first_slot);
     [(first_slot, until_wrap), (0, rows - until_wrap)]
@@ -713,6 +813,45 @@ mod tests {
         assert_eq!(state_headroom(0), VRAM_HEADROOM_BYTES);
         assert_eq!(state_headroom(32 << 20), VRAM_HEADROOM_BYTES - (32 << 20));
         assert_eq!(state_headroom(VRAM_HEADROOM_BYTES), DEVICE_HEADROOM);
+    }
+
+    #[test]
+    fn auto_selects_narrower_kv_ring_when_free_vram_tightens() {
+        assert_eq!(RelativeKvFormat::parse_override("auto"), Some(None));
+        assert_eq!(
+            RelativeKvFormat::parse_override("f32"),
+            Some(Some(RelativeKvFormat::F32))
+        );
+        assert_eq!(
+            RelativeKvFormat::parse_override("f16"),
+            Some(Some(RelativeKvFormat::F16))
+        );
+        assert_eq!(
+            RelativeKvFormat::parse_override("q8"),
+            Some(Some(RelativeKvFormat::Int8))
+        );
+        assert_eq!(RelativeKvFormat::parse_override("bogus"), None);
+
+        let gib = 1usize << 30;
+        let sizes_256k = [
+            (RelativeKvFormat::F32, 16 * gib),
+            (RelativeKvFormat::F16, 8 * gib),
+            (RelativeKvFormat::Int8, 4 * gib + (gib / 4)),
+        ];
+        // 14.7 GiB free (IQ1_M at 256K): F16 fits while keeping the full 3 GiB reserve.
+        let picked = select_kv_format(14 * gib as u64 + 700 * (1 << 20), false, &sizes_256k);
+        assert_eq!(picked, Some((RelativeKvFormat::F16, 8 * gib, false, 0)));
+        // 5.2 GiB free (17 GiB quant at 256K): Int8 fits by crediting the state reserve.
+        let picked = select_kv_format(5 * gib as u64 + 200 * (1 << 20), false, &sizes_256k);
+        assert_eq!(
+            picked,
+            Some((
+                RelativeKvFormat::Int8,
+                4 * gib + (gib / 4),
+                true,
+                LONG_CONTEXT_WORKSPACE_FLOOR
+            ))
+        );
     }
 
     #[test]
@@ -752,6 +891,7 @@ mod tests {
         let attention = Plan {
             visits: vec![Visit {
                 shape,
+                kv_format: RelativeKvFormat::F32,
                 table_at: 0,
                 table_bytes,
                 cache_at: table_bytes,

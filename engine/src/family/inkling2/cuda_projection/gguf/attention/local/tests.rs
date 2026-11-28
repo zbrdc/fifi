@@ -26,6 +26,7 @@ fn local_decode_updates_raw_and_processed_rows_and_refuses_stale_cursor() {
     let attention = Plan {
         visits: vec![Visit {
             shape,
+            kv_format: crate::kernels::cuda::resident::relative_attention::RelativeKvFormat::F32,
             table_at: 0,
             table_bytes,
             cache_at: table_bytes,

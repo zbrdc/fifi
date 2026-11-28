@@ -183,6 +183,7 @@ impl Buffers {
     fn call(&self) -> RelativeAttentionCall<'_> {
         RelativeAttentionCall {
             shape: SHAPE,
+            kv_format: RelativeKvFormat::F32,
             q: whole(&self.q),
             k: whole(&self.k),
             v: whole(&self.v),
@@ -463,6 +464,7 @@ fn query_tile_matches_the_fp64_reference() {
         let out = upload_filled(&ctx, 0xff, count * QUERY * 4);
         let call = RelativeAttentionCall {
             shape: SHAPE,
+            kv_format: RelativeKvFormat::F32,
             q: whole(&q_buf),
             k: whole(&k_buf),
             v: whole(&v_buf),
@@ -516,6 +518,229 @@ fn query_tile_matches_the_fp64_reference() {
             for (p, row) in rows.iter().enumerate().skip(kept) {
                 let at = p % SHAPE.capacity * KV * 4;
                 assert_eq!(&all[at..at + KV * 4], bytes(row), "ring row {p}");
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_kv_formats_match_shared_kv_format_and_round_trip() {
+    for kv_heads in [1, 8, 16] {
+        for fmt in [
+            RelativeKvFormat::F32,
+            RelativeKvFormat::F16,
+            RelativeKvFormat::Int8,
+        ] {
+            assert!(fmt.plane_bytes_matches_shared(kv_heads), "{fmt:?}");
+        }
+    }
+    let row = pattern(KV, 42);
+    for (fmt, tol) in [
+        (RelativeKvFormat::F16, 2e-3),
+        (RelativeKvFormat::Int8, 2e-2),
+    ] {
+        let mut encoded = Vec::new();
+        fmt.encode_row(&row, &mut encoded);
+        assert_eq!(encoded.len(), fmt.row_bytes(SHAPE.kv_heads));
+        let decoded = fmt.decode_row(&encoded);
+        assert_eq!(decoded.len(), row.len());
+        for (i, (&a, &b)) in decoded.iter().zip(&row).enumerate() {
+            assert!((a - b).abs() <= tol, "{fmt:?} [{i}]: {a} vs {b}");
+        }
+    }
+    let mut poisoned = row.clone();
+    poisoned[37] = f32::NAN;
+    let mut encoded = Vec::new();
+    RelativeKvFormat::Int8.encode_row(&poisoned, &mut encoded);
+    let decoded = RelativeKvFormat::Int8.decode_row(&encoded);
+    assert!(decoded[32..64].iter().all(|v| v.is_nan()));
+    assert!(decoded[..32].iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn compact_kv_rings_match_fp64_reference_in_decode_and_tile() {
+    if !device_present("compact relative attention rings") {
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let steps = SHAPE.capacity + 11;
+    let fixture = Fixture::new(steps);
+    let table_buf = upload_f32(&ctx, &fixture.table);
+    let q_buf = upload_f32(&ctx, &fixture.q);
+    let rel_buf = upload_f32(&ctx, &fixture.relative);
+    let sink_buf = upload_f32(&ctx, &fixture.sinks);
+    let gate_buf = upload_f32(&ctx, &fixture.gates);
+
+    for (fmt, decode_tol, tile_tol) in [
+        (RelativeKvFormat::F16, 3e-3f32, 4e-3f32),
+        (RelativeKvFormat::Int8, 3e-2f32, 3e-2f32),
+    ] {
+        let row_bytes = fmt.row_bytes(SHAPE.kv_heads);
+        let cache_bytes = SHAPE.capacity * row_bytes;
+        let k_ring = upload_filled(&ctx, 0, cache_bytes);
+        let v_ring = upload_filled(&ctx, 0, cache_bytes);
+        let k_buf = ctx.allocate(KV * 4).unwrap();
+        let v_buf = ctx.allocate(KV * 4).unwrap();
+        let pos_buf = ctx.allocate(4).unwrap();
+        let status = upload_filled(&ctx, 0, 4);
+        let out = ctx.allocate(QUERY * 4).unwrap();
+        for pos in 0..steps {
+            k_buf
+                .write_at(&stream, 0, &bytes(&fixture.keys[pos]))
+                .unwrap();
+            v_buf
+                .write_at(&stream, 0, &bytes(&fixture.values[pos]))
+                .unwrap();
+            pos_buf
+                .write_at(&stream, 0, &(pos as i32).to_le_bytes())
+                .unwrap();
+            ctx.relative_attention(
+                &stream,
+                RelativeAttentionCall {
+                    shape: SHAPE,
+                    kv_format: fmt,
+                    q: whole(&q_buf),
+                    k: whole(&k_buf),
+                    v: whole(&v_buf),
+                    relative: whole(&rel_buf),
+                    table: whole(&table_buf),
+                    sinks: whole(&sink_buf),
+                    gates: whole(&gate_buf),
+                    k_cache: whole(&k_ring),
+                    v_cache: whole(&v_ring),
+                    pos: whole(&pos_buf),
+                    status: whole(&status),
+                    out: whole(&out),
+                },
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            if pos == 0 || pos == SHAPE.capacity - 1 || pos + 1 == steps {
+                let got = floats(&read_bytes(&ctx, &out, QUERY * 4));
+                let want = fixture.reference(pos);
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    worst <= decode_tol,
+                    "{fmt:?} decode pos {pos}: worst {worst:e} > {decode_tol:e}"
+                );
+            }
+        }
+        // Device-encoded ring cells match host encode_row bit-for-bit.
+        for (ring, rows) in [(&k_ring, &fixture.keys), (&v_ring, &fixture.values)] {
+            let all = read_bytes(&ctx, ring, cache_bytes);
+            for (pos, row) in rows.iter().enumerate().skip(steps - SHAPE.capacity) {
+                let mut expected = Vec::with_capacity(row_bytes);
+                fmt.encode_row(row, &mut expected);
+                let start = (pos % SHAPE.capacity) * row_bytes;
+                assert_eq!(
+                    &all[start..start + row_bytes],
+                    expected,
+                    "{fmt:?} row {pos}"
+                );
+            }
+        }
+        // Tile path past a ring wrap reading pre-tile compact cells and committing compact cells.
+        let (first, count) = (100usize, 70usize);
+        let total = first + count;
+        let keys: Vec<Vec<f32>> = (0..total).map(|p| pattern(KV, p * 2 + 6)).collect();
+        let values: Vec<Vec<f32>> = (0..total).map(|p| pattern(KV, p * 2 + 7)).collect();
+        let mut init = [vec![0u8; cache_bytes], vec![0u8; cache_bytes]];
+        for p in first.saturating_sub(SHAPE.capacity)..first {
+            let at = (p % SHAPE.capacity) * row_bytes;
+            let mut enc_k = Vec::with_capacity(row_bytes);
+            let mut enc_v = Vec::with_capacity(row_bytes);
+            fmt.encode_row(&keys[p], &mut enc_k);
+            fmt.encode_row(&values[p], &mut enc_v);
+            init[0][at..at + row_bytes].copy_from_slice(&enc_k);
+            init[1][at..at + row_bytes].copy_from_slice(&enc_v);
+        }
+        let tile_rings = init.each_ref().map(|b| ctx.upload(b).unwrap());
+        let rows_f = |width: usize, seed: usize, scale: f32| -> Vec<f32> {
+            pattern(count * width, seed)
+                .into_iter()
+                .map(|x| x * scale)
+                .collect()
+        };
+        let q = rows_f(QUERY, 1, 1.0);
+        let rel = rows_f(SHAPE.query_heads * SHAPE.relative_dims, 2, 1.0);
+        let sinks = rows_f(SHAPE.query_heads, 4, 8.0);
+        let gates = rows_f(QUERY, 5, 4.0);
+        let pos_bytes: Vec<u8> = (first..total)
+            .flat_map(|p| (p as i32).to_le_bytes())
+            .collect();
+        let q_t = upload_f32(&ctx, &q);
+        let k_t = upload_f32(&ctx, &keys[first..].concat());
+        let v_t = upload_f32(&ctx, &values[first..].concat());
+        let rel_t = upload_f32(&ctx, &rel);
+        let sink_t = upload_f32(&ctx, &sinks);
+        let gate_t = upload_f32(&ctx, &gates);
+        let pos_t = ctx.upload(&pos_bytes).unwrap();
+        let status_t = upload_filled(&ctx, 0, count * 4);
+        let out_t = upload_filled(&ctx, 0xff, count * QUERY * 4);
+        ctx.relative_attention_tile(
+            &stream,
+            RelativeAttentionCall {
+                shape: SHAPE,
+                kv_format: fmt,
+                q: whole(&q_t),
+                k: whole(&k_t),
+                v: whole(&v_t),
+                relative: whole(&rel_t),
+                table: whole(&table_buf),
+                sinks: whole(&sink_t),
+                gates: whole(&gate_t),
+                k_cache: whole(&tile_rings[0]),
+                v_cache: whole(&tile_rings[1]),
+                out: whole(&out_t),
+                pos: whole(&pos_t),
+                status: whole(&status_t),
+            },
+            RelativeAttentionTile {
+                first,
+                count,
+                input_stride: 0,
+                query_stride: 0,
+                side_stride: 0,
+            },
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert!(
+            read_bytes(&ctx, &status_t, count * 4)
+                .iter()
+                .all(|&b| b == 0)
+        );
+        let got = floats(&read_bytes(&ctx, &out_t, count * QUERY * 4));
+        let mut worst = 0.0f32;
+        for (r, actual) in got.as_chunks::<QUERY>().0.iter().enumerate() {
+            let row = Row {
+                q: &q[r * QUERY..][..QUERY],
+                relative: &rel[r * SHAPE.query_heads * SHAPE.relative_dims..]
+                    [..SHAPE.query_heads * SHAPE.relative_dims],
+                sinks: &sinks[r * SHAPE.query_heads..][..SHAPE.query_heads],
+                gates: &gates[r * QUERY..][..QUERY],
+            };
+            let want = reference(row, &keys, &values, &fixture.table, first + r);
+            for (a, e) in actual.iter().zip(&want) {
+                worst = worst.max((a - e).abs());
+            }
+        }
+        assert!(
+            worst <= tile_tol,
+            "{fmt:?} tile worst {worst:e} > {tile_tol:e}"
+        );
+        for (plane, rows) in tile_rings.iter().zip([&keys, &values]) {
+            let all = read_bytes(&ctx, plane, cache_bytes);
+            for (p, row) in rows.iter().enumerate().skip(first) {
+                let mut expected = Vec::with_capacity(row_bytes);
+                fmt.encode_row(row, &mut expected);
+                let at = (p % SHAPE.capacity) * row_bytes;
+                assert_eq!(&all[at..at + row_bytes], expected, "{fmt:?} tile row {p}");
             }
         }
     }

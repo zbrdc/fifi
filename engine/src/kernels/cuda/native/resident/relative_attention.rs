@@ -10,7 +10,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::resident::relative_attention::{
-    LogScale, RANGES, RelativeAttentionShape, RelativeAttentionTile, WRITTEN,
+    LogScale, RANGES, RelativeAttentionShape, RelativeAttentionTile, RelativeKvFormat, WRITTEN,
 };
 
 #[repr(C)]
@@ -21,12 +21,14 @@ struct Args {
     relative_dims: c_int,
     relative_extent: c_int,
     capacity: c_int,
+    kv_format: c_int,
 }
 
 const _: () = assert!(
     size_of::<Args>() == 120
         && offset_of!(Args, query_heads) == 96
         && offset_of!(Args, capacity) == 112
+        && offset_of!(Args, kv_format) == 116
 );
 
 unsafe extern "C" {
@@ -129,6 +131,7 @@ pub(in crate::kernels::cuda) fn clip_queries(
 pub(in crate::kernels::cuda) struct RelativeAttentionRaw<'a> {
     pub(in crate::kernels::cuda) ranges: [RawRange<'a>; RANGES],
     pub(in crate::kernels::cuda) shape: RelativeAttentionShape,
+    pub(in crate::kernels::cuda) kv_format: RelativeKvFormat,
     pub(in crate::kernels::cuda) tile: Option<RelativeAttentionTile>,
 }
 
@@ -137,8 +140,8 @@ pub(in crate::kernels::cuda) fn relative_attention_launch(
     call: &RelativeAttentionRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let bytes = match call.tile {
-        Some(tile) => tile.region_bytes(call.shape),
-        None => call.shape.region_bytes(),
+        Some(tile) => tile.region_bytes_for(call.shape, call.kv_format),
+        None => call.shape.region_bytes_for(call.kv_format),
     }
     .ok_or_else(invalid_argument)?;
     let spans = std::array::from_fn::<_, RANGES, _>(|i| Span::of(&call.ranges[i], bytes[i]));
@@ -158,6 +161,7 @@ pub(in crate::kernels::cuda) fn relative_attention_launch(
         relative_dims: shape.relative_dims as c_int,
         relative_extent: shape.relative_extent as c_int,
         capacity: shape.capacity as c_int,
+        kv_format: call.kv_format as c_int,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: region_bytes bounded the geometry, interval and strides. The checks

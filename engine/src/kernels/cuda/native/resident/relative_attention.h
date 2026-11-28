@@ -9,12 +9,16 @@
 extern "C" {
 #endif
 
+#define INFERENCE_CUDA_RELATIVE_KV_F32 0
+#define INFERENCE_CUDA_RELATIVE_KV_F16 1
+#define INFERENCE_CUDA_RELATIVE_KV_INT8 2
+
 typedef struct inference_cuda_relative_attention_args {
     /* The first four ranges are written and must be disjoint from every
      * other range. The step position is read on the device. */
     float *out;
-    float *keys;
-    float *values;
+    void *keys;
+    void *values;
     int *status;
     const float *q;
     const float *k;
@@ -29,6 +33,7 @@ typedef struct inference_cuda_relative_attention_args {
     int relative_dims;
     int relative_extent;
     int capacity;
+    int kv_format;
 } inference_cuda_relative_attention_args;
 
 int inference_cuda_relative_attention_launch(
@@ -57,7 +62,8 @@ int inference_cuda_relative_attention_clip_queries(
 }
 static_assert(sizeof(inference_cuda_relative_attention_args) == 120 &&
                   offsetof(inference_cuda_relative_attention_args, query_heads) == 96 &&
-                  offsetof(inference_cuda_relative_attention_args, capacity) == 112,
+                  offsetof(inference_cuda_relative_attention_args, capacity) == 112 &&
+                  offsetof(inference_cuda_relative_attention_args, kv_format) == 116,
               "relative attention ABI");
 #endif
 

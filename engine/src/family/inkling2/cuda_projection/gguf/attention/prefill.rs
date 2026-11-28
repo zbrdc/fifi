@@ -759,7 +759,8 @@ impl ResidentAttention {
                     layout.input
                 },
             };
-            tile.region_bytes(visit.shape).map(|bytes| (tile, bytes))
+            tile.region_bytes_for(visit.shape, visit.kv_format)
+                .map(|bytes| (tile, bytes))
         } else {
             None
         };
@@ -903,6 +904,7 @@ impl ResidentAttention {
             )?;
             Ok::<_, EngError>(RelativeAttentionCall {
                 shape: visit.shape,
+                kv_format: visit.kv_format,
                 q,
                 k,
                 v,
@@ -981,7 +983,7 @@ impl ResidentAttention {
             if let Some((tile, bytes)) = tile {
                 context.relative_attention_tile(&self.stream, call(0, bytes)?, tile)?;
             } else {
-                let bytes = visit.shape.region_bytes().unwrap(); // validated by Layout
+                let bytes = visit.shape.region_bytes_for(visit.kv_format).unwrap(); // validated by Layout
                 for i in 0..count {
                     context.relative_attention(&self.stream, call(i, bytes)?)?;
                 }

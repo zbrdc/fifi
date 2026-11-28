@@ -13,7 +13,7 @@ use super::super::conv::{self, Ring as ConvRing, Row as ConvRow, Variant};
 use crate::EngError;
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
 use crate::kernels::cuda::resident::relative_attention::{
-    HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape,
+    HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape, RelativeKvFormat,
 };
 use crate::kernels::cuda::resident::relative_prep::{PrepMath, PrepShape};
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
@@ -105,6 +105,7 @@ pub(crate) fn prep_row(
 #[derive(Clone, Copy)]
 pub(crate) struct Rings<'a> {
     pub(crate) shape: RelativeAttentionShape,
+    pub(crate) kv_format: RelativeKvFormat,
     pub(crate) table: DeviceRange<'a>,
     pub(crate) k: DeviceRange<'a>,
     pub(crate) v: DeviceRange<'a>,
@@ -148,6 +149,7 @@ pub(crate) fn attend_row(
         stream,
         RelativeAttentionCall {
             shape: row.rings.shape,
+            kv_format: row.rings.kv_format,
             q: rows.q,
             k: rows.k,
             v: rows.v,

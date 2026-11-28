@@ -21,6 +21,12 @@ constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * kWarp;
 constexpr int kColumns = kHeadDim / kWarp;
 constexpr float kScale = 0.08838834764831844f;  // 1 / sqrt(128)
+constexpr int kKvF32 = INFERENCE_CUDA_RELATIVE_KV_F32;
+constexpr int kKvF16 = INFERENCE_CUDA_RELATIVE_KV_F16;
+constexpr int kKvInt8 = INFERENCE_CUDA_RELATIVE_KV_INT8;
+constexpr int kInt8Group = kWarp;
+constexpr int kInt8Groups = kHeadDim / kInt8Group;
+constexpr size_t kInt8HeadBytes = kHeadDim + kInt8Groups * sizeof(__half);
 
 using Args = inference_cuda_relative_attention_args;
 
@@ -41,17 +47,99 @@ __device__ float warp_sum(float value) {
     return value;
 }
 
-struct KvPair {
-    const float *key, *value;
-};
+__device__ __forceinline__ float fmax_nan(float a, float b) {
+    const float m = fmaxf(a, b);
+    const float n = (b != b) ? b : m;
+    return (a != a) ? a : n;
+}
 
+__device__ __forceinline__ float warp_max_nan(float v) {
+#pragma unroll
+    for (int offset = kWarp / 2; offset > 0; offset >>= 1) {
+        v = fmax_nan(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    return v;
+}
+
+__device__ __forceinline__ int8_t quant_int8(float x, float scale_f32, unsigned short scale_bits) {
+    if (scale_bits == 0) return 0;
+    const int q = __float2int_rn(__fdiv_rn(x, scale_f32));
+    return static_cast<int8_t>(max(-127, min(127, q)));
+}
+
+// Writes one element of one head into the K or V ring. For Int8, every warp of 32 lanes must be
+// full and cover one 32-element group of the same head so the warp max reduction is convergent.
+template <int Fmt>
+__device__ __forceinline__ void store_ring_elem(void *ring, size_t slot, int kv_heads, int kv_head,
+                                                int dim, float x) {
+    if constexpr (Fmt == kKvF32) {
+        static_cast<float *>(ring)[(slot * kv_heads + kv_head) * kHeadDim + dim] = x;
+    } else if constexpr (Fmt == kKvF16) {
+        static_cast<__half *>(ring)[(slot * kv_heads + kv_head) * kHeadDim + dim] =
+            __float2half_rn(x);
+    } else {
+        char *base = static_cast<char *>(ring) + (slot * kv_heads + kv_head) * kInt8HeadBytes;
+        const float amax = warp_max_nan(fabsf(x));
+        const __half hs = __float2half_rn(__fdiv_rn(amax, 127.f));
+        const unsigned short bits = __half_as_ushort(hs);
+        const float s = __half2float(hs);
+        reinterpret_cast<int8_t *>(base)[dim] = quant_int8(x, s, bits);
+        if ((dim & (kInt8Group - 1)) == 0) {
+            reinterpret_cast<__half *>(base + kHeadDim)[dim / kInt8Group] = hs;
+        }
+    }
+}
+
+// The lane's columns of one staged f32 K or V row.
+__device__ __forceinline__ void load_f32_columns(const float *row, float (&out)[kColumns]) {
+    const int lane = threadIdx.x % kWarp;
+#pragma unroll
+    for (int i = 0; i < kColumns; ++i) {
+        out[i] = row[lane + i * kWarp];
+    }
+}
+
+// The lane's columns of one ring K or V head in format Fmt.
+template <int Fmt>
+__device__ __forceinline__ void load_ring_columns(const void *ring, size_t slot, int kv_heads,
+                                                  int kv_head, float (&out)[kColumns]) {
+    const int lane = threadIdx.x % kWarp;
+    if constexpr (Fmt == kKvF32) {
+        const float *row = static_cast<const float *>(ring) + (slot * kv_heads + kv_head) * kHeadDim;
+        load_f32_columns(row, out);
+    } else if constexpr (Fmt == kKvF16) {
+        const __half *row =
+            static_cast<const __half *>(ring) + (slot * kv_heads + kv_head) * kHeadDim;
+#pragma unroll
+        for (int i = 0; i < kColumns; ++i) {
+            out[i] = __half2float(row[lane + i * kWarp]);
+        }
+    } else {
+        const char *base =
+            static_cast<const char *>(ring) + (slot * kv_heads + kv_head) * kInt8HeadBytes;
+        const int8_t *codes = reinterpret_cast<const int8_t *>(base);
+        const __half *scales = reinterpret_cast<const __half *>(base + kHeadDim);
+#pragma unroll
+        for (int i = 0; i < kColumns; ++i) {
+            out[i] = float(codes[lane + i * kWarp]) * __half2float(scales[i]);
+        }
+    }
+}
+
+template <int Fmt>
 struct SerialKv {
-    __device__ KvPair operator()(const Args &a, const Rows &r, int distance) const {
-        const int row = r.slot - distance;
-        const size_t slot = row < 0 ? row + a.capacity : row;
-        const size_t src = (slot * a.kv_heads + r.kv_head) * kHeadDim;
-        return {distance == 0 ? a.k + r.kv_head * kHeadDim : a.keys + src,
-                distance == 0 ? a.v + r.kv_head * kHeadDim : a.values + src};
+    __device__ __forceinline__ void operator()(const Args &a, const Rows &r, int distance,
+                                               float (&key)[kColumns],
+                                               float (&value)[kColumns]) const {
+        if (distance == 0) {
+            load_f32_columns(a.k + r.kv_head * kHeadDim, key);
+            load_f32_columns(a.v + r.kv_head * kHeadDim, value);
+        } else {
+            const int row = r.slot - distance;
+            const size_t slot = row < 0 ? row + a.capacity : row;
+            load_ring_columns<Fmt>(a.keys, slot, a.kv_heads, r.kv_head, key);
+            load_ring_columns<Fmt>(a.values, slot, a.kv_heads, r.kv_head, value);
+        }
     }
 };
 
@@ -127,15 +215,6 @@ __device__ void fill_biases(const Args &a, int head, int count, float *biases) {
     }
 }
 
-// The lane's columns of one K or V row.
-__device__ __forceinline__ void load_columns(const float *row, float (&out)[kColumns]) {
-    const int lane = threadIdx.x % kWarp;
-#pragma unroll
-    for (int i = 0; i < kColumns; ++i) {
-        out[i] = row[lane + i * kWarp];
-    }
-}
-
 // Rows a warp loads and scores before it folds them. The loads and the scores of a batch do not
 // depend on the running partial, so they are issued together; the folds then run in distance
 // order, as one row at a time would, so the results keep their bits.
@@ -170,9 +249,7 @@ __device__ void partial(const Args &a, const Rows &r, Partials (&p)[H], ReadKv r
         for (int j = 0; j < kBatch; ++j) {
             const int distance = first + j * kWarps;
             if (distance < r.count) {
-                const auto [key, value] = read_kv(a, r, distance);
-                load_columns(key, keys[j]);
-                load_columns(value, values[j]);
+                read_kv(a, r, distance, keys[j], values[j]);
             }
         }
 #pragma unroll
@@ -254,6 +331,7 @@ __device__ void finish_heads(const Args &a, const Rows &r, const Partials (&p)[H
 // Block b serves query head b. A decode step scores one row per head, so a block per head keeps
 // the grid as wide as the heads; grouping them (as the prompt tiles do) would leave most of the
 // device idle for the sake of K/V rows that the cache serves to the group's other blocks anyway.
+template <int Fmt>
 __global__ void relative_attention(Args a) {
     __shared__ Partials p[1];
     __shared__ float biases[1][kBiasRows];
@@ -268,36 +346,41 @@ __global__ void relative_attention(Args a) {
     // blocks read the current K/V directly and read the cache only for older rows.
     if (head % group == 0 && d < kHeadDim) {
         const int src = r.kv_head * kHeadDim + d;
-        const size_t dst = size_t(r.slot) * a.kv_heads * kHeadDim + src;
-        a.keys[dst] = a.k[src];
-        a.values[dst] = a.v[src];
+        store_ring_elem<Fmt>(a.keys, size_t(r.slot), a.kv_heads, r.kv_head, d, a.k[src]);
+        store_ring_elem<Fmt>(a.values, size_t(r.slot), a.kv_heads, r.kv_head, d, a.v[src]);
     }
     const bool table = bias_table(a, r.count);
     if (table) {
         fill_biases(a, head, r.count, biases[0]);
         __syncthreads();
     }
-    partial<1>(a, r, p, SerialKv{}, table ? biases : nullptr);
+    partial<1>(a, r, p, SerialKv<Fmt>{}, table ? biases : nullptr);
     __syncthreads();
     finish(a, r, p[0]);
 }
 
 __device__ int row_stride(int stride, int width) { return stride == 0 ? width : stride; }
 
+template <int Fmt>
 struct SnapshotKv {
     int query, stride;
-    __device__ KvPair operator()(const Args &a, const Rows &r, int distance) const {
+    __device__ __forceinline__ void operator()(const Args &a, const Rows &r, int distance,
+                                               float (&key)[kColumns],
+                                               float (&value)[kColumns]) const {
         const auto src = snapshot::source(query, r.slot, distance, a.capacity);
-        const int channels = a.kv_heads * kHeadDim;
-        const size_t offset = size_t(src.row) * (src.staged ? stride : channels)
-                            + r.kv_head * kHeadDim;
-        return {(src.staged ? a.k : a.keys) + offset,
-                (src.staged ? a.v : a.values) + offset};
+        if (src.staged) {
+            const size_t offset = size_t(src.row) * stride + r.kv_head * kHeadDim;
+            load_f32_columns(a.k + offset, key);
+            load_f32_columns(a.v + offset, value);
+        } else {
+            load_ring_columns<Fmt>(a.keys, size_t(src.row), a.kv_heads, r.kv_head, key);
+            load_ring_columns<Fmt>(a.values, size_t(src.row), a.kv_heads, r.kv_head, value);
+        }
     }
 };
 
 // Block (b, query) serves the H query heads from b * H.
-template <int H>
+template <int H, int Fmt>
 __global__ void snapshot_queries(Args a, int first, int input_stride, int query_stride,
                                  int side_stride) {
     __shared__ Partials p[H];
@@ -329,7 +412,7 @@ __global__ void snapshot_queries(Args a, int first, int input_stride, int query_
         for (int h = 0; h < H; ++h) fill_biases(a, head + h, r.count, biases[h]);
         __syncthreads();
     }
-    partial<H>(a, r, p, SnapshotKv{query, row_stride(input_stride, a.kv_heads * kHeadDim)},
+    partial<H>(a, r, p, SnapshotKv<Fmt>{query, row_stride(input_stride, a.kv_heads * kHeadDim)},
                table ? biases : nullptr);
     __syncthreads();
     finish_heads<H>(a, r, p);
@@ -386,8 +469,32 @@ __device__ __forceinline__ void load_rows(const float *const (&row)[2], const bo
         }
     }
 }
+template <int Fmt>
+__device__ __forceinline__ uint2 load_tile_half4(const void *ring, size_t slot, int kv_heads,
+                                                 int kv_head, int c) {
+    if constexpr (Fmt == kKvF32) {
+        const float *p = static_cast<const float *>(ring) + (slot * kv_heads + kv_head) * kHeadDim + c;
+        return make_uint2(pack_half2(p[0], p[1]), pack_half2(p[2], p[3]));
+    } else if constexpr (Fmt == kKvF16) {
+        const __half *p =
+            static_cast<const __half *>(ring) + (slot * kv_heads + kv_head) * kHeadDim + c;
+        const __half2 lo = __halves2half2(p[0], p[1]);
+        const __half2 hi = __halves2half2(p[2], p[3]);
+        return make_uint2(*reinterpret_cast<const unsigned *>(&lo),
+                          *reinterpret_cast<const unsigned *>(&hi));
+    } else {
+        const char *base =
+            static_cast<const char *>(ring) + (slot * kv_heads + kv_head) * kInt8HeadBytes;
+        const int8_t *codes = reinterpret_cast<const int8_t *>(base) + c;
+        const float s =
+            __half2float(reinterpret_cast<const __half *>(base + kHeadDim)[c / kInt8Group]);
+        return make_uint2(pack_half2(float(codes[0]) * s, float(codes[1]) * s),
+                          pack_half2(float(codes[2]) * s, float(codes[3]) * s));
+    }
+}
 #endif
 
+template <int Fmt>
 __global__ void __launch_bounds__(kTileThreads) snapshot_tile(Args a, int first, int count,
                                                               int input_stride, int query_stride,
                                                               int side_stride) {
@@ -428,22 +535,22 @@ __global__ void __launch_bounds__(kTileThreads) snapshot_tile(Args a, int first,
         // K and V of keys k0 .. k0 + 31 as f16: a staged row of the tile, or the pre-tile ring.
         for (int i = threadIdx.x; i < kTileKeys * (kHeadDim / 4); i += kTileThreads) {
             const int key = i / (kHeadDim / 4), c = 4 * (i % (kHeadDim / 4)), kp = k0 + key;
-            float kx[4] = {}, vx[4] = {};
+            uint2 kh = make_uint2(0u, 0u), vh = make_uint2(0u, 0u);
             if (kp <= last) {
-                const size_t at = kp >= first
-                                      ? size_t(kp - first) * kv_stride + kv_head * kHeadDim + c
-                                      : (size_t(kp % a.capacity) * a.kv_heads + kv_head) * kHeadDim + c;
-                const float *ks = kp >= first ? a.k : a.keys, *vs = kp >= first ? a.v : a.values;
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    kx[e] = ks[at + e];
-                    vx[e] = vs[at + e];
+                if (kp >= first) {
+                    const size_t at = size_t(kp - first) * kv_stride + kv_head * kHeadDim + c;
+                    kh = make_uint2(pack_half2(a.k[at], a.k[at + 1]),
+                                    pack_half2(a.k[at + 2], a.k[at + 3]));
+                    vh = make_uint2(pack_half2(a.v[at], a.v[at + 1]),
+                                    pack_half2(a.v[at + 2], a.v[at + 3]));
+                } else {
+                    const size_t slot = size_t(kp % a.capacity);
+                    kh = load_tile_half4<Fmt>(a.keys, slot, a.kv_heads, kv_head, c);
+                    vh = load_tile_half4<Fmt>(a.values, slot, a.kv_heads, kv_head, c);
                 }
             }
-            *reinterpret_cast<uint2 *>(&sm.k[key][c]) =
-                make_uint2(pack_half2(kx[0], kx[1]), pack_half2(kx[2], kx[3]));
-            *reinterpret_cast<uint2 *>(&sm.v[key][c]) =
-                make_uint2(pack_half2(vx[0], vx[1]), pack_half2(vx[2], vx[3]));
+            *reinterpret_cast<uint2 *>(&sm.k[key][c]) = kh;
+            *reinterpret_cast<uint2 *>(&sm.v[key][c]) = vh;
         }
         // The table rows of the block's distances: slice row j is distance d_lo + j, zero where
         // no bias applies (a negative distance is masked below).
@@ -581,6 +688,7 @@ __global__ void __launch_bounds__(kTileThreads) snapshot_tile(Args a, int first,
 #endif
 }
 
+template <int Fmt>
 __global__ void snapshot_commit(Args a, int first, int count, int input_stride) {
     __shared__ int valid;
     if (threadIdx.x == 0) {
@@ -590,13 +698,13 @@ __global__ void snapshot_commit(Args a, int first, int count, int input_stride) 
     __syncthreads();
     if (!valid) return;
     const int row = snapshot::first_commit(count, a.capacity) + blockIdx.x;
-    const int slot = (first + row) % a.capacity;
+    const size_t slot = size_t((first + row) % a.capacity);
     const int channels = a.kv_heads * kHeadDim;
     for (int d = threadIdx.x; d < channels; d += blockDim.x) {
         const size_t src = size_t(row) * row_stride(input_stride, channels) + d;
-        const size_t dst = size_t(slot) * channels + d;
-        a.keys[dst] = a.k[src];
-        a.values[dst] = a.v[src];
+        const int kv_head = d / kHeadDim, dim = d % kHeadDim;
+        store_ring_elem<Fmt>(a.keys, slot, a.kv_heads, kv_head, dim, a.k[src]);
+        store_ring_elem<Fmt>(a.values, slot, a.kv_heads, kv_head, dim, a.v[src]);
     }
 }
 
@@ -643,20 +751,52 @@ __global__ void clip_prefill_queries(float *side, const float *scales, uint32_t 
 // Whether the loaded code of the tensor-core tile kernel was built for sm_75 or later, the
 // first PTX with the f16 MMA; older devices take the warp kernel. A failed query is cleared so
 // the launch check below does not report it.
+template <int Fmt>
 bool tensor_core_tile() {
     cudaFuncAttributes attr{};
-    if (cudaFuncGetAttributes(&attr, snapshot_tile) != cudaSuccess) {
+    if (cudaFuncGetAttributes(&attr, snapshot_tile<Fmt>) != cudaSuccess) {
         (void)cudaGetLastError();
         return false;
     }
     return attr.ptxVersion >= 75;
 }
 
+template <int Fmt>
+void launch_tile_format(const Args &a, int first, int count, int input_stride, int query_stride,
+                        int side_stride, cudaStream_t s, Failure &failure) {
+    if (tensor_core_tile<Fmt>()) {
+        const dim3 grid(a.query_heads, (count + kTileQueries - 1) / kTileQueries);
+        snapshot_tile<Fmt><<<grid, kTileThreads, 0, s>>>(a, first, count, input_stride,
+                                                         query_stride, side_stride);
+    } else {
+        const int heads = block_heads(a.query_heads / a.kv_heads);
+        const dim3 grid(a.query_heads / heads, count);
+        switch (heads) {
+            case 4: snapshot_queries<4, Fmt><<<grid, kThreads, 0, s>>>(
+                        a, first, input_stride, query_stride, side_stride); break;
+            case 3: snapshot_queries<3, Fmt><<<grid, kThreads, 0, s>>>(
+                        a, first, input_stride, query_stride, side_stride); break;
+            case 2: snapshot_queries<2, Fmt><<<grid, kThreads, 0, s>>>(
+                        a, first, input_stride, query_stride, side_stride); break;
+            default: snapshot_queries<1, Fmt><<<grid, kThreads, 0, s>>>(
+                        a, first, input_stride, query_stride, side_stride); break;
+        }
+    }
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    if (failure.err == cudaSuccess) {
+        // The stream, not CTA ordering, separates all snapshot reads from writes.
+        snapshot_commit<Fmt><<<min(count, a.capacity), kThreads, 0, s>>>(
+            a, first, count, input_stride);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    }
+}
+
 bool valid(const inference_cuda_relative_attention_args &a) {
     if (a.kv_heads < 1 || a.query_heads < a.kv_heads || a.query_heads > kMaxHeads ||
         a.query_heads % a.kv_heads != 0 || a.relative_dims < 1 || a.relative_dims > kWarp ||
         a.relative_extent < 1 || a.relative_extent > kWordMax ||
-        a.capacity < 1 || a.capacity > kWordMax) {
+        a.capacity < 1 || a.capacity > kWordMax ||
+        (a.kv_format != kKvF32 && a.kv_format != kKvF16 && a.kv_format != kKvInt8)) {
         return false;
     }
     const void *ranges[] = {a.out, a.keys, a.values, a.status, a.q, a.k,
@@ -698,7 +838,11 @@ extern "C" int inference_cuda_relative_attention_launch(
         if (in == nullptr || stream == nullptr || !valid(*in)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
         const auto s = (cudaStream_t)stream;
-        relative_attention<<<in->query_heads, kThreads, 0, s>>>(*in);
+        switch (in->kv_format) {
+            case kKvF32: relative_attention<kKvF32><<<in->query_heads, kThreads, 0, s>>>(*in); break;
+            case kKvF16: relative_attention<kKvF16><<<in->query_heads, kThreads, 0, s>>>(*in); break;
+            default: relative_attention<kKvInt8><<<in->query_heads, kThreads, 0, s>>>(*in); break;
+        }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
@@ -726,30 +870,19 @@ extern "C" int inference_cuda_relative_attention_tile_launch(
         }
         Failure failure;
         const auto s = (cudaStream_t)stream;
-        if (tensor_core_tile()) {
-            const dim3 grid(in->query_heads, (count + kTileQueries - 1) / kTileQueries);
-            snapshot_tile<<<grid, kTileThreads, 0, s>>>(*in, first, count, input_stride,
-                                                       query_stride, side_stride);
-        } else {
-            const int heads = block_heads(in->query_heads / in->kv_heads);
-            const dim3 grid(in->query_heads / heads, count);
-            switch (heads) {
-                case 4: snapshot_queries<4><<<grid, kThreads, 0, s>>>(
-                            *in, first, input_stride, query_stride, side_stride); break;
-                case 3: snapshot_queries<3><<<grid, kThreads, 0, s>>>(
-                            *in, first, input_stride, query_stride, side_stride); break;
-                case 2: snapshot_queries<2><<<grid, kThreads, 0, s>>>(
-                            *in, first, input_stride, query_stride, side_stride); break;
-                default: snapshot_queries<1><<<grid, kThreads, 0, s>>>(
-                            *in, first, input_stride, query_stride, side_stride); break;
-            }
-        }
-        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-        if (failure.err == cudaSuccess) {
-            // The stream, not CTA ordering, separates all snapshot reads from writes.
-            snapshot_commit<<<min(count, in->capacity), kThreads, 0, s>>>(
-                *in, first, count, input_stride);
-            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        switch (in->kv_format) {
+            case kKvF32:
+                launch_tile_format<kKvF32>(*in, first, count, input_stride, query_stride,
+                                           side_stride, s, failure);
+                break;
+            case kKvF16:
+                launch_tile_format<kKvF16>(*in, first, count, input_stride, query_stride,
+                                           side_stride, s, failure);
+                break;
+            default:
+                launch_tile_format<kKvInt8>(*in, first, count, input_stride, query_stride,
+                                            side_stride, s, failure);
+                break;
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
