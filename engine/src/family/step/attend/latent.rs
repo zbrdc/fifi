@@ -8,11 +8,13 @@
 //! carries the attended latent back to the head width. A projected gate scales the result
 //! before the output projection.
 //!
-//! The score has two forms over the same cache and the same partials. A step of one row, a
-//! chunk of up to [`FEW_ROWS`] rows and every chunk under the exact switch score a row at a time
-//! with f32 queries, so those rows keep the bits of a one-row step. A larger chunk scores all
-//! heads of 8 rows against a key tile as one matrix product on tensor cores, its queries
-//! rounded to f16 like the cached rows; a prompt at depth then costs a fraction of the row form.
+//! The score has three forms over the same cache and the same partials. A chunk of 2..=[`FEW_ROWS`]
+//! rows and every call under the exact switch score a row at a time with f32 queries, so those
+//! rows keep the bits of a pure-f32 step. A single non-exact row scores up to 64 heads together
+//! per block on tensor cores (sharing every KV tile load across heads and reading the position
+//! from `StepParams` when graph-captured). A larger chunk scores all heads of 8 rows against a
+//! key tile as one matrix product on tensor cores, its queries rounded to f16 like the cached
+//! rows; a prompt at depth then costs a fraction of the row form.
 
 use super::super::rows::{FEW_ROWS, Rows, StepIo};
 use crate::EngError;
@@ -155,9 +157,9 @@ pub(crate) fn mix(
     )?;
     io.mv(&names.latent, rows.input, rows.latent, n)?;
     if let Some(pos_word) = rows.step_pos {
-        if n != 1 || io.exact || !(MLA_GROUP..=64).contains(&d.heads) {
+        if n != 1 || io.exact || !(MLA_GROUP..=256).contains(&d.heads) {
             return Err(EngError::BadRequest(format!(
-                "{}: step_pos requires a single non-exact row with 8..=64 heads",
+                "{}: step_pos requires a single non-exact row with 8..=256 heads",
                 io.family
             )));
         }
@@ -246,20 +248,20 @@ pub(crate) fn score(
     let groups = d.heads / MLA_GROUP;
     // A single non-exact row uses the shared-KV decode kernel (all heads share one KV load per
     // split; fixed split count when reading pos from StepParams for graph capture).
-    if rows.step_pos.is_some() && (n != 1 || io.exact || !(MLA_GROUP..=64).contains(&d.heads)) {
+    if rows.step_pos.is_some() && (n != 1 || io.exact || !(MLA_GROUP..=256).contains(&d.heads)) {
         return Err(EngError::BadRequest(format!(
-            "{}: step_pos requires a single non-exact row with 8..=64 heads",
+            "{}: step_pos requires a single non-exact row with 8..=256 heads",
             io.family
         )));
     }
-    if n == 1 && !io.exact && (MLA_GROUP..=64).contains(&d.heads) {
+    if n == 1 && !io.exact && (MLA_GROUP..=256).contains(&d.heads) {
         let cap = MAX_SPLITS
             .min(rows.part.bytes() / part_bytes(d, 1, 1))
             .max(1);
         let splits = if rows.step_pos.is_some() {
             cap
         } else {
-            keys.div_ceil(16).clamp(1, cap)
+            keys.div_ceil(32).clamp(1, cap)
         };
         io.run(BlockOp::mla_attn_decode(
             shape,

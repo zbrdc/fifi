@@ -270,7 +270,7 @@ mla_attn_chunk_kernel(const float *qeff, const __half *cache, float *part, int n
             *reinterpret_cast<float2 *>(dst + kMlaValueQuarter * dq + 8 * j + c) =
                 make_float2(o[j][2 * i], o[j][2 * i + 1]);
         if (dq == 0 && c == 0) {
-            dst[kMlaRank] = m_run[i];
+            dst[kMlaRank] = isnan(l_run[i]) ? NAN : m_run[i];
             dst[kMlaRank + 1] = l_run[i];
         }
     }
@@ -316,7 +316,7 @@ mla_attn_decode_tc_kernel(const float *qeff, const __half *cache, float *part,
     float *const xsum = reinterpret_cast<float *>(xp + 16 * kMlaProbRow);
 
     unsigned qf[kMlaScoreQuarter / 16][4];
-    if (active_rg) {
+    if (lo < hi && active_rg) {
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const float *q = qeff + (size_t)head[i] * kMlaWidth + kMlaScoreQuarter * dq + c;
@@ -466,7 +466,7 @@ mla_attn_decode_tc_kernel(const float *qeff, const __half *cache, float *part,
             *reinterpret_cast<float2 *>(dst + kMlaValueQuarter * dq + 8 * j + c) =
                 make_float2(o[j][2 * i], o[j][2 * i + 1]);
         if (dq == 0 && c == 0) {
-            dst[kMlaRank] = m_run[i];
+            dst[kMlaRank] = isnan(l_run[i]) ? NAN : m_run[i];
             dst[kMlaRank + 1] = l_run[i];
         }
     }

@@ -988,6 +988,7 @@ fn the_decode_latent_score_and_step_kv_prep_match_the_row_path() {
     for (heads, pos, splits, use_dev_pos) in [
         (8usize, 7usize, 16usize, true),
         (16, 300, 32, false),
+        (40, 1500, 16, true),
         (40, 1500, 64, true),
         (64, 128, 16, true),
         (72, 200, 16, true),

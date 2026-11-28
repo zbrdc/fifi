@@ -406,7 +406,9 @@ mla_attn_decode_fallback_kernel(const float *qeff, const __half *cache, float *p
     const int hi = min(lo + per_split, visible);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const float *qsrc = qeff + (size_t)g * kMlaGroup * kMlaWidth;
-    for (int i = tid; i < kMlaGroup * kMlaWidth; i += 256) qs[i] = qsrc[i];
+    if (lo < hi) {
+        for (int i = tid; i < kMlaGroup * kMlaWidth; i += 256) qs[i] = qsrc[i];
+    }
     float m = -INFINITY, l = 0.0f;
     float acc[kMlaRank / 32];
 #pragma unroll
@@ -543,13 +545,15 @@ __global__ void __launch_bounds__(128) mla_reduce_kernel(const float *part, floa
     float total = 0.0f;
     for (int s = 0; s < splits; ++s) {
         const float ms = base[s * split_stride + kMlaRank];
-        if (ms != -INFINITY) total += base[s * split_stride + kMlaRank + 1] * expf(ms - mx);
+        const float ls = base[s * split_stride + kMlaRank + 1];
+        if (ms != -INFINITY || isnan(ls)) total += ls * expf(ms - mx);
     }
     for (int c = threadIdx.x; c < kMlaRank; c += blockDim.x) {
         float acc = 0.0f;
         for (int s = 0; s < splits; ++s) {
             const float ms = base[s * split_stride + kMlaRank];
-            if (ms != -INFINITY) acc += base[s * split_stride + c] * expf(ms - mx);
+            const float ls = base[s * split_stride + kMlaRank + 1];
+            if (ms != -INFINITY || isnan(ls)) acc += base[s * split_stride + c] * expf(ms - mx);
         }
         mix[((size_t)t * heads + h) * kMlaRank + c] = acc / total;
     }
