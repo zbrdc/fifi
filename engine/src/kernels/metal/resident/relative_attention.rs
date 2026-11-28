@@ -186,8 +186,9 @@ impl MetalContext {
         frame.drain().map(|_| ())
     }
 
-    /// The same step `repeats` times in one command buffer of a frame, for a timing test: the
-    /// GPU time of the whole frame in nanoseconds, as `dense_gemv_timed` returns it.
+    /// The same step `repeats` times in one frame, over as many of its command buffers as the
+    /// dispatches need, for a timing test: the GPU time of the whole frame in nanoseconds, as
+    /// `dense_gemv_timed` returns it.
     #[cfg(test)]
     pub(crate) fn relative_attention_timed(
         &self,
@@ -209,12 +210,22 @@ impl Frame {
         &mut self,
         call: RelativeAttentionCall<'_>,
     ) -> Result<(), EngError> {
-        self.relative_attention_parts(call, [true; 3])
+        self.relative_attention_masked(call, [true; 3])
     }
 
     /// The step's dispatches the mask names, in the step's order. A timing test leaves one
-    /// out to measure what it costs in place.
+    /// out to measure what it costs in place. Only the tests can name a mask.
+    #[cfg(test)]
     pub(super) fn relative_attention_parts(
+        &mut self,
+        call: RelativeAttentionCall<'_>,
+        parts: [bool; 3],
+    ) -> Result<(), EngError> {
+        self.relative_attention_masked(call, parts)
+    }
+
+    /// The encode of the step: the dispatches the mask names.
+    fn relative_attention_masked(
         &mut self,
         call: RelativeAttentionCall<'_>,
         parts: [bool; 3],
