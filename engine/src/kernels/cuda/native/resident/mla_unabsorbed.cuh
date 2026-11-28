@@ -82,7 +82,7 @@ __device__ inline void unab_issue_v(const __half *v_h, int base, int k_hi, unsig
 /* ---- Kernel 1: Expand cached 512-dim latents into per-head f16 K_nope or V ---------------- */
 
 template <bool TransposeW>
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(256, 2)
 mla_kv_expand_kernel(const __half *__restrict__ cache, const float *__restrict__ w,
                      __half *__restrict__ out, int k_len, int k_base) {
 #if __CUDA_ARCH__ >= 800
@@ -132,9 +132,11 @@ mla_kv_expand_kernel(const __half *__restrict__ cache, const float *__restrict__
                 const float4 v = *reinterpret_cast<const float4 *>(
                     w_head + (size_t)(k + br) * d_out + n0 + bc);
                 const int dst_col = ((ch ^ (br & 7)) << 3) + sub;
-                __half2 *dst = reinterpret_cast<__half2 *>(&bs_raw[br * kUnabExpBn + dst_col]);
-                dst[0] = __floats2half2_rn(v.x, v.y);
-                dst[1] = __floats2half2_rn(v.z, v.w);
+                const __half2 h0 = __floats2half2_rn(v.x, v.y);
+                const __half2 h1 = __floats2half2_rn(v.z, v.w);
+                *reinterpret_cast<uint2 *>(&bs_raw[br * kUnabExpBn + dst_col]) = make_uint2(
+                    *reinterpret_cast<const unsigned *>(&h0),
+                    *reinterpret_cast<const unsigned *>(&h1));
             }
         } else {
             /* w_head[d][r], d in [n0..n0+64), r in [k..k+32): 2 float4 loads per thread. */
@@ -144,9 +146,11 @@ mla_kv_expand_kernel(const __half *__restrict__ cache, const float *__restrict__
                 const int br = (tid >> 3) + 32 * pass;
                 const float4 v = *reinterpret_cast<const float4 *>(
                     w_head + (size_t)(n0 + br) * kMlaRank + k + bc);
-                __half2 *dst = reinterpret_cast<__half2 *>(&bs_raw[br * kUnabExpStride + bc]);
-                dst[0] = __floats2half2_rn(v.x, v.y);
-                dst[1] = __floats2half2_rn(v.z, v.w);
+                const __half2 h0 = __floats2half2_rn(v.x, v.y);
+                const __half2 h1 = __floats2half2_rn(v.z, v.w);
+                *reinterpret_cast<uint2 *>(&bs_raw[br * kUnabExpStride + bc]) = make_uint2(
+                    *reinterpret_cast<const unsigned *>(&h0),
+                    *reinterpret_cast<const unsigned *>(&h1));
             }
         }
         __syncthreads();

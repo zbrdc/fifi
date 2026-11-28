@@ -1266,10 +1266,13 @@ fn the_unabsorbed_latent_expand_and_attention_match_the_absorbed_path() {
     let (nope, rope, rank, v_dim) = (128usize, 64usize, 512usize, 128usize);
     let row = rank + rope;
     let scale = 1.0f32 / ((nope + rope) as f32).sqrt();
-    for (n, pos0, heads, tile_keys) in [
-        (17usize, 0usize, 8usize, 64usize),
-        (135, 37, 16, 64),
-        (65, 0, 8, 32),
+    for (n, pos0, heads, tile_keys, q_scale) in [
+        (17usize, 0usize, 8usize, 64usize, 0.35f32),
+        (135, 37, 16, 64, 0.35),
+        (65, 0, 8, 32, 0.35),
+        // Multi-M-tile expand (k_len > 64, gridDim.y = 2 with partial second tile) and
+        // larger score magnitude to exercise online-softmax max rescaling across tiles.
+        (100, 37, 8, 96, 1.2),
     ] {
         let total_keys = pos0 + n;
         let cells = total_keys + 32;
@@ -1280,7 +1283,7 @@ fn the_unabsorbed_latent_expand_and_attention_match_the_absorbed_path() {
             rope,
             rank,
         };
-        let qb = r.up(&data(201 + n as u64, n * heads * (nope + rope), 0.35));
+        let qb = r.up(&data(201 + n as u64, n * heads * (nope + rope), q_scale));
         let wk = r.up(&data(202 + heads as u64, heads * rank * nope, 0.12));
         let wv = r.up(&data(203 + heads as u64, heads * v_dim * rank, 0.12));
 
@@ -1300,9 +1303,13 @@ fn the_unabsorbed_latent_expand_and_attention_match_the_absorbed_path() {
         r.run(
             BlockOp::mla_attn(
                 shape,
-                (pos0, splits, kps),
+                pos0,
+                splits,
+                kps,
                 scale,
-                [whole(&qeff), whole(&cache), whole(&part)],
+                whole(&qeff),
+                whole(&cache),
+                whole(&part),
             )
             .expect("attn"),
         );
@@ -1323,9 +1330,9 @@ fn the_unabsorbed_latent_expand_and_attention_match_the_absorbed_path() {
         );
         let want = r.read(&out_ref, n * heads * v_dim);
 
-        // Candidate: tiled unabsorbed expand + attention with NaN-initialized output and ml.
-        let k_buf = r.zero_bytes(heads * tile_keys * nope * 2);
-        let v_buf = r.zero_bytes(heads * tile_keys * v_dim * 2);
+        // Candidate: tiled unabsorbed expand + attention with NaN-poisoned tile/output/ml buffers.
+        let k_buf = r.up_bytes(&0x7E00u16.to_le_bytes().repeat(heads * tile_keys * nope));
+        let v_buf = r.up_bytes(&0x7E00u16.to_le_bytes().repeat(heads * tile_keys * v_dim));
         let out_unab = r.up(&vec![f32::NAN; n * heads * v_dim]);
         let ml = r.up(&vec![f32::NAN; n * heads * 2]);
         let mut k_base = 0;
@@ -1384,4 +1391,64 @@ fn the_unabsorbed_latent_expand_and_attention_match_the_absorbed_path() {
         );
         assert_close("mla_unabsorbed", &got, &want, 2e-2);
     }
+
+    // Argument refusals: misaligned tile output and k_base >= pos0 + n must be rejected.
+    let shape = MlaShape {
+        n: 8,
+        heads: 8,
+        nope,
+        rope,
+        rank,
+    };
+    let qb = r.zeros(8 * 8 * (nope + rope));
+    let wk = r.zeros(8 * rank * nope);
+    let cache = r.zero_bytes(32 * row * 2);
+    let k_buf = r.zero_bytes(8 * 32 * nope * 2 + 16);
+    let v_buf = r.zero_bytes(8 * 32 * v_dim * 2);
+    let out = r.zeros(8 * 8 * v_dim);
+    let ml = r.zeros(8 * 8 * 2);
+    assert!(
+        r.ctx
+            .block_op(
+                &r.stream,
+                BlockOp::mla_kv_expand(
+                    8,
+                    8,
+                    rank,
+                    rope,
+                    nope,
+                    0,
+                    true,
+                    whole(&cache),
+                    whole(&wk),
+                    k_buf.range(4, 8 * 8 * nope * 2).expect("misaligned"),
+                )
+                .expect("build op"),
+            )
+            .is_err(),
+        "misaligned mla_kv_expand output should be refused"
+    );
+    assert!(
+        r.ctx
+            .block_op(
+                &r.stream,
+                BlockOp::mla_attn_unabsorbed(
+                    shape,
+                    v_dim,
+                    (0, 8, 8),
+                    scale,
+                    [
+                        whole(&qb),
+                        k_buf.range(0, 8 * 8 * nope * 2).expect("k"),
+                        whole(&cache),
+                        v_buf.range(0, 8 * 8 * v_dim * 2).expect("v"),
+                    ],
+                    whole(&out),
+                    whole(&ml),
+                )
+                .expect("build op"),
+            )
+            .is_err(),
+        "k_base >= pos0 + n should be refused"
+    );
 }

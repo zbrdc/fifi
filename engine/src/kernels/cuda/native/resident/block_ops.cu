@@ -1000,7 +1000,7 @@ extern "C" int inference_cuda_block_ops_launch_mode(const inference_cuda_block_o
             const long long d_out = i[4], k_base = i[5], transpose_w = i[6];
             if (k_len < 1 || k_len > 65536 || heads < 1 || heads > 256 || rank != kMlaRank ||
                 rope != kMlaRope || d_out != kUnabNope || k_base < 0 ||
-                (transpose_w != 0 && transpose_w != 1))
+                k_base > 0x7fffffffLL - k_len || (transpose_w != 0 && transpose_w != 1))
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
             slots.use(0, (k_base + k_len) * (rank + rope) * 2, false);
             slots.use(1, heads * rank * d_out * 4, false);
@@ -1036,7 +1036,8 @@ extern "C" int inference_cuda_block_ops_launch_mode(const inference_cuda_block_o
             const long long v_dim = i[5], pos0 = i[6], k_base = i[7], k_len = i[8];
             if (n < 1 || n > 65536 || heads < 1 || heads > 256 || nope != kUnabNope ||
                 rope != kUnabRope || rank != kMlaRank || v_dim != kUnabV || pos0 < 0 ||
-                k_base < 0 || k_len < 1 || k_len > 65536 || k_base >= pos0 + n)
+                pos0 > 0x7fffffffLL - n - kUnabBr || k_base < 0 ||
+                k_base > 0x7fffffffLL - k_len || k_len < 1 || k_len > 65536 || k_base >= pos0 + n)
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
             slots.use(0, n * heads * (nope + rope) * 4, false);
             slots.use(1, heads * k_len * nope * 2, false);

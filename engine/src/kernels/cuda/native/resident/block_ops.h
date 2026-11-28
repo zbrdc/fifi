@@ -89,12 +89,15 @@ extern "C" {
  *             [heads][k_len][d_out] (W, 16B aligned). i0 k_len; i1 heads; i2 rank (512);
  *             i3 rope (64); i4 d_out (128); i5 k_base; i6 transpose_w (0 or 1).
  * 24 MLA_ATTN_UNABSORBED one key-tile pass of tiled unabsorbed FlashAttention (m16n8k16 on
- *             sm_80+, scalar fallback otherwise). p0 qb f32 [n][heads][nope+rope] (8B aligned);
- *             p1 k_nope f16 [heads][k_len][nope] (16B aligned); p2 cache f16 [cells][rank+rope]
- *             (16B aligned, for shared k_rope); p3 v f16 [heads][k_len][v_dim] (16B aligned);
- *             p4 out f32 [n][heads][v_dim] (W, 8B aligned); p5 ml f32 [n][heads][2] (W, 8B
- *             aligned). i0 n; i1 heads; i2 nope (128); i3 rope (64); i4 rank (512); i5 v_dim
- *             (128); i6 pos0; i7 k_base; i8 k_len; f0 scale.
+ *             sm_80+, scalar fallback otherwise). Tiles must run contiguously starting at
+ *             k_base = 0 with k_base < pos0 + n: k_base == 0 initializes out/ml, k_base > 0
+ *             read-modify-writes p4/p5, and the final tile covering each query block normalizes
+ *             out by l_run. p0 qb f32 [n][heads][nope+rope] (8B aligned); p1 k_nope f16
+ *             [heads][k_len][nope] (16B aligned); p2 cache f16 [cells][rank+rope] (16B aligned,
+ *             for shared k_rope); p3 v f16 [heads][k_len][v_dim] (16B aligned); p4 out f32
+ *             [n][heads][v_dim] (W, 8B aligned); p5 ml f32 [n][heads][2] (W, 8B aligned).
+ *             i0 n; i1 heads; i2 nope (128); i3 rope (64); i4 rank (512); i5 v_dim (128);
+ *             i6 pos0; i7 k_base; i8 k_len; f0 scale.
  */
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,

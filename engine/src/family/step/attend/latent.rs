@@ -8,14 +8,14 @@
 //! carries the attended latent back to the head width. A projected gate scales the result
 //! before the output projection.
 //!
-//! The score has three forms over the same cache and the same partials. A chunk of 2..=[`FEW_ROWS`]
-//! rows and every call under the exact switch score a row at a time with f32 queries (and run
-//! scalar f32 absorb/project), so those rows keep the bits of a pure-f32 step. A single non-exact
-//! row scores up to 64 heads together per block on tensor cores (sharing every KV tile load across
-//! heads and reading the position from `StepParams` when graph-captured). A larger non-exact chunk
-//! runs absorb and project on tf32 tensor cores and scores all heads of 8 rows against a key tile
-//! as one matrix product on f16 tensor cores; a prompt at depth then costs a fraction of the row
-//! form.
+//! The score has four forms over the same compact cache. A chunk of 2..=[`FEW_ROWS`] rows and
+//! every call under the exact switch absorb into latent space and score a row at a time with f32
+//! queries, keeping pure-f32 bits. A single non-exact row absorbs and scores up to 64 heads
+//! together per block on tensor cores (reading the position from `StepParams` when graph-captured).
+//! A larger non-exact chunk expands cached latents per key tile into per-head f16 keys and values
+//! (reusing the idle absorbed/mixed/part scratch buffers) and runs unabsorbed FlashAttention over
+//! 192 score + 128 value dims, skipping absorb/reduce/project; non-standard geometries fall back
+//! to the absorbed tf32/f16 tensor-core chunk path.
 
 use super::super::rows::{FEW_ROWS, Rows, StepIo};
 use crate::EngError;
@@ -195,19 +195,24 @@ pub(crate) fn mix(
         rank: d.rank,
     };
     let tiled = !io.exact && n > FEW_ROWS;
-    let unabsorbed_tile_keys =
-        if tiled && d.key_dim == 128 && d.head_dim == 128 && d.rank == 512 && d.rot_dims == 64 {
-            let by_k = rows.absorbed.bytes() / (d.heads * d.key_dim * 2);
-            let by_v = rows.mixed.bytes() / (d.heads * d.head_dim * 2);
-            let ml_need = n * d.heads * 2 * 4;
-            if rows.part.bytes() >= ml_need {
-                (by_k.min(by_v) / 32 * 32).min(4096)
-            } else {
-                0
-            }
+    let unabsorbed_tile_keys = if tiled
+        && (1..=256).contains(&d.heads)
+        && d.key_dim == 128
+        && d.head_dim == 128
+        && d.rank == 512
+        && d.rot_dims == 64
+    {
+        let by_k = rows.absorbed.bytes() / (d.heads * d.key_dim * 2);
+        let by_v = rows.mixed.bytes() / (d.heads * d.head_dim * 2);
+        let ml_need = n.checked_mul(d.heads).and_then(|v| v.checked_mul(8));
+        if ml_need.is_some_and(|need| rows.part.bytes() >= need) {
+            (by_k.min(by_v) / 32 * 32).min(4096)
         } else {
             0
-        };
+        }
+    } else {
+        0
+    };
     if unabsorbed_tile_keys >= 32 {
         let total_keys = p0 + n;
         let q_range = rows.query.range(0, n * d.heads * query_row * 4)?;
