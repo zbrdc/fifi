@@ -24,10 +24,6 @@
 //! offset; `x` and `status`, which the kernel writes, overlap none of the other ranges; every
 //! number fits a C int; the stream belongs to this context. A refused call changes nothing. The
 //! rules mirror `valid()` in `embed.cu`: Rust rejects everything C rejects.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use std::ffi::c_int;
 
