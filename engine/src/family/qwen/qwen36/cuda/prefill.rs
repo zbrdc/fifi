@@ -54,6 +54,7 @@ use crate::{
             mmq_mmid::{
                 IdsGuardCall, MmidIds, MmidIdsOut, MmidShape, RoutedQuant, RoutedX, routed_gemm,
             },
+            mmq_quant::{MmqPacking, q36_mmq_packing},
             mmq_size::{NCOLS_LIMIT, fixup_floats_max},
             swiglu_rows::SwigluRowsCall,
         },
@@ -1632,7 +1633,7 @@ fn quantize_q8x(
         run.dense_input(
             ctx.launch,
             MmqDenseInputCall {
-                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                packing: q36_mmq_packing(MmqPacking::CpuReference),
                 weight,
                 m: run.rows.m(),
                 row_stride: run.model.geometry.hidden,
@@ -1798,7 +1799,7 @@ pub(super) fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Res
     run.dense_input(
         launch,
         MmqDenseInputCall {
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            packing: q36_mmq_packing(MmqPacking::CpuReference),
             weight,
             m: run.rows.m(),
             row_stride: run.model.geometry.delta.value_width,
@@ -2378,7 +2379,7 @@ pub(super) fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Res
     run.dense_input(
         launch,
         MmqDenseInputCall {
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            packing: q36_mmq_packing(MmqPacking::CpuReference),
             weight,
             m: run.rows.m(),
             row_stride: run.model.geometry.attn.q_width,
@@ -2677,7 +2678,7 @@ fn run_chunk_tiered(
         quant: RoutedQuant {
             ids: &ids.combined,
             gather: false,
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            packing: q36_mmq_packing(MmqPacking::CpuReference),
             cursor: Q8Cursor::default(),
         },
     };
@@ -2707,7 +2708,7 @@ fn run_chunk_tiered(
         quant: RoutedQuant {
             ids: &ids.combined,
             gather: true,
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
+            packing: q36_mmq_packing(MmqPacking::Vendor),
             cursor: Q8Cursor::default(),
         },
     };
@@ -3121,7 +3122,7 @@ pub(super) fn run_chunk_shared(
                 ctx.mmq_dense_input(
                     stream,
                     MmqDenseInputCall {
-                        packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                        packing: q36_mmq_packing(MmqPacking::CpuReference),
                         weight,
                         m,
                         row_stride: dims.hidden,
@@ -3160,7 +3161,7 @@ pub(super) fn run_chunk_shared(
         ctx.mmq_dense_input(
             stream,
             MmqDenseInputCall {
-                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                packing: q36_mmq_packing(MmqPacking::CpuReference),
                 weight: down_w,
                 m,
                 row_stride: dims.shared_inter,
@@ -3267,7 +3268,7 @@ pub(super) fn run_chunk_routed_timed(
         quant: RoutedQuant {
             ids: &ids,
             gather: false,
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            packing: q36_mmq_packing(MmqPacking::CpuReference),
             cursor: Q8Cursor::default(),
         },
     };
@@ -3294,7 +3295,7 @@ pub(super) fn run_chunk_routed_timed(
         quant: RoutedQuant {
             ids: &ids,
             gather: true,
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            packing: q36_mmq_packing(MmqPacking::CpuReference),
             cursor: Q8Cursor::default(),
         },
     };
@@ -3875,7 +3876,7 @@ pub(super) mod phase_timing {
             quant: RoutedQuant {
                 ids: &ids,
                 gather: false,
-                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                packing: q36_mmq_packing(MmqPacking::CpuReference),
                 cursor: Q8Cursor::default(),
             },
         };
@@ -3900,7 +3901,7 @@ pub(super) mod phase_timing {
             quant: RoutedQuant {
                 ids: &ids,
                 gather: true,
-                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                packing: q36_mmq_packing(MmqPacking::CpuReference),
                 cursor: Q8Cursor::default(),
             },
         };
@@ -4462,7 +4463,7 @@ mod kernel_diagnostics {
         let gate = native_dense(&mw.shared_gate)?;
         let up = native_dense(&mw.shared_up)?;
         let down = native_dense(&mw.shared_down)?;
-        let packing = crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference;
+        let packing = q36_mmq_packing(MmqPacking::CpuReference);
         diagnostic_dense_input(
             launch,
             MmqDenseInputCall {
@@ -4594,7 +4595,7 @@ mod kernel_diagnostics {
                 status: Some(io.status),
             },
         )?;
-        let packing = crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference;
+        let packing = q36_mmq_packing(MmqPacking::CpuReference);
         diagnostic_dense_input(
             launch,
             MmqDenseInputCall {

@@ -254,6 +254,17 @@ pub(crate) struct MmqQuantizeScatterCall<'b> {
     pub(crate) y: DeviceRange<'b>,
 }
 
+/// Opt-in packing override for legacy Qwen3.6 chunked prefill (`FIFI_Q36_MMQ_ROUNDED=1`).
+/// Unset or any value other than `1` preserves the caller's legacy packing bit-for-bit.
+pub(crate) fn q36_mmq_packing(legacy: MmqPacking) -> MmqPacking {
+    static ROUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ROUNDED.get_or_init(|| std::env::var_os("FIFI_Q36_MMQ_ROUNDED").is_some_and(|v| v == "1")) {
+        MmqPacking::Rounded
+    } else {
+        legacy
+    }
+}
+
 impl CudaContext {
     /// Queues the (optionally gathered) q8_1 quantize of `call` on `stream`: `ncols`
     /// columns, one `block_q8_1_mmq` per 128 values per column, k-block-major, in the ds
