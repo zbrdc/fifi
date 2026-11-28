@@ -58,5 +58,5 @@ Flint does not serve on CUDA in this build. A `native-cuda` build refuses a `fli
 
 ## See also
 
-- [Flint environment variables](../reference/environment.md#flint)
+- [Flint environment variables](../reference/environment.md#other-families)
 - [How fifi plans memory](../explanation/memory.md)

@@ -152,6 +152,63 @@ For supported user-facing variables, see [Environment variables](environment.md)
 | `NEM35_SUBOP_TIMING` | off | Times sub-operations of the MoE CPU routed path. |
 | `NEM35_TOKEN_TIMING` | off | Prints each step's timing split to stderr as it closes. |
 
+## Inkling 2 Mini diagnostics and kernel flags
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FIFI_INKLING2_MINI_GGUF_MLX` | on | `0` disables GGUF serving on Apple Silicon native MLX. |
+| `FIFI_INKLING_ATTN_CPU_WORKERS` | `4` | Attention projection CPU worker count on Apple Silicon. |
+| `FIFI_INKLING_PREFILL_ROWS` | `1` | Prompt prefill rows per step on Apple Silicon safetensors (`1` or `4`). |
+| `FIFI_INKLING_MMAP_DENSE` | `1` | `0` disables mmap for dense weights on Apple Silicon benchmarks. |
+| `FIFI_INKLING_FILE_CACHE_ONLY` | `1` | `0` disables file-cache-only staging on Apple Silicon benchmarks. |
+| `FIFI_INKLING_COMPONENT_TIMING` | off | `1` logs CPU, Metal, and logical dense I/O phase counters. |
+| `FIFI_INKLING_ROUTE_TRACE` | off | `1` logs ordered expert selections, plane sizes, and cache counters per visit. |
+| `FIFI_INKLING_GGUF_SEGMENTED_LRU` | on | `0` switches Apple Silicon GGUF Metal expert cache from segmented LRU to plain LRU. |
+| `FIFI_INKLING_GGUF_PACKED_DOT` | off | `1` selects direct Q6_K and Q8_0 row dots for mapped Apple Silicon GGUF weights. |
+| `FIFI_INKLING_GGUF_Q8_ACTIVATIONS` | off | `1` quantizes inputs to mapped Q8_0 projections (requires AArch64 dot product). |
+| `FIFI_INKLING_CUDA_PROFILE` | off | `1` logs per-token projection, upload, and expert-cache counters on CUDA. |
+| `FIFI_INKLING_CUDA_PACKED_GGUF` | on | `0` disables packed GGUF CUDA projections and keeps BF16 dense matrices resident. |
+| `FIFI_INKLING_CUDA_STREAM_EXPERTS` | on | `0` disables pinned staging of cold BF16 and NVFP4 expert pairs. |
+| `FIFI_INKLING_CUDA_CACHE_EXPERTS` | on | `0` disables adaptive VRAM caching for routed expert pairs. |
+| `FIFI_INKLING_CUDA_EXPERT_CACHE_RESERVE_MIB` | 3/4 of budget | Fixed adaptive expert cache quota in MiB (`0` places whole layers first). |
+| `FIFI_INKLING_CUDA_BATCH_EXPERTS` | on | `0` disables batching of resident selected experts per layer. |
+| `FIFI_INKLING_CUDA_BATCH_STREAMED_EXPERTS` | off | `1` batches streamed expert projections on CUDA. |
+| `FIFI_INKLING_CUDA_DENSE_STREAM` | on | `0` disables vectorized BF16 controller matrix streaming. |
+| `FIFI_INKLING_CUDA_ALLOC_CACHE` | on | `0` disables reuse of freed CUDA device buffers and prompt buffers. |
+| `FIFI_INKLING_CUDA_DIRECT_RESIDENT` | on | `0` disables direct CUDA kernel for resident GGUF NVFP4 expert banks. |
+| `FIFI_INKLING_CUDA_DECODE_Q8_EXPERTS` | on | `0` restores F32 expert products instead of q8_1 activations during decode. |
+| `FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN` | off | `1` uses exact Q2 down projection during decode. |
+| `FIFI_INKLING_CUDA_IQ2_GATE` | off | `1` enables IQ2 gate kernel on CUDA. |
+| `FIFI_INKLING_CUDA_Q8_ACTIVATIONS` | off | `1` enables Q8 activation quantization on CUDA. |
+| `FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_PROJECTIONS` | on | `0` restores exact kernels instead of tensor-core GEMM for prefill > 8 rows. |
+| `FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_EXPERTS` | on | `0` restores dequantizing GEMM for device prompt prefill experts. |
+| `FIFI_INKLING_CUDA_PREFILL_WEIGHT_WINDOW` | `64` | Prefill weight window size on CUDA. |
+| `FIFI_INKLING_CUDA_PREFILL_ROUTER_INPUT_REUSE` | on | `0` disables gathering resident expert inputs from batched router input. |
+| `FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE` | on | `0` disables paired F32 activation rows for resident Q8_0 attention (SM75+). |
+| `FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE_REPORT` | off | `1` logs paired and ordinary Q8_0 dispatch counts. |
+| `FIFI_INKLING_CUDA_PREFILL_QUERY_TILES` | on | `0` disables query-parallel relative attention for grouped GGUF prefill (SM75+). |
+| `FIFI_INKLING_CUDA_PREFILL_RESIDENT_QUERY` | on | `0` disables keeping Q, relative coefficients, sinks, and gates on CUDA during prefill. |
+| `FIFI_INKLING_CUDA_BATCH_CONTROLLERS` | on | `0` disables grouping resident Q, K, and V controller projections. |
+| `FIFI_INKLING_CUDA_GROUP_PROJECTIONS` | on | `0` disables grouped attention projections. |
+| `FIFI_INKLING_CUDA_GROUP_ATTENTION` | on | `0` disables grouped attention execution. |
+| `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS` | on | `0` disables batching attention projections across prompt rows. |
+| `FIFI_INKLING_CUDA_BATCH_ROUTER` | on | `0` disables batching resident router projections. |
+| `FIFI_INKLING_CUDA_BATCH_RELATIVE_ATTENTION` | on | `0` disables batched relative attention. |
+| `FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL` | on | `0` disables device expert prefill. |
+| `FIFI_INKLING_CUDA_RESIDENT_ATTENTION` | on | `0` disables resident target relative attention on CUDA GGUF. |
+| `FIFI_INKLING_CUDA_RESIDENT_ATTENTION_RESERVE` | off | `1` reserves resident attention capacity. |
+| `FIFI_INKLING_CUDA_CHAIN_ATTENTION_INPUT` | on | `0` disables keeping controller outputs on CUDA through attention input projections. |
+| `FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT` | on | `0` disables keeping attention output on CUDA through its resident output projection. |
+| `FIFI_INKLING_CUDA_GROUPED_CHAIN_ATTENTION` | on | `0` disables fused Q/K/V controller normalization for grouped GGUF CUDA prefill. |
+| `FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE` | on | `0` disables chaining local decode attention projections through one readback. |
+| `FIFI_INKLING_CUDA_CONTROLLER_CPU_PARITY` | off | `1` uses host-style FP64-rounded `tanh` and ordered sums in grouped Q/K/V normalization. |
+| `FIFI_INKLING_DSPARK_CUDA` | off | `1` runs DSpark draft projections and attention on CUDA. |
+| `FIFI_INKLING_DSPARK_CUDA_MARKOV` | off | `1` keeps DSpark Markov matrices in VRAM and runs them on CUDA. |
+| `FIFI_INKLING_DSPARK_CUDA_HEAD` | off | `1` runs DSpark draft logit correction and selection on CUDA. |
+| `FIFI_INKLING_DSPARK_GROUPED_PREFILL` | off | `1` captures target features during grouped prompt prefill. |
+| `FIFI_INKLING_CUDA_GROUPED_VERIFY` | off | `1` checks multiple DSpark draft rows per visit on CUDA. |
+| `FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT` | off | `1` adjusts DSpark draft width dynamically after rejections or accepts. |
+
 ## Test harnesses
 
 `cargo test` reads these, not `enginesrv`. Tests needing recorded data check the environment variable first, then `~/.config/fifi/test-paths.json`. Missing locations skip unless `FIFI_TEST_REQUIRE_DATA=1` or the test is `#[ignore]`.

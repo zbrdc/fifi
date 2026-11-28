@@ -118,4 +118,4 @@ With more than one engine, the server keeps running while at least one engine is
 | free GPU memory | The profile does not fit next to other GPU use | Close other GPU programs or pick a smaller profile. |
 | `session_cap_bytes` | Prefix reuse needs a larger session cap on the Mac | Raise it as described above. |
 
-To change prefill or caching behaviour, see the [environment variables](../reference/environment.md#qwen36-on-nvidia-cuda).
+To change prefill or caching behaviour, see the [environment variables](../reference/environment.md#nvidia-cuda-qwen36-flash-next-bolt).

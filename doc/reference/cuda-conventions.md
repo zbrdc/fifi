@@ -53,9 +53,11 @@ Alternatively, record an event at return and query it at reissue (`cudaEventQuer
 
 ## 2. A capture pins the buffers its body uses (context/graph.rs)
 
-A CUDA graph bakes in device addresses. If a captured body reads or writes a
-cached block that returns and reissues to another user, the graph's next
-run touches the new tenant's bytes. `CapturePlan::pins` lists the buffers a capture claims to use. The start window does not compare it with the buffers the body actually touches (`kernels/cuda/context/graph.rs`).
+A CUDA graph bakes in device addresses. Suppose a captured body uses a cached
+block, and that block returns and reissues to another user. The graph's next
+run then touches the new tenant's bytes. `CapturePlan::pins` lists the buffers a
+capture claims to use. The start window does not compare it with the buffers
+the body actually touches (`kernels/cuda/context/graph.rs`).
 
 What holds it today: the capture window refuses allocation, free, sync and
 graph run. It defers drops to `free_after_capture`. The capture author fills
@@ -94,7 +96,7 @@ The split refill copies misses on a second stream, involving two orderings:
   picks produced them — rests on "both streams were quiescent at the
   readback". This is a host-side argument, not a device dependency.
 
-What holds it today: the readback path waits on the launch stream before it
+What holds it today: the readback path waits on the start stream before it
 plans the refill.
 
 What would break it: removing that sync, or enqueueing the refill before the

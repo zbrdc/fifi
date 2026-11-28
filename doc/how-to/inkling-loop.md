@@ -1,78 +1,38 @@
 # Run Inkling 2 Mini on CPU or CUDA
 
-The `inkling2_loop` family runs Inkling 2 Mini on one CUDA device, or on the CPU. It serves raw completions and plain-text chat with one active sequence.
+The `inkling2_loop` family runs Inkling 2 Mini on one CUDA device or on the CPU.
+It serves raw completions and plain-text chat with one active sequence.
 For Apple Silicon, see [Run Inkling 2 Mini on a Mac](inkling.md).
 
 ## Start
 
-Choose family `inkling2_loop` in the `enginesrv` configuration. Use the pinned release directory for `model_dir` and `tokenizer_dir`, or set `model_dir` to a text GGUF in either layout. With no backend setting, a 64-bit Linux build with `native-cuda` serves on the first visible CUDA device, and any other 64-bit build serves on the CPU. Set `CUDA_VISIBLE_DEVICES` to choose the card.
+1. Download the pinned checkpoint (`thinkingmachines/Inkling-2-Mini`, revision `ed40e7da625f594fc9c4990f5f66be24873c22d7`) or a published fixed-loop text GGUF.
+2. Point `model_dir` to the safetensors directory, a GGUF file, or a directory with one text GGUF. Point `tokenizer_dir` to the pinned release tokenizer files.
+3. Configure an engine with `"family": "inkling2_loop"`, or run `enginesrv serve`:
 
-To select a backend explicitly, set `FIFI_INKLING_CPU_REFERENCE=1` or `FIFI_INKLING_CUDA_REFERENCE=1`. Setting both is an error.
+```sh
+export ENGINESRV_API_KEY=my-secret-key
+target/release/enginesrv serve --model ~/models/inkling2-mini --family inkling2_loop
+```
 
-The default context is 8,192 tokens including the prompt. That is the longest the current attention implementation takes, the model's attention log-scaling floor. Set `FIFI_INKLING_CONTEXT_TOKENS` to a smaller value for a shorter context. Routing, attention, KV and convolution state run on the host. On Linux, extended context and prefix storage use fifi's cgroup-aware host admission. Routing expert page-cache warming receives the RAM budget after the text-state reserve.
+With no backend variable set, a 64-bit Linux build with `native-cuda` runs on the first visible CUDA device.
+Any other 64-bit build runs on the CPU.
+Set `CUDA_VISIBLE_DEVICES` to pick a card.
 
-`enginesrv check` inspects the safetensors inventory and reports the BF16 KV storage plan for the fixed loop. It also checks the pinned tokenizer and the context settings. CUDA admission checks available device memory at startup.
+For `enginesrv check` on a GGUF directory, pass `--tokenizer-dir` separately.
 
-The published Inkling 2 Mini fixed-loop GGUF also works. Point `model_dir` to the GGUF file or a directory with one text GGUF, and use the original tokenizer files from the pinned release in `tokenizer_dir`. For `enginesrv check`, give the GGUF directory and pass `--tokenizer-dir` separately.
+## Common options
 
-## Defaults and overrides
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FIFI_INKLING_CONTEXT_TOKENS` | `8192` | Context limit in tokens (maximum 8,192). |
+| `FIFI_INKLING_CPU_REFERENCE` | off | `1` forces CPU execution. Setting both CPU and CUDA flags fails startup. |
+| `FIFI_INKLING_CUDA_REFERENCE` | off | `1` forces CUDA execution. |
+| `FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB` | unlimited | Caps VRAM budget for resident packed expert banks (`0` streams all experts). |
+| `FIFI_INKLING_CUDA_RAM_EXPERT_MIB` | unset | `auto` or positive MiB warms mapped expert pages in host RAM. `0` uses demand paging. |
+| `FIFI_INKLING_CUDA_PREFILL_ROWS` | `512` | Prompt tokens grouped per prefill request (`1` uses single-token prefill). |
+| `FIFI_INKLING_DSPARK_GGUF` | unset | Path to the Inkling 2 Mini DSpark sidecar GGUF for speculative decoding. |
 
-Each switch uses one read per process. `1` turns the path on, `0` turns it off, and an unset name takes the default. Any other value keeps the default and prints a warning once.
+Set `"prefix_reuse": true` in the server configuration to reuse saved chat prefixes.
 
-These switches default off. Set one to `1` to turn it on: `FIFI_INKLING_CUDA_BATCH_STREAMED_EXPERTS`, `FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN`, `FIFI_INKLING_CUDA_GROUPED_VERIFY`, `FIFI_INKLING_CUDA_IQ2_GATE`, `FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE_REPORT`, `FIFI_INKLING_CUDA_PROFILE`, `FIFI_INKLING_CUDA_Q8_ACTIVATIONS` and `FIFI_INKLING_CUDA_RESIDENT_ATTENTION_RESERVE`. Every other `FIFI_INKLING_CUDA_` switch on this page defaults on, and `0` turns it off. `FIFI_INKLING_CUDA_CONTROLLER_CPU_PARITY` (off) and `FIFI_INKLING_CUDA_PREFILL_WEIGHT_WINDOW` (64) are not in this table and keep their existing behavior.
-
-On CUDA, the loader puts packed GGUF experts in VRAM until the card is full, with adaptive caching on and no VRAM cap. `FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB` caps the budget for packed expert banks. The loader puts complete banks for the repeated core layers first and includes their bytes in device admission. A budget of zero uses streamed experts. Use `FIFI_INKLING_CUDA_PROFILE=1` to log per-token time by projection and upload phase. `FIFI_INKLING_CUDA_DENSE_STREAM` is on by default and uses the vectorized BF16 projections. Setting it to `0` turns it off. This path queues all three controller matrices on one stream and copies only the final gain and forget rows back to the host.
-
-Set `FIFI_INKLING_DSPARK_GGUF` to the separate Inkling 2 Mini DSpark sidecar to opt into speculative decoding. The CUDA backend accelerates the target projections and expert computation with a host drafter by default. Set `FIFI_INKLING_DSPARK_CUDA=1` with the CUDA GGUF target to run draft projections and attention on the GPU. The loader charges draft weights and committed draft KV to the shared state reserve after target placement and checks the remaining runtime headroom. Draft normalization and Markov recurrence run on the host. Set `FIFI_INKLING_DSPARK_CUDA_MARKOV=1` with CUDA DSpark to keep the two Markov projection matrices in VRAM and run those projections on CUDA. Set `FIFI_INKLING_DSPARK_CUDA_HEAD=1` with CUDA DSpark and a resident GGUF vocabulary projection to apply the draft logit correction and select each candidate on the GPU. `FIFI_INKLING_CUDA_RESIDENT_ATTENTION` is on by default and enables resident target relative attention with a fully resident packed CUDA GGUF target. Setting it to `0` turns it off. The host keeps committed KV and convolution histories for prefix restore and verifier rollback. A rejected window fixes the device slots it overwrote that the next token needs. Unset `FIFI_INKLING_DSPARK_GGUF` to return to ordinary decoding.
-
-Set `FIFI_INKLING_CUDA_GROUPED_VERIFY=1` to check multiple draft rows per visit on the CUDA target. This requires fully resident packed GGUF experts, `FIFI_INKLING_CUDA_BATCH_EXPERTS` and `FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL` (both on by default), and floating-point projection activations. `FIFI_INKLING_CUDA_GROUP_ATTENTION`, `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS` and `FIFI_INKLING_CUDA_BATCH_ROUTER` batch the attention projections and resident router projections. All three are on by default, and `=0` turns each off. The verifier uses the serial path for one row or when the backend or host budget cannot admit grouped checking.
-
-Both backends map the original packed weights from disk and decode or upload only selected expert payloads. Without packed GGUF projection (`FIFI_INKLING_CUDA_PACKED_GGUF=0`), the CUDA backend keeps BF16 dense matrices resident. It uses vectorized CUDA projection and reuses a fixed device buffer for streamed BF16 and NVFP4 experts. In this mode, other supported GGUF quantization types project on the host. `FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB` caps VRAM for compatible NVFP4 expert banks. The shared expert tier keeps complete banks for repeated core layers first and stops at its VRAM headroom. The remaining experts use the file mapping and bounded staging. `FIFI_INKLING_CUDA_STREAM_EXPERTS` is on by default and stages cold BF16 and NVFP4 expert pairs through fifi's shared pinned CUDA banks. Setting it to `0` turns it off. The GPU decodes the original GGUF NVFP4 blocks directly. The backend allocates both banks before hot expert placement.
-
-`FIFI_INKLING_CUDA_PACKED_GGUF` is on by default. It uses CUDA projections with the original GGUF blocks in all ten text variants, from UD-IQ1_S and UD-IQ1_M through UD-Q8_K_XL. Setting it to `0` turns it off. fifi selects the projection by each tensor's GGUF type and uses actual packed sizes to put complete expert layers in VRAM. This option enables pinned staging for the remaining experts. The RAM and adaptive-cache settings below warm mapped expert pages and retain frequently selected experts in VRAM.
-
-`FIFI_INKLING_CUDA_BATCH_EXPERTS` is on by default and batches each resident layer's selected experts with packed GGUF projection. Setting it to `0` turns it off. The gate/up projection, clipped activation, down projection, and weighted sum run on one CUDA stream. Each resident layer visit reads back one combined activation row.
-
-During grouped prompt prefill with `FIFI_INKLING_CUDA_BATCH_ROUTER` and `FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL`, `FIFI_INKLING_CUDA_PREFILL_ROUTER_INPUT_REUSE` (on by default, `=0` off) gathers resident expert inputs from the batched router's device input. This skips one hidden-row upload per token when the complete batch fits the existing packed expert weight stage. Router tiles write consecutive rows there. Each expert window gathers from its corresponding slice. Routing logits still return to the host for the usual selection, observation and expert scheduling. It does not apply to cold layers or speculative execution. The device expert profile reports `router_input_h2d_bytes_saved` per visit. Zero means the ordinary input upload ran.
-
-`FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_PROJECTIONS` is on by default. A prompt prefill's projections over more than 8 rows run on the shared tensor-core GEMM. Each activation plane quantizes to 8 bits once, then each weight with a vendored MMQ case runs one GEMM. Other weight types and short calls keep the exact kernels. `=0` restores the exact kernels for every call.
-
-`FIFI_INKLING_CUDA_PREFILL_TENSOR_CORE_EXPERTS` is on by default. A device prompt prefill runs its expert gate/up and down products on the shared grouped tensor-core GEMM. The kernel quantizes gathered rows to 8 bits once per stage, then runs each picked expert's rows through its matrix. A stack takes this path when its type has a vendored MMQ case. The vendored k loop reads 256-value tiles, so down products (1,152 values per row) read past their row into the next row or zeroed tail. `=0` restores the dequantizing GEMM and the exact tiles.
-
-`FIFI_INKLING_CUDA_DECODE_Q8_EXPERTS` is on by default. It runs the expert products of a resident decode visit on q8_1 activations. The visit quantizes the expert input once, then runs the gate/up product of every selected expert in one run. It applies the clipped activation, quantizes the activation rows, and runs the down product the same way. The weighted sum stays the same. It applies to device-routed layers whose two expert stacks have a q8_1 kernel, and other layers keep the f32 products. `=0` restores the f32 products.
-
-`FIFI_INKLING_CUDA_ALLOC_CACHE` is on by default. The CUDA backend reuses freed device buffers of the same size. During a prompt prefill, it also keeps prompt-sized buffers between layer visits instead of freeing and reallocating them. It frees them when the prefill ends. `=0` turns it off.
-
-`FIFI_INKLING_CUDA_DIRECT_RESIDENT` is on by default. It keeps original GGUF NVFP4 blocks in VRAM and uses the direct CUDA kernel for those expert banks. Setting it to `0` turns it off.
-
-To put experts in VRAM first, then RAM, then on the SSD, set `FIFI_INKLING_CUDA_RAM_EXPERT_MIB=auto` or give a positive MiB budget. This enables shared pinned staging and automatic VRAM placement when you omit an explicit VRAM budget. After GPU placement, fifi warms file-backed expert layers within the process's host-memory allowance. Under a smaller allowance, fifi uses the expert predictor before attention. It asks Linux to read the predicted experts' two GGUF ranges into the page cache. The actual Inkling router determines which experts execute. The budget limits startup warming and advice per visit. Linux can reclaim or retain file pages as memory pressure changes. Set the RAM budget to zero to use ordinary demand paging.
-
-`FIFI_INKLING_CUDA_CACHE_EXPERTS` is on by default and retains frequently routed expert pairs in the remaining VRAM allowance. Setting it to `0` turns it off. The shared adaptive policy ranks observed routes per layer. A promotion copies an expert directly from its existing CUDA staging bank. Later hits execute both projections from the cached original bytes. The cache respects the total expert budget and the shared device headroom. With `FIFI_INKLING_CUDA_PROFILE=1`, the server reports hits and avoided host-to-device bytes by layer.
-
-With packed GGUF and adaptive caching enabled, fifi reserves three quarters of the admitted expert budget for adaptive slots when weights exceed the budget. The shared device headroom still applies. Set `FIFI_INKLING_CUDA_EXPERT_CACHE_RESERVE_MIB` to choose a fixed quota, or set it to zero to put whole layers first.
-
-Set `"prefix_reuse": true` in the server configuration to reuse saved chat prefixes. Inkling uses the shared scheduler and prefix store with one pinned root and two evictable entries. Each snapshot retains the independent KV and short-convolution state of every visit. Snapshots share KV rows while those rows stay in use.
-
-`FIFI_INKLING_CUDA_PREFILL_ROWS` sets how many prompt tokens the GGUF CUDA backend groups per prefill request with shared expert streaming. The default is 512. The host memory plan admits fewer rows when the state does not fit. Each attention and convolution state advances in token order. The CUDA staging banks upload each missing expert once per layer visit and prompt chunk. `FIFI_INKLING_CUDA_PROFILE=1` records expert uploads in the shared request log. A value of 1 uses single-token prefill.
-
-Set `FIFI_INKLING_DSPARK_GROUPED_PREFILL=1` to capture target features during grouped prompt prefill on the same compatible CUDA backend as grouped checking. `FIFI_INKLING_CUDA_PREFILL_ROWS` sets the requested group width (default 512). The host memory planner admits the width, and the startup prefill report shows the admitted value. You can turn on the prefill and checking switches independently. Token-major feature capture is the default.
-
-`FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT` is on by default and keeps the attention result on CUDA through its resident output projection. Setting it to `0` turns it off. It applies with `FIFI_INKLING_CUDA_RESIDENT_ATTENTION`. The engine reads back the projected activation before the existing causal convolution. A projection without eligible resident weights uses the existing path.
-
-`FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE` is on by default. It uses paired F32 activation rows for resident Q8_0 attention projections on SM75 and newer cards. Setting it to `0` turns it off. It applies only to existing multirow prefill: `(M,N,K)=(7–12,1024,2304)`, `(7–12,3072,2304)`, or `(63–64,2304,3072)`. It does not enable batching or affect decode (including grouped speculative checking), routed experts, or WMMA. `FIFI_INKLING_CUDA_PREFILL_Q8_ROW_REUSE_REPORT=1` reports paired and ordinary Q8_0 enqueues for dispatch checks.
-
-`FIFI_INKLING_CUDA_PREFILL_QUERY_TILES` is on by default and enables query-parallel relative attention on SM75 and newer cards for ordinary grouped GGUF prefill. Setting it to `0` turns it off. This requires resident attention and output projection, `FIFI_INKLING_CUDA_BATCH_RELATIVE_ATTENTION` (on by default), and admission to the existing batched attention path. Eligible groups of 2–64 queries read one immutable device-ring snapshot and then commit their K/V in stream order. Host K/V remains authoritative. Prefix restore and reset invalidate the device cursor. Singletons, unsupported hardware and ineligible batches use the existing path. The flag does not apply to decode or speculative checking.
-
-`FIFI_INKLING_CUDA_PREFILL_RESIDENT_QUERY` is on by default and keeps Q, relative coefficients, sinks and gates on CUDA for eligible ordinary grouped GGUF prefill. Setting it to `0` turns it off. It requires the existing batched relative-attention path and resident output projection. It does not enable batching, controller chaining or the resident cache by itself. The host still prepares and retains K/V. With query tiles enabled and admitted, query preparation and snapshot attention share status so an invalid row prevents the whole tile's K/V commit. Otherwise resident query preparation feeds the existing serial attention calls. Ineligible paths fall back before submission. An enqueued batch error does not retry on a potentially modified ring.
-
-`FIFI_INKLING_CUDA_BATCH_CONTROLLERS` and `FIFI_INKLING_CUDA_GROUP_PROJECTIONS` are on by default. Setting either to `0` turns it off. Together they group resident Q, K, and V cross-pass controller projections in one transfer. Grouped prefill also batches those controllers across prompt rows when `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS` is on. Controllers with missing resident matrices use their existing fallback.
-
-`FIFI_INKLING_CUDA_CHAIN_ATTENTION_INPUT` is on by default. It keeps cross-pass controller outputs on CUDA through residual gating, weighted RMSNorm, and the attention input projections. Setting it to `0` turns it off. It requires `FIFI_INKLING_CUDA_BATCH_CONTROLLERS`, `FIFI_INKLING_CUDA_GROUP_PROJECTIONS`, and `FIFI_INKLING_CUDA_GROUP_ATTENTION`, which are on by default. This applies to ordinary single-row GGUF execution when all required matrices are resident. Grouped prefill and speculative checking retain their existing paths.
-
-Set `FIFI_INKLING_CUDA_CONTROLLER_CPU_PARITY=1` to experiment with host-style arithmetic only in the fused Q/K/V controller normalization for eligible grouped GGUF CUDA prefill (`FIFI_INKLING_CUDA_GROUPED_CHAIN_ATTENTION`, on by default). The parity flag does not enable the chain or change its eligibility or fallback. Single-row fused attention (including resident local decode) and routed MLP controllers always use the generic CUDA arithmetic. The engine reads the flag once when it first admits the grouped fusion. Unset it (the default) to use generic arithmetic there too.
-
-The parity kernel replaces device `tanhf` with device FP64 `tanh` rounded to FP32, and uses host-ordered FP32 sum of squares, square root, reciprocal, and gamma multiplication. On one exact-model first tile with identical inputs, both rounded tanh taps and the pre-norm activations matched the host at all 20,736 elements each. A standalone replay through the fused kernel also matched all 20,736 normalized outputs on that tile. This does not establish tanh equality on other inputs or hosts, or whole-model parity.
-
-`FIFI_INKLING_CUDA_CHAIN_LOCAL_DECODE` is on by default. It runs local decode attention projections, causal K/V convolution, clipping and normalization, and relative attention before one readback. Setting it to `0` turns it off. It requires `FIFI_INKLING_CUDA_GROUP_ATTENTION` and `FIFI_INKLING_CUDA_RESIDENT_ATTENTION`, which are on by default. The controller input chain above includes cross-pass local visits when it is on. The readback still commits raw convolution history and processed KV rows to the host for snapshots and rollback. Global attention, grouped prefill, draft-enabled sessions, missing resident weights, and un-restored device cursors use the existing path.
-
-Set `FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT=1` to reduce the DSpark draft width after a rejection and restore it after fully accepted windows. Two consecutive windows accepting fewer than half their proposals switch that generation to one-token target decode. Each new request starts at the configured width, including a request that restores a saved prefix. The request log reports adaptive stand-down steps when they occur. The fixed DSpark width is the default.
+For internal CUDA kernel, DSpark, and profiling flags, see [Internal and experimental environment variables](../reference/internal-environment.md#inkling-2-mini-diagnostics-and-kernel-flags).
