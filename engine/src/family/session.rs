@@ -71,6 +71,45 @@ pub(crate) trait TokenStepper {
     }
     fn fed(&self) -> usize;
     fn reset(&mut self) -> Result<()>;
+    /// The bytes of one [`Kept`] of this model, or `None` when it keeps none: prompt reuse
+    /// between requests is then off for it.
+    fn kept_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// Copies the running state after the `fed` positions.
+    fn keep(&mut self) -> Result<Kept> {
+        Err(EngError::BadRequest(
+            "this model keeps no state".to_string(),
+        ))
+    }
+    /// Puts a kept state back and makes `fed` its position count. The rows a cache holds by
+    /// position stay as they are: the caller has checked that those below the kept position are
+    /// the rows the state was kept with.
+    fn put_back(&mut self, _kept: &Kept) -> Result<()> {
+        Err(EngError::BadRequest(
+            "this model keeps no state".to_string(),
+        ))
+    }
+    /// Counts up whenever the rows a kept state relies on may have been written again: a
+    /// sequence that starts at position 0, or a clear after a failure. A kept state is put back
+    /// only under the count it was kept under.
+    fn kept_generation(&self) -> u64 {
+        0
+    }
+}
+
+/// The part of a model state that cannot be cut back to an earlier position, after `rows`
+/// positions: byte copies of its buffers, in the model's own order. A cache addressed by
+/// position needs no copy, because later rows are written over; a running state does.
+pub(crate) struct Kept {
+    pub(crate) rows: usize,
+    pub(crate) parts: Vec<Vec<u8>>,
+}
+
+impl Kept {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.parts.iter().map(|part| part.len() as u64).sum()
+    }
 }
 
 /// Samples only the tokenizer-visible vocabulary, with the same width check for solo and rows.

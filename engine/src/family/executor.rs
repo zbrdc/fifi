@@ -2,7 +2,10 @@
 
 use crate::EngError;
 use crate::family::sampler::Sampler;
-use crate::family::session::{self, DecodeSession, Limits, SaveKind, StoreLimits, TokenStepper};
+use crate::family::session::{
+    self, DecodeSession, Kept, Limits, PrefixStore, SaveKind, SnapshotBudget, StoreLimits,
+    TokenStepper,
+};
 use crate::family::speculate::budget::DraftBudget;
 use crate::sched::job::{PrefillBankReport, PrefixReport};
 use crate::tokenizer::{DecodeBatch, IncrementalDecoder};
@@ -255,6 +258,17 @@ pub(crate) trait ExecutorOps {
     fn restore_prefix(&mut self, _st: &mut Self::Session, _prompt: &[u32]) -> Result<usize> {
         Ok(0)
     }
+    /// [`Self::restore_prefix`] for a job whose last message boundary is `tip` prompt tokens. The
+    /// worker calls this one. An executor whose restore depends on where the worker cuts the
+    /// prompt overrides it; the default does not read the tip.
+    fn restore_prefix_under(
+        &mut self,
+        st: &mut Self::Session,
+        prompt: &[u32],
+        _tip: usize,
+    ) -> Result<usize> {
+        self.restore_prefix(st, prompt)
+    }
     /// The prefix-store report of this executor, which the worker takes once per job after the
     /// prefill and carries in `JobUsage`: the entries the store holds, the charged bytes of their
     /// snapshots, the kind of the entry the job restored, and the prompt tokens shared with a
@@ -323,13 +337,54 @@ pub(crate) trait ExecutorOps {
     }
 }
 
-/// Runs one model state through the shared decode policy, without a prefix store.
+/// Runs one model state through the shared decode policy. With [`Self::with_reuse`], a request
+/// whose prompt begins like an earlier one starts from a kept state instead of position 0.
+///
+/// # Prompt reuse
+///
+/// A reused request has the bits of a cold start: the same request, with the same boundary
+/// mark, served by this engine from an empty store. Chunks of more than a few rows give a row
+/// bits that depend on the chunk it sits in, so the two runs must cut the prompt alike. They do,
+/// because a state is kept only at a multiple of the worker's piece and put back only below the
+/// tip of the request:
+///
+/// - a cold start cuts every piece at a multiple of the piece below its tip, cuts once at the
+///   tip and starts its pieces again there;
+/// - a kept key is a multiple of the piece, so a cold start of any prompt whose tip lies above
+///   it ends a chunk there, and the pieces after a restore fall where the cold ones fall;
+/// - a key at or above the tip is not taken: the cold start would have cut at its tip below it.
+///
+/// The rows a cache holds by position stay on the device, so one sequence is held at a time.
+/// The model counts a generation up when a sequence starts at position 0, and a restore drops
+/// every longer entry before a row is written over.
 pub(crate) struct SerialDecode<S> {
     step: S,
     eos: Vec<u32>,
     sampler_vocab: usize,
     context_limit: usize,
+    reuse: Option<Reuse>,
 }
+
+/// The kept states of one executor: each is tagged with the generation of the model that
+/// kept it and with the piece.
+struct Reuse {
+    store: PrefixStore<Kept, (u64, usize)>,
+    piece: usize,
+    /// The host bytes the kept states may take together.
+    budget: u64,
+    /// Asks the host whether one more copy of this many bytes fits now.
+    admit: HostAdmit,
+}
+
+/// The host admission of one kept state: a `MemoryPlan` refusal skips the save.
+pub(crate) type HostAdmit = fn(usize) -> Result<()>;
+
+/// The fewest entries with which the worker plans a cut below the tip. One conversation uses
+/// one: a later cut of a prompt replaces the earlier one.
+const KEPT_LIMITS: StoreLimits = StoreLimits {
+    roots: 0,
+    entries: 2,
+};
 
 impl<S: TokenStepper> SerialDecode<S> {
     pub(crate) fn new(step: S, eos: Vec<u32>, sampler_vocab: usize, context_limit: usize) -> Self {
@@ -338,7 +393,29 @@ impl<S: TokenStepper> SerialDecode<S> {
             eos,
             sampler_vocab,
             context_limit,
+            reuse: None,
         }
+    }
+
+    /// Turns prompt reuse on for a model that keeps its state. `piece` is the prompt piece of
+    /// the worker that drives this executor, `budget` the host bytes the kept states may take
+    /// together (`None` when the host's memory is unknown: each save then asks `admit` alone),
+    /// and `admit` the host admission of one more state.
+    pub(crate) fn with_reuse(
+        mut self,
+        piece: usize,
+        budget: Option<u64>,
+        admit: HostAdmit,
+    ) -> Self {
+        if piece > 0 && self.step.kept_bytes().is_some() {
+            self.reuse = Some(Reuse {
+                store: PrefixStore::with_limits(KEPT_LIMITS),
+                piece,
+                budget: budget.unwrap_or(u64::MAX),
+                admit,
+            });
+        }
+        self
     }
 }
 
@@ -378,6 +455,65 @@ impl<S: TokenStepper> ExecutorOps for SerialDecode<S> {
     }
 
     fn boundary(&mut self, _st: &mut Self::Session) {}
+
+    fn prefix_limits(&self) -> StoreLimits {
+        match self.reuse {
+            Some(_) => KEPT_LIMITS,
+            None => StoreLimits::default(),
+        }
+    }
+
+    /// Keeps the state at `key` when a cold start of a longer prompt ends a chunk there. A
+    /// host without the room skips the save; the request is served the same.
+    fn save_prefix(&mut self, st: &Self::Session, key: &[u32], kind: SaveKind) -> Result<bool> {
+        let (Some(reuse), Some(incoming)) = (self.reuse.as_mut(), self.step.kept_bytes()) else {
+            return Ok(false);
+        };
+        if !key.len().is_multiple_of(reuse.piece) {
+            return Ok(false);
+        }
+        let path = (self.step.kept_generation(), reuse.piece);
+        // The states of an earlier generation never match again: their bytes go first.
+        reuse.store.retain_path(&path);
+        match (reuse.admit)(usize::try_from(incoming).unwrap_or(usize::MAX)) {
+            Ok(()) => {}
+            Err(EngError::MemoryPlan(_)) => return Ok(false),
+            Err(other) => return Err(other),
+        }
+        let budget = SnapshotBudget {
+            limit: reuse.budget,
+            incoming,
+            size: &Kept::bytes,
+        };
+        let step = &mut self.step;
+        let fed = step.fed();
+        st.save_prefix_budgeted(&mut reuse.store, key, path, fed, kind, budget, || {
+            step.keep()
+        })
+    }
+
+    /// Puts back the longest kept state whose key the prompt begins with below `tip`, and
+    /// drops every longer one: the rest of the prompt is written over the rows those describe.
+    fn restore_prefix_under(
+        &mut self,
+        st: &mut Self::Session,
+        prompt: &[u32],
+        tip: usize,
+    ) -> Result<usize> {
+        let Some(reuse) = self.reuse.as_mut() else {
+            return Ok(0);
+        };
+        let path = (self.step.kept_generation(), reuse.piece);
+        reuse.store.retain_path(&path);
+        let below = &prompt[..tip.min(prompt.len())];
+        let step = &mut self.step;
+        let restored =
+            st.restore_prefix(&mut reuse.store, below, path, |kept| step.put_back(kept))?;
+        if restored > 0 {
+            reuse.store.drop_above(restored);
+        }
+        Ok(restored)
+    }
 }
 
 #[cfg(test)]
@@ -385,8 +521,9 @@ mod tests {
     use super::{BatchPolicy, ExecutorOps, GenerationState, SerialDecode};
     use crate::EngError;
     use crate::family::sampler::{Sampler, SamplingParams};
-    use crate::family::session::{DecodeSession, SaveKind, StoreLimits, TokenStepper};
+    use crate::family::session::{DecodeSession, Kept, SaveKind, StoreLimits, TokenStepper};
     use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer};
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
     const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"a":0},"merges":[]}}"#;
@@ -610,5 +747,329 @@ mod tests {
         state.record_generated(u32::MAX);
         state.record_generated(2);
         assert_eq!(state.remaining_tokens(), Some(0), "counter does not wrap");
+    }
+
+    /// A model whose bits depend on how its rows were cut into chunks, as the batched products
+    /// of a device step do: a running state that folds every chunk with its length, and a row
+    /// per position that holds where in its chunk the token sat. Its "logits" are a fingerprint
+    /// of the running state and of the rows below the position, so a row at or above it is
+    /// never read, and a stale row below it is.
+    struct Chunky {
+        running: u64,
+        rows: Vec<u64>,
+        pos: usize,
+        generation: u64,
+        log: Arc<std::sync::Mutex<Chunks>>,
+    }
+
+    /// What a [`Chunky`] ran: every chunk as (first position, rows, fingerprint after it), and
+    /// the fingerprint behind every decoded token.
+    #[derive(Default, Clone, PartialEq, Debug)]
+    struct Chunks {
+        chunks: Vec<(usize, usize, u64)>,
+        decoded: Vec<u64>,
+    }
+
+    fn mix(a: u64, b: u64) -> u64 {
+        (a ^ b).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29) ^ b
+    }
+
+    impl Chunky {
+        fn new(context: usize, log: &Arc<std::sync::Mutex<Chunks>>) -> Self {
+            Self {
+                running: 0,
+                rows: vec![0; context],
+                pos: 0,
+                generation: 0,
+                log: Arc::clone(log),
+            }
+        }
+
+        fn fingerprint(&self) -> u64 {
+            self.rows[..self.pos]
+                .iter()
+                .fold(self.running, |h, &row| mix(h, row))
+        }
+
+        fn run(&mut self, tokens: &[u32]) {
+            if self.pos == 0 {
+                self.generation += 1;
+            }
+            let n = tokens.len() as u64;
+            self.running = mix(self.running, n);
+            for (at, &token) in tokens.iter().enumerate() {
+                self.running = mix(self.running, u64::from(token));
+                self.rows[self.pos + at] = mix(self.running, (n << 32) | at as u64);
+            }
+            let first = self.pos;
+            self.pos += tokens.len();
+            let after = self.fingerprint();
+            let mut log = self.log.lock().unwrap();
+            log.chunks.push((first, tokens.len(), after));
+        }
+    }
+
+    impl TokenStepper for Chunky {
+        const OPERATION: &'static str = "test_chunky";
+
+        fn feed(&mut self, token: u32) -> Result<(), EngError> {
+            self.feed_rows(&[token])
+        }
+
+        fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+            self.run(tokens);
+            Ok(())
+        }
+
+        fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+            self.run(&[token]);
+            let row = self.fingerprint();
+            self.log.lock().unwrap().decoded.push(row);
+            Ok(vec![1.0])
+        }
+
+        fn fed(&self) -> usize {
+            self.pos
+        }
+
+        fn reset(&mut self) -> Result<(), EngError> {
+            (self.running, self.pos) = (0, 0);
+            Ok(())
+        }
+
+        fn kept_bytes(&self) -> Option<u64> {
+            Some(8)
+        }
+
+        fn keep(&mut self) -> Result<Kept, EngError> {
+            Ok(Kept {
+                rows: self.pos,
+                parts: vec![self.running.to_le_bytes().to_vec()],
+            })
+        }
+
+        fn put_back(&mut self, kept: &Kept) -> Result<(), EngError> {
+            let bytes: [u8; 8] = kept.parts[0][..].try_into().expect("eight bytes");
+            (self.running, self.pos) = (u64::from_le_bytes(bytes), kept.rows);
+            Ok(())
+        }
+
+        fn kept_generation(&self) -> u64 {
+            self.generation
+        }
+    }
+
+    /// The prompt piece of the worker in the reuse tests, and the context of the model.
+    const PIECE: usize = 256;
+    const CONTEXT: usize = 8192;
+    /// The tokens after the last message boundary of a test prompt.
+    const TAIL: usize = 4;
+
+    /// An engine over a [`Chunky`] on the real worker. `kept_piece` is the piece the executor
+    /// keeps states at (`None` leaves reuse off); the worker's piece is [`PIECE`].
+    struct Served {
+        engine: crate::sched::worker::Engine,
+        log: Arc<std::sync::Mutex<Chunks>>,
+    }
+
+    impl Served {
+        fn start(kept_piece: Option<usize>) -> Self {
+            let log = Arc::new(std::sync::Mutex::new(Chunks::default()));
+            let thread_log = Arc::clone(&log);
+            let engine = crate::sched::worker::spawn_engine(PIECE, move |_| {
+                let step = Chunky::new(CONTEXT, &thread_log);
+                let mut executor = SerialDecode::new(step, vec![], 1, CONTEXT);
+                if let Some(piece) = kept_piece {
+                    executor = executor.with_reuse(piece, None, |_| Ok(()));
+                }
+                Ok((executor, DecodeSession::default()))
+            })
+            .expect("the engine starts");
+            Self { engine, log }
+        }
+
+        /// Serves `prompt`, whose last message ends [`TAIL`] tokens before its end, and three
+        /// tokens after it. Returns what the model ran, the tokens and the reused count.
+        fn request(&self, prompt: &[u32]) -> (Chunks, Vec<u32>, u32) {
+            *self.log.lock().unwrap() = Chunks::default();
+            let generation = new_state().with_max_tokens(3);
+            let (job, mut handle) =
+                crate::sched::job::Job::new(prompt.to_vec(), generation).expect("a job");
+            let job = job
+                .with_prefix_boundary(prompt.len() - TAIL)
+                .expect("a boundary inside the prompt");
+            assert!(
+                self.engine.handle().try_submit(job).is_ok(),
+                "the job queues"
+            );
+            let (mut tokens, mut reused) = (Vec::new(), None);
+            while let Some(event) = handle.events.blocking_recv() {
+                match event {
+                    crate::sched::job::JobEvent::Batch(batch) => tokens.extend(batch.tokens),
+                    crate::sched::job::JobEvent::Finished(usage) => {
+                        reused = Some(usage.reused_tokens);
+                    }
+                    crate::sched::job::JobEvent::Error(error) => panic!("{error:?}"),
+                    crate::sched::job::JobEvent::Started => {}
+                }
+            }
+            let ran = self.log.lock().unwrap().clone();
+            (ran, tokens, reused.expect("the job finished"))
+        }
+
+        /// What a cold start runs: the same request on an engine that has served nothing.
+        fn cold(kept_piece: Option<usize>, prompt: &[u32]) -> (Chunks, Vec<u32>) {
+            let (ran, tokens, reused) = Self::start(kept_piece).request(prompt);
+            assert_eq!(reused, 0, "a cold start reuses nothing");
+            (ran, tokens)
+        }
+    }
+
+    fn ids(count: usize, salt: u32) -> Vec<u32> {
+        (0..count as u32)
+            .map(|i| (i ^ salt).wrapping_mul(2_654_435_761) >> 12)
+            .collect()
+    }
+
+    /// The reused request ran exactly the chunks of the cold one above `kept`, on the same
+    /// bits, and decoded from the same bits.
+    fn assert_the_chunks_of_the_cold_start(warm: &Chunks, cold: &Chunks, kept: usize) {
+        // A key of `kept` tokens is the state after `kept - 1` rows.
+        let above: Vec<_> = cold
+            .chunks
+            .iter()
+            .copied()
+            .filter(|&(first, _, _)| first + 1 >= kept)
+            .collect();
+        assert_eq!(
+            warm.chunks.first().map(|c| c.0),
+            Some(kept - 1),
+            "the first row fed"
+        );
+        assert_eq!(warm.chunks, above, "the chunks above the kept position");
+        assert_eq!(
+            warm.decoded, cold.decoded,
+            "the rows behind the decoded tokens"
+        );
+    }
+
+    /// The acceptance case: request 1, then request 2 = request 1, its completion and a new
+    /// turn. Request 2 starts from the state kept at the last block boundary below request 1's
+    /// tip, feeds only the rows above it, and runs the chunks its cold start runs.
+    #[test]
+    fn a_reused_request_runs_the_chunks_of_its_cold_start_with_the_same_boundary_mark() {
+        let served = Served::start(Some(PIECE));
+        let first = ids(2_600, 1);
+        let (_, completion, reused) = served.request(&first);
+        assert_eq!(reused, 0);
+        let mut second = first.clone();
+        second.extend(&completion);
+        second.extend(ids(300, 2));
+        let (warm, warm_tokens, reused) = served.request(&second);
+        // The tip of request 1 is 2,596 tokens: its block spacing is 1,024, its cut 2,048.
+        assert_eq!(reused, 2_048);
+        let (cold, cold_tokens) = Served::cold(Some(PIECE), &second);
+        assert_the_chunks_of_the_cold_start(&warm, &cold, 2_048);
+        assert_eq!(warm_tokens, cold_tokens);
+        // A third turn starts from the cut request 2 left, wherever it is.
+        let mut third = second.clone();
+        third.extend(&warm_tokens);
+        third.extend(ids(1_500, 3));
+        let (warm, _, reused) = served.request(&third);
+        assert_eq!(reused, 2_048, "request 2 cut where request 1 had");
+        let (cold, _) = Served::cold(Some(PIECE), &third);
+        assert_the_chunks_of_the_cold_start(&warm, &cold, 2_048);
+        let mut fourth = third.clone();
+        fourth.extend(ids(40, 4));
+        let (warm, _, reused) = served.request(&fourth);
+        assert_eq!(reused, 4_096, "request 3 cut one block further");
+        let (cold, _) = Served::cold(Some(PIECE), &fourth);
+        assert_the_chunks_of_the_cold_start(&warm, &cold, 4_096);
+    }
+
+    /// The model of these tests can see a wrong cut: an executor that keeps the state at the
+    /// tip itself, which is no multiple of the worker's piece, serves other bits than the cold
+    /// start. This is the restore the executor refuses.
+    #[test]
+    fn a_state_kept_off_the_piece_lattice_would_not_have_the_bits_of_a_cold_start() {
+        let served = Served::start(Some(1));
+        let first = ids(2_600, 1);
+        let (_, completion, _) = served.request(&first);
+        let mut second = first.clone();
+        second.extend(&completion);
+        second.extend(ids(300, 2));
+        let (warm, _, reused) = served.request(&second);
+        assert_eq!(reused, 2_596, "the tip of request 1");
+        let (cold, _) = Served::cold(Some(1), &second);
+        assert_ne!(warm.decoded, cold.decoded);
+    }
+
+    /// A request repeated, and a second conversation that shares the head of the first, both
+    /// start from the kept state and both have the chunks of their cold start.
+    #[test]
+    fn a_repeated_request_and_a_fork_below_the_tip_reuse_the_kept_state() {
+        let served = Served::start(Some(PIECE));
+        let first = ids(2_600, 1);
+        served.request(&first);
+        let (warm, _, reused) = served.request(&first);
+        assert_eq!(reused, 2_048);
+        let (cold, _) = Served::cold(Some(PIECE), &first);
+        assert_the_chunks_of_the_cold_start(&warm, &cold, 2_048);
+        let mut fork = first[..2_300].to_vec();
+        fork.extend(ids(900, 5));
+        let (warm, _, reused) = served.request(&fork);
+        assert_eq!(reused, 2_048);
+        let (cold, _) = Served::cold(Some(PIECE), &fork);
+        assert_the_chunks_of_the_cold_start(&warm, &cold, 2_048);
+    }
+
+    /// What is not reused, each served with the bits of its cold start: a prompt whose tip is
+    /// not above the kept key (the cold start cuts at its tip below the key), a prompt after
+    /// another sequence wrote over the rows, and a prompt that leaves the kept one below the
+    /// key.
+    #[test]
+    fn a_kept_state_is_refused_at_or_above_the_tip_and_after_another_sequence() {
+        let first = ids(2_600, 1);
+        let all_cold = |prompt: &[u32], served: &Served| {
+            let (ran, tokens, reused) = served.request(prompt);
+            assert_eq!(reused, 0);
+            assert_eq!((ran, tokens), Served::cold(Some(PIECE), prompt));
+        };
+        // The generation tail spans the kept key: tip 2,046, key 2,048, prompt 2,050.
+        let served = Served::start(Some(PIECE));
+        served.request(&first);
+        all_cold(&first[..2_050], &served);
+        // Another sequence from position 0, then the first conversation again.
+        let served = Served::start(Some(PIECE));
+        served.request(&first);
+        served.request(&ids(40, 9));
+        all_cold(&first, &served);
+        // A prompt that differs below the key.
+        let served = Served::start(Some(PIECE));
+        served.request(&first);
+        let mut other = first.clone();
+        other[2_000] ^= 1;
+        all_cold(&other, &served);
+    }
+
+    /// Without `with_reuse`, and for a model that keeps no state, the executor is the one it
+    /// was: the default limits, nothing saved, nothing restored.
+    #[test]
+    fn reuse_is_off_unless_asked_for_and_the_model_keeps_its_state() {
+        let off = SerialDecode::new(
+            Chunky::new(8, &Arc::new(std::sync::Mutex::new(Chunks::default()))),
+            vec![],
+            1,
+            8,
+        );
+        assert_eq!(off.prefix_limits(), StoreLimits::default());
+        let keeps_none =
+            SerialDecode::new(Step::default(), vec![], 1, 4).with_reuse(PIECE, None, |_| Ok(()));
+        assert_eq!(keeps_none.prefix_limits(), StoreLimits::default());
+        let served = Served::start(None);
+        let first = ids(2_600, 1);
+        served.request(&first);
+        let (_, _, reused) = served.request(&first);
+        assert_eq!(reused, 0);
     }
 }

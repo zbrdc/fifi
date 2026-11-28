@@ -368,10 +368,9 @@ fn setup_slot<E: ExecutorOps>(
         slot.job.generation.remaining_tokens(),
         slot.job.prefix_boundary.is_some(),
     )?;
-    let restored = if slot.job.prefix_boundary.is_some() {
-        executor.restore_prefix(&mut slot.session, &slot.job.prompt)?
-    } else {
-        0
+    let restored = match slot.job.prefix_boundary {
+        Some(tip) => executor.restore_prefix_under(&mut slot.session, &slot.job.prompt, tip)?,
+        None => 0,
     };
     if restored >= slot.job.prompt.len() {
         return Err(EngError::BadRequest(

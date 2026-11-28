@@ -91,6 +91,11 @@ impl State {
         }
     }
 
+    /// The buffers a sequence cannot cut back to an earlier position: the rings and the records.
+    pub(crate) fn running(&self) -> impl Iterator<Item = &DeviceBuffer> {
+        self.ring.iter().chain(self.record.iter())
+    }
+
     /// Every carried buffer.
     pub(crate) fn buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
         let delta = self.ring.iter().chain(self.record.iter());

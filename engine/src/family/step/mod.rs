@@ -15,7 +15,8 @@
 //! attention, each over one row or a chunk.
 //!
 //! [`state`] is what a step carries from token to token: the rings, records and cache planes of
-//! its visits. [`scratch`] is where a step's scratch comes from: one declaration both plans and allocates
+//! its visits. [`keep`] copies the part of it that cannot be cut back to an earlier position, so
+//! a later request can start from that position. [`scratch`] is where a step's scratch comes from: one declaration both plans and allocates
 //! it. [`head`] is the final norm and the projection onto the vocabulary. [`replay`] records a
 //! one-row step once and replays it, so a decode step is one call. [`tail`] is the token tail of
 //! a decode step: the embedding gather before it and the pick after it, on the device.
@@ -30,6 +31,7 @@ pub(crate) mod depth;
 pub(crate) mod experts;
 pub(crate) mod ffn;
 pub(crate) mod head;
+pub(crate) mod keep;
 pub(crate) mod moe;
 pub(crate) mod recipe;
 pub(crate) mod replay;

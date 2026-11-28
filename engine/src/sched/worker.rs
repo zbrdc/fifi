@@ -1242,7 +1242,7 @@ fn start<E: ExecutorOps>(
     let prefill_chunk = request_prefill_chunk(executor, session, prefill_chunk);
     let cancel = &generation.cancel;
     let restored = match plan.boundary {
-        Some(_) => executor.restore_prefix(session, plan.tokens)?,
+        Some(tip) => executor.restore_prefix_under(session, plan.tokens, tip)?,
         None => 0,
     };
     if restored >= plan.tokens.len() {

@@ -26,6 +26,7 @@ use std::rc::Rc;
 
 use crate::EngError;
 use crate::family::project::cuda::CudaWeights;
+use crate::family::session::Kept;
 use crate::family::step::recipe::Layer;
 #[cfg(test)]
 use crate::family::step::recipe::{Forward, Mixer};
@@ -34,7 +35,7 @@ use crate::family::step::rows::Map;
 use crate::family::step::scratch::{Count, OnDevice, Zeroed};
 use crate::family::step::state::{Slots, State};
 use crate::family::step::tail::Tail;
-use crate::family::step::{attend, delta};
+use crate::family::step::{attend, delta, keep};
 use crate::kernels::cuda::resident::embed::EmbedTable;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::step_params::{
@@ -584,6 +585,46 @@ impl<'a> LoopStep<'a> {
     pub(crate) fn reset(&mut self) -> Result<(), EngError> {
         self.state.reset(&self.stream)?;
         self.rows.core.cur.set(0);
+        Ok(())
+    }
+
+    /// Starts a new sequence on the rows the planes hold: the GDN state and the conv rings
+    /// return to zeros and the planes stay. A step reads no cache row at or above its position,
+    /// so the new sequence has the bits it has after [`Self::reset`], and a sequence that
+    /// returns to a kept state finds its rows below that position.
+    pub(crate) fn reset_running(&mut self) -> Result<(), EngError> {
+        keep::reset_running(&self.state, &self.stream)?;
+        self.rows.core.cur.set(0);
+        Ok(())
+    }
+
+    /// The bytes of one [`Kept`] of this step.
+    pub(crate) fn kept_bytes(&self) -> u64 {
+        keep::bytes(&self.state)
+    }
+
+    /// The GDN state and the conv rings after `rows` positions, once the queued steps ran.
+    pub(crate) fn keep(&self, rows: usize) -> Result<Kept, EngError> {
+        keep::keep(&self.state, &self.stream, rows)
+    }
+
+    /// Returns to a kept state. The copies land in the buffers the recorded steps name, so both
+    /// records stay valid: the next decode step replays.
+    pub(crate) fn put_back(&mut self, kept: &Kept) -> Result<(), EngError> {
+        keep::put_back(&self.state, &self.stream, kept)?;
+        self.rows.core.cur.set(0);
+        Ok(())
+    }
+
+    /// Fills every cache plane from row `from` on with the two bytes `word`, for the test that
+    /// shows a step reads no row at or above its position.
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn fill_planes(&self, from: usize, word: [u8; 2]) -> Result<(), EngError> {
+        let row = self.shape.heads_kv * self.shape.head_dim * 2;
+        let fill: Vec<u8> = word.repeat((self.cache_rows - from) * row / 2);
+        for buffer in self.state.buffers().skip(self.state.running().count()) {
+            buffer.write_at(&self.stream, from * row, &fill)?;
+        }
         Ok(())
     }
 

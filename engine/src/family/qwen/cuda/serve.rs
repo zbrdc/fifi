@@ -33,7 +33,7 @@ use crate::family::project::gguf::{GgufMatrix, GgufProjector};
 use crate::family::qwen::recipe::{Model, ROUTED_EXPERTS, layers, routed_experts, tensors};
 use crate::family::qwen::sensenova::weights::LoopWeights;
 use crate::family::sampler::Sampler;
-use crate::family::session::{DecodeSession, TokenStepper, sample_logits};
+use crate::family::session::{DecodeSession, Kept, TokenStepper, sample_logits};
 use crate::family::step::tail::device_table;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::resident::embed::EmbedTable;
@@ -150,7 +150,14 @@ pub(crate) fn start(
             "{family} cuda: ready in {:.1} s; the card step serves {rows} positions",
             began.elapsed().as_secs_f64()
         );
-        let executor = SerialDecode::new(card, eos, sampler_vocab, rows);
+        // An entry whose configuration marks no prompt boundary never reaches the kept states.
+        let budget =
+            crate::family::mem::host_store_budget(crate::family::mem::process_resident_bytes());
+        let executor = SerialDecode::new(card, eos, sampler_vocab, rows).with_reuse(
+            PREFILL_ROWS,
+            budget,
+            crate::family::step::keep::admit,
+        );
         Ok((executor, DecodeSession::default()))
     })?;
     let context = match resolved.recv() {
@@ -181,6 +188,10 @@ pub(crate) struct CardStep {
     embd: GgufMatrix,
     projector: GgufProjector,
     pos: usize,
+    /// Counts the sequences that started at position 0 and the clears after a failure.
+    generation: u64,
+    /// A step failed since the last clear: what the planes hold is unknown.
+    failed: bool,
 }
 
 impl CardStep {
@@ -203,7 +214,32 @@ impl CardStep {
             embd: GgufMatrix::new(file.header(), "token_embd.weight", vocab, hidden)?,
             projector: GgufProjector::new(Arc::clone(file)),
             pos: 0,
+            generation: 0,
+            failed: false,
         })
+    }
+
+    /// Before a step at the stepper's position: a step at position 0 starts a sequence that
+    /// writes over the rows of the one before.
+    fn begin(&mut self) {
+        if self.pos == 0 {
+            self.generation += 1;
+        }
+    }
+
+    /// Notes a failed step, so the next reset clears everything the step carries.
+    fn checked<T>(&mut self, result: Result<T, EngError>) -> Result<T, EngError> {
+        self.failed |= result.is_err();
+        result
+    }
+
+    /// The logits row the last step left on the device.
+    #[cfg(test)]
+    pub(crate) fn last_logits(&self) -> Result<Vec<u8>, EngError> {
+        let logits = self.step.logits_row();
+        let mut bytes = vec![0u8; logits.bytes()];
+        logits.read_at(self.step.stream(), 0, &mut bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -224,19 +260,24 @@ impl TokenStepper for CardStep {
 
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
         let rows = self.projector.rows(&self.embd, tokens)?;
-        self.step.prefill(&rows, self.pos)?;
+        self.begin();
+        let fed = self.step.prefill(&rows, self.pos);
+        self.checked(fed)?;
         self.pos += tokens.len();
         Ok(())
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
         let row = self.projector.rows(&self.embd, &[token])?;
-        self.step.decode(&row, self.pos)?;
+        self.begin();
+        let stepped = self.step.decode(&row, self.pos);
+        self.checked(stepped)?;
         self.pos += 1;
         // The read is enqueued on the step's stream, behind its kernels.
         let logits = self.step.logits_row();
         let mut bytes = vec![0u8; logits.bytes()];
-        logits.read_at(self.step.stream(), 0, &mut bytes)?;
+        let read = logits.read_at(self.step.stream(), 0, &mut bytes);
+        self.checked(read)?;
         Ok(bytes
             .as_chunks::<4>()
             .0
@@ -262,9 +303,12 @@ impl TokenStepper for CardStep {
             && sampler.first_top2_margin().is_some();
         if !on_device {
             let logits = self.logits(token)?;
-            return sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab);
+            let drawn = sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab);
+            return self.checked(drawn);
         }
-        let picked = self.step.decode_token(token, self.pos, sampler_vocab)?;
+        self.begin();
+        let picked = self.step.decode_token(token, self.pos, sampler_vocab);
+        let picked = self.checked(picked)?;
         self.pos += 1;
         sampler.record_device_greedy(picked);
         Ok(picked)
@@ -274,10 +318,39 @@ impl TokenStepper for CardStep {
         self.pos
     }
 
+    /// A new sequence: the running state returns to zeros and the cache rows stay, for a later
+    /// request that returns to a kept state. After a failed step everything is cleared and no
+    /// kept state matches any more.
     fn reset(&mut self) -> Result<(), EngError> {
-        self.step.reset()?;
+        if self.failed {
+            self.step.reset()?;
+            self.generation += 1;
+            self.failed = false;
+        } else {
+            self.step.reset_running()?;
+        }
         self.pos = 0;
         Ok(())
+    }
+
+    fn kept_bytes(&self) -> Option<u64> {
+        Some(self.step.kept_bytes())
+    }
+
+    fn keep(&mut self) -> Result<Kept, EngError> {
+        let kept = self.step.keep(self.pos);
+        self.checked(kept)
+    }
+
+    fn put_back(&mut self, kept: &Kept) -> Result<(), EngError> {
+        let put = self.step.put_back(kept);
+        self.checked(put)?;
+        self.pos = kept.rows;
+        Ok(())
+    }
+
+    fn kept_generation(&self) -> u64 {
+        self.generation
     }
 }
 
