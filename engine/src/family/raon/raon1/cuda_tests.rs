@@ -1442,21 +1442,23 @@ fn a_reused_turn_has_the_bits_of_its_cold_start_with_the_same_boundary_mark() {
 }
 
 /// Non-greedy sampled decode through `RaonStep::next_token` (device shortlist + softmax-mass
-/// certificate) matches host `Sampler::sample` token-for-token and top-2 margin bit-for-bit across
-/// bounded `top_k <= 20`, open-vocabulary `top_k == 0`, and host-fallback (`top_k > 20`, capture).
+/// certificate) matches host `Sampler::sample` token-for-token, RNG state, and top-2 margin
+/// bit-for-bit across bounded `top_k <= 20`, narrower `sampler_vocab < vocab`, open-vocabulary
+/// `top_k == 0` (certified and uncertified fallback), and host-fallback (`top_k > 20`, capture).
 #[test]
 #[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
 fn device_sampled_requests_match_host_sampler_token_for_token() {
     use std::time::Instant;
 
     use super::serve::RaonStep;
-    use crate::family::sampler::{Sampler, SamplingParams};
+    use crate::family::sampler::{Sampler, SamplingParams, open_draws};
     use crate::family::session::TokenStepper;
 
     let path = model_path();
     require_device("device_sampled_requests_match_host_sampler_token_for_token");
     let device = Raon1Device::load(&path, Some(2048), &mut |_| {}).expect("device load");
     let vocab = device.vocab();
+    let narrow_vocab = vocab - 17;
     let mut step = RaonStep::over(device);
     let prompt = &PROMPT[..];
     let steps = 16usize;
@@ -1466,51 +1468,96 @@ fn device_sampled_requests_match_host_sampler_token_for_token() {
             "bounded_k20",
             SamplingParams::new(0.8, 0.9, 20).unwrap(),
             42u64,
+            vocab,
+            false,
+            false,
+        ),
+        (
+            "bounded_narrow",
+            SamplingParams::new(0.8, 0.9, 10).unwrap(),
+            13u64,
+            narrow_vocab,
+            false,
+            false,
         ),
         (
             "open_p95",
             SamplingParams::new(0.8, 0.95, 0).unwrap(),
             42u64,
+            vocab,
+            false,
+            false,
         ),
-        ("open_p100", SamplingParams::new(1.0, 1.0, 0).unwrap(), 7u64),
+        (
+            "open_narrow",
+            SamplingParams::new(0.8, 0.95, 0).unwrap(),
+            19u64,
+            narrow_vocab,
+            false,
+            false,
+        ),
+        (
+            "open_hot_fallback",
+            SamplingParams::new(2.0, 1.0, 0).unwrap(),
+            7u64,
+            vocab,
+            false,
+            true,
+        ),
         (
             "fallback_k50",
             SamplingParams::new(0.8, 0.95, 50).unwrap(),
             99u64,
+            vocab,
+            false,
+            false,
+        ),
+        (
+            "fallback_capture",
+            SamplingParams::new(0.8, 0.9, 10).unwrap(),
+            55u64,
+            vocab,
+            true,
+            false,
         ),
     ];
 
-    for (label, params, seed) in cases {
+    for (label, params, seed, svocab, arm_capture, expect_fallback) in cases {
         // Host reference via full logits readback + Sampler::sample.
         step.reset().expect("reset host");
         step.feed_rows(&prompt[..prompt.len() - 1])
             .expect("prefill host");
         let mut host_sampler = Sampler::new(params, seed);
+        let host_cap = arm_capture.then(|| host_sampler.arm_capture(4));
         let mut tok = *prompt.last().unwrap();
         let mut want = Vec::with_capacity(steps);
         let t_host = Instant::now();
         for _ in 0..steps {
             let logits = step.logits(tok).expect("logits");
-            tok = host_sampler.sample(&logits[..vocab]).expect("host sample");
+            tok = host_sampler.sample(&logits[..svocab]).expect("host sample");
             want.push(tok);
         }
         let host_s = t_host.elapsed().as_secs_f64();
 
         // Device shortlist / certificate path via TokenStepper::next_token.
+        let (draws0, fallbacks0) = open_draws::counts();
         step.reset().expect("reset dev");
         step.feed_rows(&prompt[..prompt.len() - 1])
             .expect("prefill dev");
         let mut dev_sampler = Sampler::new(params, seed);
+        let dev_cap = arm_capture.then(|| dev_sampler.arm_capture(4));
         let mut tok = *prompt.last().unwrap();
         let mut got = Vec::with_capacity(steps);
         let t_dev = Instant::now();
         for _ in 0..steps {
             tok = step
-                .next_token(tok, &mut dev_sampler, vocab)
+                .next_token(tok, &mut dev_sampler, svocab)
                 .expect("next_token");
             got.push(tok);
         }
         let dev_s = t_dev.elapsed().as_secs_f64();
+        let (draws1, fallbacks1) = open_draws::counts();
+        let (draws_d, fallbacks_d) = (draws1 - draws0, fallbacks1 - fallbacks0);
 
         assert!(
             step.device().decode_replayed(),
@@ -1518,13 +1565,37 @@ fn device_sampled_requests_match_host_sampler_token_for_token() {
         );
         assert_eq!(got, want, "{label}: token stream mismatch");
         assert_eq!(
+            dev_sampler.rng_state(),
+            host_sampler.rng_state(),
+            "{label}: rng_state mismatch"
+        );
+        assert_eq!(
             dev_sampler.first_top2_margin().map(f32::to_bits),
             host_sampler.first_top2_margin().map(f32::to_bits),
             "{label}: first_top2_margin mismatch"
         );
+        if let (Some(h), Some(d)) = (host_cap, dev_cap) {
+            let (h_len, d_len) = (
+                h.lock().unwrap().positions.len(),
+                d.lock().unwrap().positions.len(),
+            );
+            assert_eq!(d_len, h_len, "{label}: capture positions");
+            assert_eq!(d_len, 4, "{label}: expected 4 captured positions");
+        }
+        if !arm_capture && params.top_k() == 0 {
+            assert_eq!(draws_d, steps as u64, "{label}: expected open device draws");
+            if expect_fallback {
+                assert!(
+                    fallbacks_d > 0,
+                    "{label}: expected uncertified open fallback"
+                );
+            }
+        } else {
+            assert_eq!(draws_d, 0, "{label}: unexpected open device draws");
+        }
         eprintln!(
-            "raon sampled {label}: {steps} tokens match host exact | host {:.1} tok/s ({:.3} s) | \
-             device {:.1} tok/s ({:.3} s)",
+            "raon sampled {label}: {steps} tokens match host exact (open_draws={draws_d}, \
+             fallbacks={fallbacks_d}) | host {:.1} tok/s ({:.3} s) | device {:.1} tok/s ({:.3} s)",
             steps as f64 / host_s,
             host_s,
             steps as f64 / dev_s,

@@ -114,7 +114,7 @@ pub(crate) struct Widths {
 }
 
 /// The rows every step works in: the residual pair, the normed input of a branch, the rows of a
-/// mixer, the scratch of the batched product and the logits row.
+/// mixer, the scratch of the batched product, the logits row and the shortlist scratch.
 pub(crate) struct Core<B = DeviceBuffer> {
     pub(crate) resid: [B; 2],
     /// Which plane of the pair holds the residual.

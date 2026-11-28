@@ -3,9 +3,10 @@
 //! Tracks the consumed sequence position, the cache generation (bumped when a new sequence writes
 //! at position 0 or after a full failure reset), and whether a step failed since the last full
 //! clear. Greedy single-token steps pick on the device when the model has a resident embedding
-//! table and the sampler does not need host logits; all other steps read logits back to the host
-//! sampler. Host-memory denials (`EngError::MemoryPlan`) during `keep` or `put_back` leave device
-//! state intact and do not latch failure.
+//! table and the sampler does not need host logits; non-greedy requests with `top_k <= 20` or open
+//! vocabulary draw via the host-equal device shortlist and softmax-mass certificate; other steps
+//! read logits back to the host sampler. Host-memory denials (`EngError::MemoryPlan`) during
+//! `keep` or `put_back` leave device state intact and do not latch failure.
 
 use crate::EngError;
 use crate::family::sampler::Sampler;
@@ -62,25 +63,31 @@ pub(crate) trait DeviceStep {
         sampler_vocab: usize,
     ) -> Result<u32, EngError>;
 
-    /// Whether [`Self::sample_token`] can draw non-greedy requests on the device via the
+    /// Whether [`Self::sample_from_logits`] can draw non-greedy requests on the device via the
     /// host-equal shortlist and softmax-mass certificate.
     fn takes_shortlist(&self) -> bool {
         self.shortlist_io().is_some()
     }
 
-    /// Runs one decode step at `pos` leaving logits on the device and draws one token via
+    /// Draws one token from the logits row left on the device by [`Self::decode_to_logits`] via
     /// `sampler`'s host-equal shortlist or open-vocabulary certificate path.
-    fn sample_token(
-        &mut self,
-        token: u32,
-        pos: usize,
+    fn sample_from_logits(
+        &self,
         sampler: &mut Sampler,
         sampler_vocab: usize,
     ) -> Result<u32, EngError> {
-        self.decode_to_logits(token, pos)?;
         let io = self.shortlist_io().ok_or_else(|| {
             EngError::BadRequest("this device step has no shortlist scratch".into())
         })?;
+        if sampler_vocab == 0 || sampler_vocab > io.vocab {
+            return Err(EngError::Backend {
+                operation: Self::OPERATION,
+                message: format!(
+                    "logits row has {} entries, need at least {sampler_vocab}",
+                    io.vocab
+                ),
+            });
+        }
         sample_shortlist(
             io.ctx,
             io.stream,
@@ -195,12 +202,11 @@ impl<D: DeviceStep> TokenStepper for DeviceStepper<D> {
         }
         if self.device.takes_shortlist() && can_shortlist_sample(sampler) {
             self.begin();
-            let picked = self
-                .device
-                .sample_token(token, self.pos, sampler, sampler_vocab);
-            let picked = self.checked(picked)?;
+            let decoded = self.device.decode_to_logits(token, self.pos);
+            self.checked(decoded)?;
             self.pos += 1;
-            return Ok(picked);
+            let picked = self.device.sample_from_logits(sampler, sampler_vocab);
+            return self.checked(picked);
         }
         let logits = self.logits(token)?;
         let drawn = sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab);
@@ -270,13 +276,14 @@ mod tests {
         full_resets: usize,
         running_resets: usize,
         device_picks: usize,
-        shortlist_picks: usize,
         host_logits: usize,
         fail_keep: Cell<Option<EngError>>,
         fail_put_back: Option<EngError>,
         fail_feed: bool,
+        fail_decode: bool,
         fail_reset_running: bool,
         fail_sample_token: bool,
+        shortlist_decodes: usize,
     }
 
     impl DeviceStep for FakeDevice {
@@ -289,6 +296,17 @@ mod tests {
                     message: "injected feed error".into(),
                 });
             }
+            Ok(())
+        }
+
+        fn decode_to_logits(&mut self, _token: u32, _pos: usize) -> Result<(), EngError> {
+            if self.fail_decode {
+                return Err(EngError::Backend {
+                    operation: Self::OPERATION,
+                    message: "injected decode error".into(),
+                });
+            }
+            self.shortlist_decodes += 1;
             Ok(())
         }
 
@@ -315,20 +333,17 @@ mod tests {
             self.takes_shortlist
         }
 
-        fn sample_token(
-            &mut self,
-            _token: u32,
-            _pos: usize,
+        fn sample_from_logits(
+            &self,
             sampler: &mut Sampler,
             sampler_vocab: usize,
         ) -> Result<u32, EngError> {
             if self.fail_sample_token {
                 return Err(EngError::Backend {
                     operation: Self::OPERATION,
-                    message: "injected sample_token error".into(),
+                    message: "injected sample_from_logits error".into(),
                 });
             }
-            self.shortlist_picks += 1;
             let ranked = [(1u32, 2.0f32), (2, 1.0), (0, 0.0)];
             if sampler.open_draw_on_device() {
                 let top = 2.0_f64;
@@ -505,8 +520,9 @@ mod tests {
         let got = step.next_token(0, &mut bounded, 3).unwrap();
         let want = bounded_ref.sample(&[0.0, 2.0, 1.0]).unwrap();
         assert_eq!(got, want);
+        assert_eq!(bounded.rng_state(), bounded_ref.rng_state());
         assert_eq!(bounded.first_top2_margin(), bounded_ref.first_top2_margin());
-        assert_eq!(step.device().shortlist_picks, 1);
+        assert_eq!(step.device().shortlist_decodes, 1);
         assert_eq!(step.device().host_logits, 0);
 
         // Open-vocabulary top_k == 0 takes shortlist + mass certificate even on token 0.
@@ -515,29 +531,42 @@ mod tests {
         let got = step.next_token(1, &mut open, 3).unwrap();
         let want = open_ref.sample(&[0.0, 2.0, 1.0]).unwrap();
         assert_eq!(got, want);
+        assert_eq!(open.rng_state(), open_ref.rng_state());
         assert_eq!(open.first_top2_margin(), open_ref.first_top2_margin());
-        assert_eq!(step.device().shortlist_picks, 2);
+        assert_eq!(step.device().shortlist_decodes, 2);
         assert_eq!(step.device().host_logits, 0);
 
         // top_k > 20 falls back to host logits.
         let mut wide = Sampler::new(SamplingParams::new(0.8, 0.95, 21).unwrap(), 7);
         step.next_token(1, &mut wide, 3).unwrap();
-        assert_eq!(step.device().shortlist_picks, 2);
+        assert_eq!(step.device().shortlist_decodes, 2);
         assert_eq!(step.device().host_logits, 1);
 
         // Armed capture falls back to host logits even when top_k <= 20.
         let mut captured = Sampler::new(SamplingParams::new(0.8, 0.9, 10).unwrap(), 7);
         let _cap = captured.arm_capture(4);
         step.next_token(1, &mut captured, 3).unwrap();
-        assert_eq!(step.device().shortlist_picks, 2);
+        assert_eq!(step.device().shortlist_decodes, 2);
         assert_eq!(step.device().host_logits, 2);
 
-        // Error in sample_token latches full reset and bumps generation.
-        step.device.fail_sample_token = true;
-        let gen0 = step.kept_generation();
+        // Error in decode_to_logits leaves fed unchanged and latches full reset.
+        let pos_before = step.fed();
+        step.device.fail_decode = true;
         assert!(step.next_token(1, &mut bounded, 3).is_err());
+        assert_eq!(step.fed(), pos_before);
+        step.device.fail_decode = false;
+        let gen0 = step.kept_generation();
         step.reset().unwrap();
         assert_eq!(step.device().full_resets, 1);
         assert_eq!(step.kept_generation(), gen0 + 1);
+
+        // Error in sample_from_logits advances fed (token was consumed) and latches full reset.
+        step.device.fail_sample_token = true;
+        assert!(step.next_token(1, &mut bounded, 3).is_err());
+        assert_eq!(step.fed(), 1);
+        let gen1 = step.kept_generation();
+        step.reset().unwrap();
+        assert_eq!(step.device().full_resets, 2);
+        assert_eq!(step.kept_generation(), gen1 + 1);
     }
 }

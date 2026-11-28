@@ -278,13 +278,13 @@ pub(crate) fn read_logits_row(
 fn decode_shortlist(bytes: &[u8], vocab: usize) -> Result<Vec<(u32, f32)>, EngError> {
     if bytes.len() < shortlist::RESULT_BYTES {
         return Err(EngError::Backend {
-            operation: "shortlist",
+            operation: "sample",
             message: "shortlist readback buffer is truncated".to_owned(),
         });
     }
     if bytes[160..164] != [0; 4] {
         return Err(EngError::Backend {
-            operation: "shortlist",
+            operation: "sample",
             message: "device shortlist found non-finite logits".to_owned(),
         });
     }
@@ -345,6 +345,8 @@ pub(crate) fn sample_shortlist(
             },
         )?;
         // Final shortlist record (RESULT_BYTES) and MASS_PARTS f64 partials sit contiguously.
+        const _: () =
+            assert!(shortlist::RESULT_OFFSET + shortlist::RESULT_BYTES == shortlist::MASS_OFFSET);
         const COMBINED: usize = shortlist::RESULT_BYTES + shortlist::MASS_PARTS * 8;
         let mut buf = [0u8; COMBINED];
         scratch.read_at(stream, shortlist::RESULT_OFFSET, &mut buf)?;
@@ -363,4 +365,70 @@ pub(crate) fn sample_shortlist(
     scratch.read_at(stream, shortlist::RESULT_OFFSET, &mut buf)?;
     let candidates = decode_shortlist(&buf, sampler_vocab)?;
     sampler.sample_shortlist(&candidates, sampler_vocab)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::family::sampler::SamplingParams;
+
+    #[test]
+    fn can_shortlist_sample_gates_bounded_open_and_special_samplers() {
+        let greedy = Sampler::greedy();
+        assert!(!can_shortlist_sample(&greedy));
+
+        let k1 = Sampler::new(SamplingParams::new(0.8, 0.9, 1).unwrap(), 1);
+        assert!(can_shortlist_sample(&k1));
+        let k20 = Sampler::new(SamplingParams::new(0.8, 0.9, 20).unwrap(), 1);
+        assert!(can_shortlist_sample(&k20));
+        let k21 = Sampler::new(SamplingParams::new(0.8, 0.9, 21).unwrap(), 1);
+        assert!(!can_shortlist_sample(&k21));
+
+        let open = Sampler::new(SamplingParams::new(0.8, 0.95, 0).unwrap(), 1);
+        assert!(can_shortlist_sample(&open));
+        let open_p0 = Sampler::new(SamplingParams::new(0.8, 0.0, 0).unwrap(), 1);
+        assert!(can_shortlist_sample(&open_p0));
+
+        // Tiny temperature whose f32 reciprocal overflows to +inf cannot run shortlist_mass,
+        // while bounded top_k <= 20 computes softmax in f64 on host and remains eligible.
+        let open_tiny_t = Sampler::new(SamplingParams::new(1e-45, 0.95, 0).unwrap(), 1);
+        assert!(!can_shortlist_sample(&open_tiny_t));
+        let bounded_tiny_t = Sampler::new(SamplingParams::new(1e-45, 0.95, 10).unwrap(), 1);
+        assert!(can_shortlist_sample(&bounded_tiny_t));
+
+        let mut captured = Sampler::new(SamplingParams::new(0.8, 0.9, 10).unwrap(), 1);
+        let _cap = captured.arm_capture(4);
+        assert!(!can_shortlist_sample(&captured));
+    }
+
+    #[test]
+    fn decode_shortlist_validates_bounds_finiteness_and_layout() {
+        let short = [0u8; shortlist::RESULT_BYTES - 1];
+        assert!(matches!(
+            decode_shortlist(&short, 5),
+            Err(EngError::Backend {
+                operation: "sample",
+                ..
+            })
+        ));
+
+        let mut bad = [0u8; shortlist::RESULT_BYTES];
+        bad[160..164].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            decode_shortlist(&bad, 5),
+            Err(EngError::Backend {
+                operation: "sample",
+                ..
+            })
+        ));
+
+        let mut ok = [0u8; shortlist::RESULT_BYTES];
+        let entries = [(42u32, 3.25f32), (7, -1.5), (99, 0.0)];
+        for (i, &(id, logit)) in entries.iter().enumerate() {
+            ok[i * 8..i * 8 + 4].copy_from_slice(&logit.to_le_bytes());
+            ok[i * 8 + 4..i * 8 + 8].copy_from_slice(&id.to_le_bytes());
+        }
+        assert_eq!(decode_shortlist(&ok, 2).unwrap(), entries[..2]);
+        assert_eq!(decode_shortlist(&ok, 3).unwrap(), entries);
+    }
 }

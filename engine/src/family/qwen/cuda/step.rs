@@ -572,6 +572,7 @@ impl<'a> LoopStep<'a> {
     }
 
     /// The logits row (device floats); valid after the stream drained.
+    #[cfg(test)]
     pub(crate) fn logits_row(&self) -> &DeviceBuffer {
         &self.rows.core.logits
     }
@@ -798,6 +799,7 @@ impl<'a> LoopStep<'a> {
     }
 
     /// The step's stream: a read enqueued on it lands behind the step's kernels.
+    #[cfg(test)]
     pub(crate) fn stream(&self) -> &DeviceStream {
         &self.stream
     }

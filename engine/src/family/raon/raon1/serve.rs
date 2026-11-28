@@ -4,8 +4,9 @@
 //! One session per engine, driven by the shared [`SerialDecode`] executor with prompt reuse over
 //! [`DecodeSession`]. The model side is [`RaonStep`], the shared [`DeviceStepper`] over
 //! [`Raon1Device`]: prompt rows run as chunks without the head, greedy decode picks tokens on the
-//! device when the embedding table is resident, and other requests read the logits row back to the
-//! host sampler.
+//! device when the embedding table is resident, non-greedy requests with `top_k <= 20` or open
+//! vocabulary draw via the host-equal device shortlist and softmax-mass certificate, and other
+//! requests read the logits row back to the host sampler.
 
 use std::path::Path;
 
