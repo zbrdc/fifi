@@ -13,10 +13,10 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    HEAD_DIM, RANGES, RelativeAttentionCall, RelativeAttentionShape, STATUS_INVALID_STEP_STATE,
+    HEAD_DIM, RANGES, RelativeAttentionCall, RelativeAttentionShape, RelativeKvFormat,
+    STATUS_INVALID_STEP_STATE,
 };
 use crate::EngError;
-use crate::kernels::cuda::resident::relative_attention::RelativeKvFormat;
 use crate::kernels::metal::context::PARTIALS_BYTES;
 use crate::kernels::metal::testkit::{Padded, Rig, Rng, f32_bytes, floats, sentinel};
 use crate::kernels::metal::{DeviceRange, MetalContext};
@@ -880,7 +880,7 @@ fn the_f16_and_int8_rings_match_the_rule_and_the_reference() {
     let rig = Rig::new();
     let mut rng = Rng::new(0x1D_6E_88_0B);
     for format in [RelativeKvFormat::F16, RelativeKvFormat::Int8] {
-        for (base, position) in [(shape(4, 2, 8, 64, 40), 39), (decode_geometry(8192), 8191)] {
+        for (base, position) in [(shape(4, 2, 8, 64, 40), 39), (inkling(8192), 8191)] {
             let s = RelativeAttentionShape { format, ..base };
             let c = Case::new(&mut rng, s, position);
             let row = s.kv_heads * s.format.head_bytes();
@@ -901,7 +901,7 @@ fn the_f16_and_int8_rings_match_the_rule_and_the_reference() {
                     "{format:?}: the output {i} is not finite: {value}"
                 );
                 let off = (f64::from(value) - want).abs();
-                assert?(
+                assert!(
                     off <= bound,
                     "{format:?}: the output {i} is {value} against {want}: off {off} over the bound {bound}",
                 );
@@ -912,7 +912,7 @@ fn the_f16_and_int8_rings_match_the_rule_and_the_reference() {
             for cell in 0..s.capacity {
                 let at = cell * row..(cell + 1) * row;
                 let (want_k, want_v) = if cell == slot {
-                    (&row_k, &row_v)
+                    (&row_k[..], &row_v[..])
                 } else {
                     (&ring_k[at.clone()], &ring_v[at.clone()])
                 };
@@ -930,10 +930,9 @@ fn the_f16_and_int8_rings_match_the_rule_and_the_reference() {
                 );
             }
             assert_eq!(status(&b), 0, "the status after a valid step");
-            println?(
+            println!(
                 "{format:?} over {} heads, ring {}, position {position}: the worst error is {worst:.3} of the bound",
-                s.query_heads,
-                s.capacity,
+                s.query_heads, s.capacity,
             );
         }
     }
@@ -997,7 +996,11 @@ fn the_int8_commit_stores_zero_nan_and_infinite_groups_by_the_rule() {
             "the status, nan {with_nan}"
         );
         if !marked {
-            assert!(floats(&b.out.read("out")).iter().all(f32::is_finite));
+            assert!(
+                floats(&b.out.read("out"))
+                    .iter()
+                    .all(|value| value.is_finite())
+            );
         }
     }
 }
@@ -1016,7 +1019,7 @@ fn the_ring_formats_are_timed() {
         for (capacity, position) in [(8192usize, 8191i32), (65536, 65535)] {
             let s = RelativeAttentionShape {
                 format,
-                ..decode_geometry(capacity)
+                ..inkling(capacity)
             };
             let c = Case::new(&mut rng, s, position);
             let rings = (ring_bytes(format, &c.ring_k), ring_bytes(format, &c.ring_v));

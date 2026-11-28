@@ -18,7 +18,6 @@
 //! call changes nothing.
 
 use crate::EngError;
-use crate::kernels::cuda::resident::relative_attention::RelativeKvFormat;
 
 use super::super::context::Shared;
 use super::super::frame::Frame;
@@ -49,6 +48,31 @@ fn kernels(format: RelativeKvFormat) -> (&'static str, &'static str) {
 
 /// The one head dimension the step serves.
 pub(crate) const HEAD_DIM: usize = 128;
+
+/// The storage format of the relative-attention K and V rings. Staged inputs and outputs stay
+/// F32; only the ring cells narrow.
+// shortcut: a mirror of `kernels::cuda::resident::relative_attention::RelativeKvFormat`, which
+// no Mac build compiles (`kernels::cuda` is a module only on a Linux CUDA build); one type
+// replaces both when the shared step's types leave the CUDA module.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub(crate) enum RelativeKvFormat {
+    #[default]
+    F32 = 0,
+    F16 = 1,
+    /// Symmetric per-32-element int8 codes followed by four FP16 scales per head (136 B/head).
+    Int8 = 2,
+}
+
+impl RelativeKvFormat {
+    pub(crate) const fn head_bytes(self) -> usize {
+        match self {
+            Self::F32 => HEAD_DIM * 4,
+            Self::F16 => HEAD_DIM * 2,
+            Self::Int8 => HEAD_DIM + (HEAD_DIM / 32) * 2,
+        }
+    }
+}
 const MAX_HEADS: usize = 64;
 const MAX_WORD: usize = (1 << 30) - 1;
 /// The strips the partials are kept for, sixteen rows each up to 8192 rows and longer at a
