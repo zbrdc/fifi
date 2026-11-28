@@ -33,7 +33,9 @@ use crate::family::step::replay::Replay;
 use crate::family::step::rows::Map;
 use crate::family::step::scratch::{OnDevice, Zeroed};
 use crate::family::step::state::{Slots, State};
+use crate::family::step::tail::Tail;
 use crate::family::step::{attend, delta};
+use crate::kernels::cuda::resident::embed::EmbedTable;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, STEP_PARAMS_BYTES, StepParams, ensure_rows,
@@ -76,6 +78,12 @@ pub(crate) enum Carried {
 pub(crate) struct LoopStep<'a> {
     /// The recorded decode step; first, so it drops before the buffers and the stream it uses.
     replay: Replay<usize>,
+    /// The token tail, when the embedding table is on the device, and the record of the step
+    /// that uses it: another list of launches than the step from an embedding row records.
+    tail: Option<Tail>,
+    tail_replay: Replay<usize>,
+    /// The ids the recorded pick ranges over: a pick over another count records again.
+    tail_vocab: usize,
     ctx: Rc<CudaContext>,
     stream: DeviceStream,
     weights: &'a CudaWeights,
@@ -292,6 +300,9 @@ impl<'a> LoopStep<'a> {
             ones_router: ctx.upload(&le_f32(&vec![1.0; 2 * h]))?,
             inv_freq: ctx.upload(&le_f32(&yarn_inv_freq(rope)))?,
             replay: Replay::default(),
+            tail: None,
+            tail_replay: Replay::default(),
+            tail_vocab: 0,
             rows: prefill::open_rows(&ctx, shape, ctx.sm_count() as usize)?,
             shape: *shape,
             family,
@@ -377,6 +388,81 @@ impl<'a> LoopStep<'a> {
         Ok(())
     }
 
+    /// Drops the recorded steps: the next steps record again.
+    pub(super) fn forget_records(&mut self) {
+        self.replay = Replay::default();
+        self.tail_replay = Replay::default();
+    }
+
+    /// Gives the step the embedding table of the file, on the device: a decode step can then
+    /// take a token id and leave the id of the largest logit.
+    pub(crate) fn set_embedding(&mut self, table: EmbedTable) -> Result<(), EngError> {
+        self.tail = Some(Tail::new(&self.ctx, table)?);
+        self.tail_replay = Replay::default();
+        Ok(())
+    }
+
+    /// The context the step runs on.
+    pub(crate) fn context(&self) -> &CudaContext {
+        &self.ctx
+    }
+
+    /// Whether [`Self::decode_token`] is available.
+    pub(crate) fn takes_tokens(&self) -> bool {
+        self.tail.is_some()
+    }
+
+    /// One decode step from a token id at `pos`, wholly on the device: the embedding row is
+    /// gathered there, the step runs, and the id of the largest of the first `vocab` logits is
+    /// what the host reads (a tie goes to the lower id). The logits row stays on the device as
+    /// after [`Self::decode`].
+    pub(crate) fn decode_token(
+        &mut self,
+        token: u32,
+        pos: usize,
+        vocab: usize,
+    ) -> Result<u32, EngError> {
+        let h = self.shape.hidden;
+        if token as usize >= self.shape.vocab || vocab == 0 || vocab > self.shape.vocab {
+            return Err(EngError::BadRequest(format!(
+                "{}: token {token} or a pick over {vocab} ids is outside the vocabulary of {}",
+                self.family, self.shape.vocab
+            )));
+        }
+        ensure_rows(pos, 1, self.cache_rows)?;
+        let Some(tail) = &self.tail else {
+            return Err(EngError::BadRequest(format!(
+                "{}: the step has no embedding table on the device",
+                self.family
+            )));
+        };
+        let params = StepParams::new(token as i32, pos as i32)?;
+        self.params
+            .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
+        if self.tail_vocab != vocab {
+            (self.tail_replay, self.tail_vocab) = (Replay::default(), vocab);
+        }
+        let mut replay = std::mem::take(&mut self.tail_replay);
+        let left = replay.run(&self.ctx, &self.stream, || {
+            let row = self.rows.core.resid[0].range(0, h * 4)?;
+            tail.gather(&self.ctx, &self.stream, &self.params, row)?;
+            self.visits(1, pos, None)?;
+            self.head(0, self.dq)?;
+            let logits = &self.rows.core.logits;
+            tail.pick(&self.ctx, &self.stream, logits, vocab, &self.params)?;
+            Ok(self.rows.core.cur.get())
+        });
+        self.tail_replay = replay;
+        self.rows.core.cur.set(left?);
+        tail.picked(&self.stream)
+    }
+
+    /// Whether the last step from a token id replayed its recorded step.
+    #[cfg(test)]
+    pub(crate) fn token_step_replayed(&self) -> bool {
+        self.tail_replay.recorded()
+    }
+
     /// Whether the last decode step replayed the recorded step.
     #[cfg(test)]
     pub(crate) fn replayed(&self) -> bool {
@@ -395,7 +481,7 @@ impl<'a> LoopStep<'a> {
     #[cfg(all(test, feature = "native-cuda"))]
     pub(crate) fn set_exact_routes(&mut self, rows: bool, chunks: bool) {
         (self.dq, self.exact_chunks) = (rows, chunks);
-        self.replay = Replay::default();
+        self.forget_records();
     }
 
     /// One chunk at `p0` with row 0 of every visit's mixer output and residual pushed to `trace`.
@@ -407,7 +493,7 @@ impl<'a> LoopStep<'a> {
         trace: &mut Vec<Vec<f32>>,
     ) -> Result<(), EngError> {
         let m = embed_rows.len() / self.shape.hidden;
-        self.replay = Replay::default();
+        self.forget_records();
         self.walk(&le_f32(embed_rows), m, p0, Some(trace))
     }
 

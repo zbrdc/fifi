@@ -1231,6 +1231,173 @@ fn the_served_stepper_runs_the_routed_expert_model() {
     );
 }
 
+/// A decode step from a token id against the step from a host embedding row, for a lineage
+/// model (`LINEAGE_STEP_GGUF`): two cards walk the same forced ids. The logits rows must have
+/// the same bits at every position (the device gathers the row the host gathers), and the id the
+/// device leaves must be the lowest id of the largest logit among the sampler's ids, which is
+/// the host sampler's greedy pick.
+#[test]
+fn the_token_step_has_the_rows_and_the_pick_of_the_host_step() {
+    const STEPS: usize = 48;
+    let Ok(path) = std::env::var("LINEAGE_STEP_GGUF") else {
+        eprintln!("skipped: set LINEAGE_STEP_GGUF");
+        return;
+    };
+    if !device_present("the token step") {
+        return;
+    }
+    let file = Arc::new(
+        GgufWeights::open_any_type(
+            &std::path::PathBuf::from(path),
+            GgufLimits {
+                max_header_bytes: 32 << 20,
+                max_tensor_bytes: 8 << 30,
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let (model, routing) = super::serve::model_of(&file).unwrap();
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded = super::serve::load_model(&ctx, &file, &model).unwrap();
+    let shape = model.shape;
+    let embd = crate::family::project::gguf::GgufMatrix::new(
+        file.header(),
+        "token_embd.weight",
+        shape.vocab,
+        shape.hidden,
+    )
+    .unwrap();
+    let mut projector = GgufProjector::new(file.clone());
+    let open = || LoopStep::open_model(ctx.clone(), &loaded, &model, routing, STEPS + 1).unwrap();
+    let (mut host, mut card) = (open(), open());
+    let tensor = file.header().tensor("token_embd.weight").unwrap();
+    let mut bytes = vec![0u8; tensor.byte_len() as usize];
+    file.read_range("token_embd.weight", 0, &mut bytes).unwrap();
+    let table = crate::kernels::cuda::resident::embed::EmbedTable::upload(
+        &ctx,
+        "token_embd.weight",
+        (tensor.ggml_type(), shape.vocab, shape.hidden),
+        &bytes,
+    )
+    .unwrap();
+    card.set_embedding(table).unwrap();
+    drop(bytes);
+    // The sampler leaves the ids past its vocabulary out; the pick must do the same.
+    let vocab = shape.vocab - 243;
+    let ids: Vec<u32> = (1..=STEPS as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab as u32)
+        .collect();
+    for (pos, &token) in ids.iter().enumerate() {
+        let row = projector.rows(&embd, &[token]).unwrap();
+        host.decode(&row, pos).unwrap();
+        let want = drain_row(&ctx, &host);
+        let picked = card.decode_token(token, pos, vocab).unwrap();
+        let got = drain_row(&ctx, &card);
+        assert!(
+            want.iter()
+                .map(|x| x.to_bits())
+                .eq(got.iter().map(|x| x.to_bits())),
+            "position {pos}: the token step has another logits row"
+        );
+        assert_eq!(
+            picked,
+            argmax(&want[..vocab]),
+            "position {pos}: another pick"
+        );
+    }
+    assert!(
+        card.token_step_replayed(),
+        "the token step never replayed its record"
+    );
+    card.reset().unwrap();
+    let again = card.decode_token(ids[0], 0, vocab).unwrap();
+    host.reset().unwrap();
+    let row = projector.rows(&embd, &ids[..1]).unwrap();
+    host.decode(&row, 0).unwrap();
+    assert_eq!(again, argmax(&drain_row(&ctx, &host)[..vocab]));
+}
+
+/// Timing, not a gate: a greedy token on the served stepper of a lineage model
+/// (`LINEAGE_STEP_GGUF`) after a prompt of `LINEAGE_STEP_PROMPT` ids (default 512), 64 steps
+/// each way on one card: picked on the device (the stepper's own `next_token`), and through
+/// the logits row and the host sampler, which is what a stepper without the table does. Both
+/// walks force the same ids, so they do the same work on the card.
+#[test]
+fn card_reports_the_served_greedy_step_with_and_without_the_device_pick() {
+    use crate::family::sampler::Sampler;
+    const STEPS: usize = 64;
+    let Ok(path) = std::env::var("LINEAGE_STEP_GGUF") else {
+        eprintln!("skipped: set LINEAGE_STEP_GGUF");
+        return;
+    };
+    if !device_present("the served greedy step") {
+        return;
+    }
+    let prompt: usize = std::env::var("LINEAGE_STEP_PROMPT").map_or(512, |v| v.parse().unwrap());
+    let file = Arc::new(
+        GgufWeights::open_any_type(
+            &std::path::PathBuf::from(path),
+            GgufLimits {
+                max_header_bytes: 32 << 20,
+                max_tensor_bytes: 8 << 30,
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let (model, routing) = super::serve::model_of(&file).unwrap();
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded: &'static CudaWeights = Box::leak(Box::new(
+        super::serve::load_model(&ctx, &file, &model).unwrap(),
+    ));
+    let rows = prompt + 2 * STEPS + 32;
+    let step = LoopStep::open_model(ctx.clone(), loaded, &model, routing, rows).unwrap();
+    let mut card = CardStep::new(step, &file, &model).unwrap();
+    let vocab = model.shape.vocab - 243;
+    let ids: Vec<u32> = (1..=(prompt + 2 * STEPS + 16) as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) % vocab as u32)
+        .collect();
+    assert!(
+        card.picks_on_device(),
+        "the embedding table did not fit on the device"
+    );
+    card.feed_rows(&ids[..prompt]).unwrap();
+    let mut sampler = Sampler::greedy();
+    // The stepper takes a request's first token through the host; the timed steps come after.
+    let first = card.next_token(ids[prompt], &mut sampler, vocab).unwrap();
+    assert!((first as usize) < vocab);
+    let prompt = prompt + 1;
+    let mut timed = |card: &mut CardStep, base: usize, device: bool| -> (f64, u32) {
+        // The first steps record the launches; they are not timed.
+        let mut kept = 0;
+        let mut step = |card: &mut CardStep, token: u32| -> u32 {
+            if device {
+                card.next_token(token, &mut sampler, vocab).unwrap()
+            } else {
+                let logits = card.logits(token).unwrap();
+                sampler.sample(&logits[..vocab]).unwrap()
+            }
+        };
+        for &token in &ids[base..base + 4] {
+            kept ^= step(card, token);
+        }
+        let t = std::time::Instant::now();
+        for &token in &ids[base + 4..base + 4 + STEPS] {
+            kept ^= step(card, token);
+        }
+        (t.elapsed().as_secs_f64() * 1e3 / STEPS as f64, kept)
+    };
+    let (on_device, _) = timed(&mut card, prompt, true);
+    let (on_host, _) = timed(&mut card, prompt + STEPS + 4, false);
+    eprintln!(
+        "{} at {prompt} prompt ids, greedy ms per token: device pick {on_device:.3} ({:.1} tok/s) | logits row and host sampler {on_host:.3} ({:.1} tok/s)",
+        model.family,
+        1e3 / on_device,
+        1e3 / on_host
+    );
+}
+
 /// Timing, not a gate: the parts of one served decode step of a lineage model
 /// (`LINEAGE_STEP_GGUF`), after a prompt of `LINEAGE_STEP_PROMPT` hashed ids (default 512).
 /// Over 64 steps each: the host gather of the embedding row; the step with its upload, waited

@@ -55,6 +55,9 @@ pub(crate) struct DevicePolicy {
     /// Free bytes the filesystem of an on-disk cache keeps beyond an entry's bytes: a write that
     /// would leave less is skipped, so a cache never takes the last bytes of a shared disk.
     pub(crate) disk_free_reserve: u64,
+    /// Device bytes a step keeps free when it puts a token embedding table on the device for
+    /// the token tail: with less left after the table, the table stays on the host.
+    pub(crate) embedding_table_reserve: u64,
     /// The room family reserves leave for memory outside their tensor estimates on unified
     /// memory (the Mac prefill reserve and its derivation).
     pub(crate) unified_pressure_margin: u64,
@@ -77,6 +80,7 @@ pub(crate) const DEVICE: DevicePolicy = DevicePolicy {
     raon_headroom: 768 * MIB,
     inkling_controller_margin: 32 * MIB,
     disk_free_reserve: 512 * MIB,
+    embedding_table_reserve: 256 * MIB,
     unified_pressure_margin: GIB,
 };
 
@@ -103,6 +107,7 @@ mod tests {
         assert_eq!(DEVICE.raon_headroom, 805_306_368);
         assert_eq!(DEVICE.inkling_controller_margin, 33_554_432);
         assert_eq!(DEVICE.disk_free_reserve, 536_870_912);
+        assert_eq!(DEVICE.embedding_table_reserve, 268_435_456);
         assert_eq!(DEVICE.unified_pressure_margin, 1_073_741_824);
     }
 

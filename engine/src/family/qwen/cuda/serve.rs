@@ -31,7 +31,9 @@ use crate::family::project::cuda::{
 use crate::family::project::gguf::{GgufMatrix, GgufProjector};
 use crate::family::qwen::recipe::{Model, ROUTED_EXPERTS, layers, routed_experts, tensors};
 use crate::family::qwen::sensenova::weights::LoopWeights;
-use crate::family::session::{DecodeSession, TokenStepper};
+use crate::family::sampler::Sampler;
+use crate::family::session::{DecodeSession, TokenStepper, sample_logits};
+use crate::family::step::tail::device_table;
 use crate::kernels::cuda::CudaContext;
 use crate::sched::worker::{Engine, ReadyNote, spawn_engine_noted};
 use crate::weights::{GgufLimits, GgufWeights, MetaValue};
@@ -126,12 +128,28 @@ impl CardStep {
         model: &Model,
     ) -> Result<Self, EngError> {
         let (vocab, hidden) = (model.shape.vocab, model.shape.hidden);
+        let mut step = step;
+        // With the table on the device a greedy step picks its token there and the host reads
+        // eight bytes; without it the host gathers the row and reads the logits.
+        if let Some(table) =
+            device_table(step.context(), file, "token_embd.weight", (vocab, hidden))?
+        {
+            step.set_embedding(table)?;
+        }
         Ok(Self {
             step,
             embd: GgufMatrix::new(file.header(), "token_embd.weight", vocab, hidden)?,
             projector: GgufProjector::new(Arc::clone(file)),
             pos: 0,
         })
+    }
+}
+
+impl CardStep {
+    /// Whether a greedy token of this stepper is picked on the device.
+    #[cfg(test)]
+    pub(crate) fn picks_on_device(&self) -> bool {
+        self.step.takes_tokens()
     }
 }
 
@@ -163,6 +181,31 @@ impl TokenStepper for CardStep {
             .iter()
             .map(|word| f32::from_le_bytes(*word))
             .collect())
+    }
+
+    /// A greedy pick is made on the device when the step holds the embedding table: the token
+    /// id goes in, the id of the largest logit comes out, and no row crosses the bus. Any other
+    /// sampling, and a request that captures its candidates, takes the logits row to the host;
+    /// so does the first token of a request, whose margin over the runner-up the sampler keeps
+    /// for the request's report.
+    fn next_token(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Result<u32, EngError> {
+        let on_device = self.step.takes_tokens()
+            && sampler.is_greedy()
+            && !sampler.capture_armed()
+            && sampler.first_top2_margin().is_some();
+        if !on_device {
+            let logits = self.logits(token)?;
+            return sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab);
+        }
+        let picked = self.step.decode_token(token, self.pos, sampler_vocab)?;
+        self.pos += 1;
+        sampler.record_device_greedy(picked);
+        Ok(picked)
     }
 
     fn fed(&self) -> usize {

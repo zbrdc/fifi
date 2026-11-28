@@ -134,7 +134,7 @@ impl LoopStep<'_> {
             ));
         }
         // A chunk may regrow the workspace the recorded step holds: the next steps record again.
-        self.replay = Replay::default();
+        self.forget_records();
         // On the decoding routes a piece is as many rows as the attention that scores in f32
         // takes in one launch and its scratch holds.
         let piece = if self.exact_chunks {
