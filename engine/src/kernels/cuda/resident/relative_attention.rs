@@ -12,6 +12,7 @@
 //! overwritten slots must preserve their own copies of the cache rows.
 
 use crate::EngError;
+#[cfg(test)]
 use crate::family::kv_format::{KvFormat, KvRowShape};
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
@@ -50,6 +51,7 @@ impl RelativeKvFormat {
         kv_heads * self.head_bytes()
     }
 
+    #[cfg(test)]
     pub(crate) const fn kv_format(self) -> KvFormat {
         match self {
             Self::F32 => KvFormat::F32,
@@ -91,9 +93,9 @@ impl RelativeKvFormat {
                     .flat_map(|&v| half::f16::from_f32(v).to_ne_bytes()),
             ),
             Self::Int8 => {
-                for head in row.chunks_exact(HEAD_DIM) {
+                for head in row.as_chunks::<HEAD_DIM>().0 {
                     let mut scales = [half::f16::ZERO; INT8_GROUPS];
-                    for (g, group) in head.chunks_exact(INT8_GROUP).enumerate() {
+                    for (g, group) in head.as_chunks::<INT8_GROUP>().0.iter().enumerate() {
                         let amax = group.iter().fold(0.0f32, |m, &x| {
                             let a = x.abs();
                             if a.is_nan() || m.is_nan() {
@@ -140,9 +142,9 @@ impl RelativeKvFormat {
                 .collect(),
             Self::Int8 => {
                 let mut out = Vec::with_capacity((bytes.len() / INT8_HEAD_BYTES) * HEAD_DIM);
-                for head in bytes.chunks_exact(INT8_HEAD_BYTES) {
+                for head in bytes.as_chunks::<INT8_HEAD_BYTES>().0 {
                     let (codes, scale_bytes) = head.split_at(HEAD_DIM);
-                    for (g, group) in codes.chunks_exact(INT8_GROUP).enumerate() {
+                    for (g, group) in codes.as_chunks::<INT8_GROUP>().0.iter().enumerate() {
                         let s =
                             half::f16::from_ne_bytes([scale_bytes[2 * g], scale_bytes[2 * g + 1]])
                                 .to_f32();
@@ -165,14 +167,6 @@ impl RelativeKvFormat {
         self.kv_format().plane_position_bytes(shape).ok() == Some(self.row_bytes(kv_heads) as u64)
     }
 }
-
-#[cfg(not(test))]
-const _: fn() = || {
-    let _ = KvRowShape {
-        heads_kv: 0,
-        head_dim: 0,
-    };
-};
 
 /// The factor a long-context attention applies to its clipped query and relative coefficients
 /// at a position (`native/resident/log_query_scale.cuh`): `1 + alpha * ln((pos + 1) / floor)`
@@ -213,6 +207,7 @@ pub(crate) struct RelativeAttentionTile {
 }
 
 impl RelativeAttentionTile {
+    #[cfg(test)]
     pub(crate) fn region_bytes(self, shape: RelativeAttentionShape) -> Option<[usize; RANGES]> {
         self.region_bytes_for(shape, RelativeKvFormat::F32)
     }
