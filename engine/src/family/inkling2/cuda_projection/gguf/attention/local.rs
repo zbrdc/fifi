@@ -669,14 +669,7 @@ impl ResidentAttention {
             relative::PrepRow {
                 shape: prep,
                 math: request.math,
-                rows: relative::Scored {
-                    q: qr,
-                    relative,
-                    sinks,
-                    gates,
-                    k,
-                    v,
-                },
+                rows: relative::Scored::from_order([qr, k, v, relative, sinks, gates]),
                 raw_k,
                 raw_v,
                 weights: relative::PrepWeights {
@@ -726,7 +719,6 @@ impl ResidentAttention {
             projected,
         } = rows;
         let visit = self.visits[request.visit.state_slot];
-        let ring = |at, bytes| self.arena.range(at, bytes);
         let health = Health::split(
             request.status,
             local_status(shape, request.messages.is_some()),
@@ -735,21 +727,8 @@ impl ResidentAttention {
             context,
             stream,
             relative::AttendRow {
-                rows: relative::Scored {
-                    q,
-                    relative,
-                    sinks,
-                    gates,
-                    k,
-                    v,
-                },
-                rings: relative::Rings {
-                    shape: visit.shape,
-                    kv_format: visit.kv_format,
-                    table: ring(visit.table_at, visit.table_bytes)?,
-                    k: ring(visit.cache_at, visit.cache_bytes)?,
-                    v: ring(visit.cache_at + visit.cache_bytes, visit.cache_bytes)?,
-                },
+                rows: relative::Scored::from_order([q, k, v, relative, sinks, gates]),
+                rings: visit.rings(&self.arena)?,
                 output: relative::Output {
                     weight: projection.weight,
                     dtype: projection.dtype,

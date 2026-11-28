@@ -4,6 +4,7 @@ use super::*;
 use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse},
+    family::step::{attend::relative, conv},
     kernels::cuda::resident::{
         relative_attention::{LogScale, QUERY_TILE_LIMIT, RelativeAttentionTile},
         relative_prep::{KvPrepShape, OutputConvShape, PrepShape},
@@ -627,14 +628,16 @@ impl ResidentAttention {
         status
             .buffer()
             .zero_at(&self.stream, status.offset(), health.len())?;
-        context.short_conv_rows(
+        conv::rows(
+            context,
             &self.stream,
-            [destination.raw, past, weight, output, status],
+            conv::Variant::Residual,
             OutputConvShape {
                 rows: conv.rows,
                 width: conv.stride / 4,
                 history: convolution.history,
             },
+            conv::Rows::from_planes([destination.raw, past, weight, output, status]),
         )?;
         status
             .buffer()
@@ -893,105 +896,110 @@ impl ResidentAttention {
         work.encoded.resize(out_at - uploaded, 0);
         work.transfer.write(0, &work.encoded)?;
         let device = &work.device;
-        let call = |i: usize, bytes: [usize; 12]| {
-            let [out, kc, vc, status, q, k, v, rel, table, sinks, gates, pos] = bytes;
-            let [q, k, v, relative, sinks, gates] = layout.row_inputs(
-                device,
-                offsets[i],
-                [q, k, v, rel, sinks, gates],
-                side.as_ref(),
-                i,
-            )?;
-            Ok::<_, EngError>(RelativeAttentionCall {
-                shape: visit.shape,
-                kv_format: visit.kv_format,
-                q,
-                k,
-                v,
-                relative,
-                sinks,
-                gates,
+        let score_row = |i: usize, bytes: [usize; 12]| {
+            let [out, _, _, status, q, k, v, rel, _, sinks, gates, pos] = bytes;
+            Ok::<_, EngError>(relative::ScoreRow {
+                rows: relative::Scored::from_order(layout.row_inputs(
+                    device,
+                    offsets[i],
+                    [q, k, v, rel, sinks, gates],
+                    side.as_ref(),
+                    i,
+                )?),
                 pos: device.range(offsets[i][6], pos)?,
                 status: device.range(status_at + 4 * i, status)?,
                 out: device.range(attention_at + i * layout.attention, out)?,
-                table: self.arena.range(visit.table_at, table)?,
-                k_cache: self.arena.range(visit.cache_at, kc)?,
-                v_cache: self.arena.range(visit.cache_at + visit.cache_bytes, vc)?,
             })
         };
         let queued = (|| {
+            let status_all = device.range(status_at, 4 * count)?;
             context.copy_from_pinned(
                 &self.stream,
                 &mut work.transfer,
                 0,
                 device.range(uploaded, out_at - uploaded)?,
             )?;
-            if let Some(side) = &side
-                && let Some(query) = side.query
-            {
-                context.relative_attention_clip_queries(
-                    &self.stream,
-                    visit.shape,
-                    [count, layout.resident[1] + layout.resident[2]],
-                    (query.limits, query.log.map(|log| (log, position))),
-                    [
-                        side.range,
-                        work.device.range(scales_at, layout.scales)?,
-                        work.device.range(status_at, 4 * count)?,
-                    ],
-                )?;
-            }
-            if let Some((kv, history)) = kv {
-                let side = side
-                    .as_ref()
-                    .ok_or_else(|| bad("K/V preparation lacks side rows"))?;
-                let kv_bytes = layout.resident[1];
-                let [k_at, v_at, position_at] = [offsets[0][1], offsets[0][2], offsets[0][6]];
-                if offsets.iter().enumerate().any(|(i, row)| {
-                    [row[1], row[2], row[6]]
-                        != [k_at, v_at, position_at].map(|at| at + i * layout.input)
-                }) {
-                    return Err(bad("CUDA K/V preparation rows are not evenly spaced"));
-                }
-                let past = 2 * 3 * kv_bytes;
-                context.relative_prep_rows(
-                    &self.stream,
-                    [
-                        side.range,
-                        device.range(prep_at, past)?,
-                        device.range(prep_at + past, 4 * prep_words - past)?,
-                        device.range(0, count * layout.input)?,
-                        device.range(status_at, 4 * count)?,
-                    ],
-                    KvPrepShape {
+            let query = side
+                .as_ref()
+                .and_then(|s| s.query.map(|q| (s.range, q)))
+                .map(|(side, q)| {
+                    Ok::<_, EngError>(relative::QueryClipRows {
+                        shape: visit.shape,
                         rows: count,
-                        kv_heads: kv.kv_heads,
-                        history,
-                        dynamic: kv.coefficients.is_some(),
-                        raw_stride: layout.side_stride() / 4,
-                        raw: [layout.resident[0] / 4, (layout.resident[0] + kv_bytes) / 4],
-                        out_stride: layout.input / 4,
-                        out: [k_at / 4, v_at / 4],
-                        positions: first.map(|first| (position_at / 4, first)),
-                        limit: kv.limit,
-                        eps: kv.eps,
-                    },
-                )?;
-            }
+                        raw_kv_bytes: layout.resident[1] + layout.resident[2],
+                        limits: q.limits,
+                        log: q.log.map(|log| (log, position)),
+                        side,
+                        scales: device.range(scales_at, layout.scales)?,
+                        status: status_all,
+                    })
+                })
+                .transpose()?;
+            let kv_prep = kv
+                .map(|(kv, history)| {
+                    let side = side
+                        .as_ref()
+                        .ok_or_else(|| bad("K/V preparation lacks side rows"))?;
+                    let kv_bytes = layout.resident[1];
+                    let [k_at, v_at, pos_at] = [offsets[0][1], offsets[0][2], offsets[0][6]];
+                    if offsets.iter().enumerate().any(|(i, r)| {
+                        [r[1], r[2], r[6]] != [k_at, v_at, pos_at].map(|at| at + i * layout.input)
+                    }) {
+                        return Err(bad("CUDA K/V preparation rows are not evenly spaced"));
+                    }
+                    let past = 2 * 3 * kv_bytes;
+                    Ok(relative::KvPrepRows {
+                        shape: KvPrepShape {
+                            rows: count,
+                            kv_heads: kv.kv_heads,
+                            history,
+                            dynamic: kv.coefficients.is_some(),
+                            raw_stride: layout.side_stride() / 4,
+                            raw: [layout.resident[0] / 4, (layout.resident[0] + kv_bytes) / 4],
+                            out_stride: layout.input / 4,
+                            out: [k_at / 4, v_at / 4],
+                            positions: first.map(|first| (pos_at / 4, first)),
+                            limit: kv.limit,
+                            eps: kv.eps,
+                        },
+                        raw: side.range,
+                        history: device.range(prep_at, past)?,
+                        taps: device.range(prep_at + past, 4 * prep_words - past)?,
+                        out: device.range(0, count * layout.input)?,
+                        status: status_all,
+                    })
+                })
+                .transpose()?;
+            relative::prep_rows(
+                context,
+                &self.stream,
+                relative::PrepRows { query, kv: kv_prep },
+            )?;
             // Prep ORs into the same status checked by snapshot commit. No
             // resident sidecar is replayed or re-prepared after enqueue.
-            if let Some((tile, bytes)) = tile {
-                context.relative_attention_tile(&self.stream, call(0, bytes)?, tile)?;
-            } else {
-                let bytes = visit.shape.region_bytes_for(visit.kv_format).unwrap(); // validated by Layout
-                for i in 0..count {
-                    context.relative_attention(&self.stream, call(i, bytes)?)?;
+            let scored = match tile {
+                Some((tile, bytes)) => relative::ScoredRows::Tile {
+                    tile,
+                    row: Box::new(score_row(0, bytes)?),
+                },
+                None => {
+                    let bytes = visit.shape.region_bytes_for(visit.kv_format).unwrap();
+                    let calls = (0..count)
+                        .map(|i| score_row(i, bytes))
+                        .collect::<Result<_, _>>()?;
+                    relative::ScoredRows::PerRow(calls)
                 }
-            }
+            };
+            let rings = visit.rings(&self.arena)?;
+            relative::attend_rows(
+                context,
+                &self.stream,
+                relative::AttendRows { rings, scored },
+            )?;
             if let Some(p) = projection {
                 let y = match destination {
                     Some(dest) => dest.raw,
-                    None => work.device.range(out_at, count * layout.output)?,
+                    None => device.range(out_at, count * layout.output)?,
                 };
                 q8_row_reuse::project_prompt(
                     context,
@@ -1001,30 +1009,27 @@ impl ResidentAttention {
                         shape: DenseGemvShape::packed(count, p.rows, layout.attention / 4),
                         dtype: p.dtype,
                         w: p.weight,
-                        x: work.device.range(attention_at, count * layout.attention)?,
+                        x: device.range(attention_at, count * layout.attention)?,
                         y,
                     }],
                     q8_row_reuse::Exact::Output,
                 )?;
             }
             if let Some(dest) = destination
-                && let Some(conv) = dest.convolution
+                && let Some(c) = dest.convolution
             {
-                let [past, weight, output] = conv.planes;
-                context.short_conv_rows(
+                let [past, weight, output] = c.planes;
+                let shape = OutputConvShape {
+                    rows: count,
+                    width: layout.output / 4,
+                    history: c.history,
+                };
+                conv::rows(
+                    context,
                     &self.stream,
-                    [
-                        dest.raw,
-                        past,
-                        weight,
-                        output,
-                        device.range(status_at, 4 * count)?,
-                    ],
-                    OutputConvShape {
-                        rows: count,
-                        width: layout.output / 4,
-                        history: conv.history,
-                    },
+                    conv::Variant::Residual,
+                    shape,
+                    conv::Rows::from_planes([dest.raw, past, weight, output, status_all]),
                 )?;
             }
             if let Some(convolved) = convolved_readback {

@@ -54,6 +54,21 @@ struct Visit {
     cache_bytes: usize,
 }
 
+impl Visit {
+    fn rings(
+        self,
+        arena: &DeviceBuffer,
+    ) -> Result<crate::family::step::attend::relative::Rings<'_>, EngError> {
+        Ok(crate::family::step::attend::relative::Rings {
+            shape: self.shape,
+            kv_format: self.kv_format,
+            table: arena.range(self.table_at, self.table_bytes)?,
+            k: arena.range(self.cache_at, self.cache_bytes)?,
+            v: arena.range(self.cache_at + self.cache_bytes, self.cache_bytes)?,
+        })
+    }
+}
+
 /// The local visit geometry as the resident decode chain uses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::family::inkling2) struct LocalShape {

@@ -13,9 +13,10 @@ use super::super::conv::{self, Ring as ConvRing, Row as ConvRow, Variant};
 use crate::EngError;
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
 use crate::kernels::cuda::resident::relative_attention::{
-    HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape, RelativeKvFormat,
+    HEAD_DIM, LogScale, RelativeAttentionCall, RelativeAttentionShape, RelativeAttentionTile,
+    RelativeKvFormat,
 };
-use crate::kernels::cuda::resident::relative_prep::{PrepMath, PrepShape};
+use crate::kernels::cuda::resident::relative_prep::{KvPrepShape, PrepMath, PrepShape};
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
 /// The rows one relative attention row is scored from: the query, the relative coefficients,
@@ -28,6 +29,20 @@ pub(crate) struct Scored<'a> {
     pub(crate) gates: DeviceRange<'a>,
     pub(crate) k: DeviceRange<'a>,
     pub(crate) v: DeviceRange<'a>,
+}
+
+impl<'a> Scored<'a> {
+    /// Builds [`Scored`] from the projection-order array `[q, k, v, relative, sinks, gates]`.
+    pub(crate) fn from_order([q, k, v, relative, sinks, gates]: [DeviceRange<'a>; 6]) -> Self {
+        Self {
+            q,
+            relative,
+            sinks,
+            gates,
+            k,
+            v,
+        }
+    }
 }
 
 /// The constant rows of the prep: the per-channel clip scales of the query and of the
@@ -144,25 +159,17 @@ pub(crate) fn attend_row(
     stream: &DeviceStream,
     row: AttendRow<'_>,
 ) -> Result<(), EngError> {
-    let rows = row.rows;
     ctx.relative_attention(
         stream,
-        RelativeAttentionCall {
-            shape: row.rings.shape,
-            kv_format: row.rings.kv_format,
-            q: rows.q,
-            k: rows.k,
-            v: rows.v,
-            relative: rows.relative,
-            sinks: rows.sinks,
-            gates: rows.gates,
-            out: row.attended,
-            table: row.rings.table,
-            pos: row.pos,
-            status: row.status,
-            k_cache: row.rings.k,
-            v_cache: row.rings.v,
-        },
+        attention_call(
+            row.rings,
+            ScoreRow {
+                rows: row.rows,
+                pos: row.pos,
+                status: row.status,
+                out: row.attended,
+            },
+        ),
     )?;
     let output = row.output;
     let query_channels = row.rings.shape.query_heads * HEAD_DIM;
@@ -190,6 +197,133 @@ pub(crate) fn attend_row(
             health: row.conv_health,
         },
     )
+}
+
+/// In-place query and relative-coefficient clip over a chunk of rows, with optional log-length
+/// position scaling starting at the chunk's first position.
+pub(crate) struct QueryClipRows<'a> {
+    pub(crate) shape: RelativeAttentionShape,
+    pub(crate) rows: usize,
+    /// Bytes of raw K and V columns between query and relative in each row of `side`.
+    pub(crate) raw_kv_bytes: usize,
+    pub(crate) limits: [f32; 2],
+    pub(crate) log: Option<(LogScale, usize)>,
+    pub(crate) side: DeviceRange<'a>,
+    pub(crate) scales: DeviceRange<'a>,
+    pub(crate) status: DeviceRange<'a>,
+}
+
+/// Causal convolution, key clip and value norm over a chunk of raw K and V rows, optionally
+/// writing each row's position word beside its prepared K and V.
+pub(crate) struct KvPrepRows<'a> {
+    pub(crate) shape: KvPrepShape,
+    pub(crate) raw: DeviceRange<'a>,
+    pub(crate) history: DeviceRange<'a>,
+    pub(crate) taps: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+    pub(crate) status: DeviceRange<'a>,
+}
+
+/// One chunk's preparation: optional in-place query and relative clip and optional K and V
+/// convolution, clip and norm. Each stage ORs non-finite flags into its status range.
+pub(crate) struct PrepRows<'a> {
+    pub(crate) query: Option<QueryClipRows<'a>>,
+    pub(crate) kv: Option<KvPrepRows<'a>>,
+}
+
+/// Makes a chunk's projections final for [`attend_rows`].
+pub(crate) fn prep_rows(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    rows: PrepRows<'_>,
+) -> Result<(), EngError> {
+    if let Some(q) = rows.query {
+        ctx.relative_attention_clip_queries(
+            stream,
+            q.shape,
+            [q.rows, q.raw_kv_bytes],
+            (q.limits, q.log),
+            [q.side, q.scales, q.status],
+        )?;
+    }
+    if let Some(kv) = rows.kv {
+        ctx.relative_prep_rows(
+            stream,
+            [kv.raw, kv.history, kv.taps, kv.out, kv.status],
+            kv.shape,
+        )?;
+    }
+    Ok(())
+}
+
+/// One row's ranges for [`attend_rows`] against [`Rings`].
+pub(crate) struct ScoreRow<'a> {
+    pub(crate) rows: Scored<'a>,
+    pub(crate) pos: DeviceRange<'a>,
+    pub(crate) status: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+}
+
+/// How a chunk of rows is scored against its rings: one immutable-snapshot query tile, or one
+/// row at a time (which keeps the bits of repeated one-row steps).
+pub(crate) enum ScoredRows<'a> {
+    Tile {
+        tile: RelativeAttentionTile,
+        row: Box<ScoreRow<'a>>,
+    },
+    PerRow(Vec<ScoreRow<'a>>),
+}
+
+/// One chunk's scoring against its rings, either as a query tile or row by row.
+pub(crate) struct AttendRows<'a> {
+    pub(crate) rings: Rings<'a>,
+    pub(crate) scored: ScoredRows<'a>,
+}
+
+/// Scores a chunk of rows against its rings, writing every row's cell.
+pub(crate) fn attend_rows(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    rows: AttendRows<'_>,
+) -> Result<(), EngError> {
+    match rows.scored {
+        ScoredRows::Tile { tile, row } => {
+            ctx.relative_attention_tile(stream, attention_call(rows.rings, *row), tile)
+        }
+        ScoredRows::PerRow(calls) => {
+            for row in calls {
+                ctx.relative_attention(stream, attention_call(rows.rings, row))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn attention_call<'a>(rings: Rings<'a>, row: ScoreRow<'a>) -> RelativeAttentionCall<'a> {
+    let Scored {
+        q,
+        relative,
+        sinks,
+        gates,
+        k,
+        v,
+    } = row.rows;
+    RelativeAttentionCall {
+        shape: rings.shape,
+        kv_format: rings.kv_format,
+        q,
+        k,
+        v,
+        relative,
+        sinks,
+        gates,
+        out: row.out,
+        table: rings.table,
+        pos: row.pos,
+        status: row.status,
+        k_cache: rings.k,
+        v_cache: rings.v,
+    }
 }
 
 #[cfg(test)]

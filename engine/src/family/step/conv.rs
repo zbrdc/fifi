@@ -6,6 +6,7 @@
 //! oldest first can share the ring's shape and health word with one that reads newest first.
 
 use crate::EngError;
+use crate::kernels::cuda::resident::relative_prep::OutputConvShape;
 use crate::kernels::cuda::resident::short_conv::ConvCall;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
@@ -95,6 +96,47 @@ pub(crate) fn row(
                 health: row.health,
             },
             (ring.width, ring.taps),
+        ),
+    }
+}
+
+/// The planes of a convolved chunk: `shape.rows` contiguous input rows, the `(taps - 1)`
+/// right-aligned oldest-first history rows before row 0, the channel-major taps, the
+/// `shape.rows` output rows, and the per-row status words a value that is not finite marks.
+pub(crate) struct Rows<'a> {
+    pub(crate) input: DeviceRange<'a>,
+    pub(crate) history: DeviceRange<'a>,
+    pub(crate) taps: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+    pub(crate) status: DeviceRange<'a>,
+}
+
+impl<'a> Rows<'a> {
+    pub(crate) fn from_planes([input, history, taps, out, status]: [DeviceRange<'a>; 5]) -> Self {
+        Self {
+            input,
+            history,
+            taps,
+            out,
+            status,
+        }
+    }
+}
+
+/// Convolves a chunk of rows under `variant`, leaving `rows.input` untouched so the caller can
+/// seed the next chunk or decode ring from its tail.
+pub(crate) fn rows(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    variant: Variant,
+    shape: OutputConvShape,
+    rows: Rows<'_>,
+) -> Result<(), EngError> {
+    match variant {
+        Variant::Residual => ctx.short_conv_rows(
+            stream,
+            [rows.input, rows.history, rows.taps, rows.out, rows.status],
+            shape,
         ),
     }
 }
