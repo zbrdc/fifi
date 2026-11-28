@@ -37,26 +37,31 @@ pub(crate) fn serves(ty: QuantType) -> bool {
     matches!(ty, QuantType::Q4K | QuantType::Q6K | QuantType::Q80)
 }
 
-/// Opt-in comma-separated role list (`FIFI_CUDA_DECODE_DQ_ROLES`, default off) selecting 1-row
-/// decode projections that bypass `q8_1` activation quantization via [`CudaContext::matvec_dq_native`]
-/// (`Q4_K`, `Q6_K`, or `Q8_0`, `k % 256 == 0`). Supported tags include `all`, `attn_q`, `attn_k`,
-/// `attn_v`, `attn_output`, `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_out`,
-/// `delta_inputs` (`attn_qkv` + `attn_gate`), and `delta_logits` (`ssm_alpha` + `ssm_beta`).
+/// Comma-separated role list (`FIFI_CUDA_DECODE_DQ_ROLES`, default `attn_q,attn_v`; set `0`,
+/// `off`, or `none` to disable) selecting 1-row decode projections that bypass `q8_1` activation
+/// quantization via [`CudaContext::matvec_dq_native`] (`Q4_K`, `Q6_K`, or `Q8_0`, `k % 256 == 0`).
+/// Supported tags include `all`, `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv`,
+/// `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_out`, `delta_inputs` (`attn_qkv` + `attn_gate`),
+/// and `delta_logits` (`ssm_alpha` + `ssm_beta`).
 pub(crate) fn decode_dq_role_enabled(role: &str) -> bool {
     if role.is_empty() {
         return false;
     }
     static ROLES: OnceLock<Vec<String>> = OnceLock::new();
-    let list = ROLES.get_or_init(|| {
-        std::env::var("FIFI_CUDA_DECODE_DQ_ROLES")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .map(|part| part.trim().to_ascii_lowercase())
+    let list = ROLES.get_or_init(|| match std::env::var("FIFI_CUDA_DECODE_DQ_ROLES") {
+        Ok(raw) => {
+            let trimmed = raw.trim().to_ascii_lowercase();
+            if trimmed.is_empty() || matches!(trimmed.as_str(), "0" | "off" | "none") {
+                Vec::new()
+            } else {
+                trimmed
+                    .split(',')
+                    .map(|part| part.trim().to_owned())
                     .filter(|part| !part.is_empty())
                     .collect()
-            })
-            .unwrap_or_default()
+            }
+        }
+        Err(_) => vec!["attn_q".to_owned(), "attn_v".to_owned()],
     });
     if list.is_empty() {
         return false;

@@ -258,7 +258,8 @@ pub(crate) struct MmqQuantizeScatterCall<'b> {
 /// Unset or any value other than `1` preserves the caller's legacy packing bit-for-bit.
 pub(crate) fn q36_mmq_packing(legacy: MmqPacking) -> MmqPacking {
     static ROUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ROUNDED.get_or_init(|| std::env::var_os("FIFI_Q36_MMQ_ROUNDED").is_some_and(|v| v == "1")) {
+    if *ROUNDED.get_or_init(|| !std::env::var_os("FIFI_Q36_MMQ_ROUNDED").is_some_and(|v| v == "0"))
+    {
         MmqPacking::Rounded
     } else {
         legacy

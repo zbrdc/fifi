@@ -42,21 +42,44 @@ pub(in crate::kernels::cuda) mod q8_ref {
 
     pub(in crate::kernels::cuda) fn block(values: &[f32; 32]) -> [u8; 36] {
         let amax = values.iter().fold(f32::NAN, |acc, v| acc.max(v.abs()));
-        let d = amax / 127.0f32;
+        let d_raw = amax / 127.0f32;
+        let d_bits = testkit::f64_to_f16_bits(f64::from(d_raw));
         let mut bytes = [0u8; 36];
-        bytes[0..2].copy_from_slice(&testkit::f64_to_f16_bits(f64::from(d)).to_le_bytes());
-        let sum = {
-            let mut lanes = *values;
-            butterfly32(&mut lanes);
-            lanes[0]
-        };
-        bytes[2..4].copy_from_slice(&testkit::f64_to_f16_bits(f64::from(sum)).to_le_bytes());
-        for (i, value) in values.iter().enumerate() {
-            bytes[4 + i] = if amax == 0.0 {
-                0
-            } else {
-                ((value / d).round() as i8) as u8
+        bytes[0..2].copy_from_slice(&d_bits.to_le_bytes());
+        if crate::kernels::cuda::native::resident::rounded_q8_1() {
+            let d = testkit::f16_to_f32(d_bits);
+            let mut qsum = 0i32;
+            for (i, value) in values.iter().enumerate() {
+                let q = if d == 0.0 {
+                    0i8
+                } else {
+                    let r = (value / d).round_ties_even();
+                    if r.is_nan() {
+                        0i8
+                    } else {
+                        r.clamp(-127.0, 127.0) as i8
+                    }
+                };
+                qsum += i32::from(q);
+                bytes[4 + i] = q as u8;
+            }
+            bytes[2..4].copy_from_slice(
+                &testkit::f64_to_f16_bits(f64::from(d * qsum as f32)).to_le_bytes(),
+            );
+        } else {
+            let sum = {
+                let mut lanes = *values;
+                butterfly32(&mut lanes);
+                lanes[0]
             };
+            bytes[2..4].copy_from_slice(&testkit::f64_to_f16_bits(f64::from(sum)).to_le_bytes());
+            for (i, value) in values.iter().enumerate() {
+                bytes[4 + i] = if amax == 0.0 {
+                    0
+                } else {
+                    ((value / d_raw).round() as i8) as u8
+                };
+            }
         }
         bytes
     }

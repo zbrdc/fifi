@@ -9,9 +9,9 @@ For supported user-facing variables, see [Environment variables](environment.md)
 | --- | --- | --- |
 | `FIFI_CUDA_ATTN_PREFILL_TURING` | off | `1` enables the typed half-precision Turing pilot arm (`sm75`, not device-qualified). Read once per process. |
 | `FIFI_CUDA_ATTN_PREFILL_ADAPT` | `0` | Experimental FP16 prefill attention selection (`0` or `1`). Uses device shared-memory and thread limits. Not qualified across RTX 20–50 series. |
-| `FIFI_CUDA_EXACT_TRANSCENDENTALS` | off | `1` selects `GdnL2::AddEps` on Qwen3.6 prefill scans and routes decode `gdn_conv`, `gdn_delta`, and `swiglu_q8` to in-house IEEE `expf` kernels. Read once per process. |
-| `FIFI_CUDA_Q8_1_ROUNDED` | off | `1` switches decode `block_q8_1` producers (`quantize_q8_1`, `add_rmsnorm_q8`, `swiglu_q8`, `block_ops`) to fp16-scale-consistent quantization with rounded `ds.y = d * sum(q)`. Read once per process. |
-| `FIFI_CUDA_DECODE_DQ_ROLES` | unset | Comma-separated projection roles (`attn_q`, `attn_k`, `attn_v`, `attn_output`, `delta_inputs`, `delta_logits`, `all`) routed to FP32-activation `matvec_dq` on 1-row decode (`Q4_K`/`Q6_K`/`Q8_0`). Read once per process. |
+| `FIFI_CUDA_EXACT_TRANSCENDENTALS` | on | Default on: selects `GdnL2::AddEps` on Qwen3.6 prefill scans and routes decode `gdn_conv`, `gdn_delta`, and `swiglu_q8` to in-house IEEE `expf` kernels. Set `0` to restore legacy fast-math/MaxEps behavior. Read once per process. |
+| `FIFI_CUDA_Q8_1_ROUNDED` | on | Default on: routes decode `block_q8_1` producers (`quantize_q8_1`, `add_rmsnorm_q8`, `swiglu_q8`, `block_ops`) to fp16-scale-consistent quantization with rounded `ds.y = d * sum(q)`. Set `0` to restore legacy `sum(x)`. Read once per process. |
+| `FIFI_CUDA_DECODE_DQ_ROLES` | `attn_q,attn_v` | Comma-separated projection roles (`attn_q`, `attn_k`, `attn_v`, `attn_output`, `delta_inputs`, `delta_logits`, `all`) routed to FP32-activation `matvec_dq` on 1-row decode (`Q4_K`/`Q6_K`/`Q8_0`). Set `0`, `off`, or `none` to disable. Read once per process. |
 | `FIFI_CUDA_POISON_ALLOC` | off (switch) | Debug fill: fills every device allocation from the allocator or cache with `0xFF` in 64 MiB chunks to catch uninitialized reads. |
 
 ## Server and CPU diagnostics
@@ -58,7 +58,7 @@ For supported user-facing variables, see [Environment variables](environment.md)
 | `INFERENCE_CUDA_KV8_ATTN_V_PREFETCH` | `0` | `1` enables experimental register-V decode attention prefetch kernel (head dim 256 only). |
 | `FIFI_GDN_CONV_PREFILL` | off | `1`, `16`, `32`, or `64`: multi-block causal-conv kernel for DeltaNet chunks >= 64 rows. |
 | `FIFI_GDN_SCAN_COLS` | off | `8`, `16`, or `32`: value columns per block for DeltaNet prefill scans >= 64 rows. |
-| `FIFI_Q36_MMQ_ROUNDED` | off | `1` switches legacy Qwen3.6 chunked prefill MMQ inputs from `CpuReference`/`Vendor` to `MmqPacking::Rounded`. Read once per process. |
+| `FIFI_Q36_MMQ_ROUNDED` | on | Default on: packs legacy Qwen3.6 chunked prefill MMQ inputs with `MmqPacking::Rounded`. Set `0` to restore `CpuReference`/`Vendor` packing. Read once per process. |
 | `INFERENCE_QWEN36_SPARSE_ATTN` | `0` | `1` arms sparse decode attention (bounded admission, dense fallback). |
 | `INFERENCE_CUDA_GDN_FUSE_INPROJ` | `0` | `1` fuses four Q8_0 DeltaNet input projections into one upload and call. |
 | `INFERENCE_CUDA_TILED_HEAD` | none | Comma-separated tensor names uploaded in `Tiled` layout for decode-only tiled-head matmul. |

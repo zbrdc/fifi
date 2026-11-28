@@ -50,20 +50,44 @@ fn reference_block(values: &[f32]) -> (u16, u16, [i8; 32]) {
     let amax = values
         .iter()
         .fold(0.0f32, |acc, value| acc.max(value.abs()));
-    let d = amax / 127.0f32;
+    let d_raw = amax / 127.0f32;
+    let d_bits = testkit::f64_to_f16_bits(d_raw as f64);
     let mut qs = [0i8; 32];
-    for (i, value) in values.iter().enumerate() {
-        qs[i] = if amax == 0.0 {
-            0
-        } else {
-            (value / d).round() as i8
-        };
+    if crate::kernels::cuda::native::resident::rounded_q8_1() {
+        let d = testkit::f16_to_f32(d_bits);
+        let mut qsum = 0i32;
+        for (i, value) in values.iter().enumerate() {
+            qs[i] = if d == 0.0 {
+                0
+            } else {
+                let r = (value / d).round_ties_even();
+                if r.is_nan() {
+                    0
+                } else {
+                    r.clamp(-127.0, 127.0) as i8
+                }
+            };
+            qsum += i32::from(qs[i]);
+        }
+        (
+            d_bits,
+            testkit::f64_to_f16_bits(f64::from(d * qsum as f32)),
+            qs,
+        )
+    } else {
+        for (i, value) in values.iter().enumerate() {
+            qs[i] = if amax == 0.0 {
+                0
+            } else {
+                (value / d_raw).round() as i8
+            };
+        }
+        (
+            d_bits,
+            testkit::f64_to_f16_bits(butterfly_sum(values) as f64),
+            qs,
+        )
     }
-    (
-        testkit::f64_to_f16_bits(d as f64),
-        testkit::f64_to_f16_bits(butterfly_sum(values) as f64),
-        qs,
-    )
 }
 
 /// Parses one 36-byte `block_q8_1`: (d, s, qs).

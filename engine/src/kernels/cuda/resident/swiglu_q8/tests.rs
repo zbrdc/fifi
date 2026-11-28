@@ -156,7 +156,7 @@ fn swiglu_q8_matches_the_host_reference() {
                 let mut ref_values = [0f32; 32];
                 ref_values.copy_from_slice(&reference[block * 32..block * 32 + 32]);
                 let ref_block = q8_ref::block(&ref_values);
-                let (ref_d, _ref_s, _) = parse_block(&ref_block, 0);
+                let (ref_d, ref_s, _) = parse_block(&ref_block, 0);
                 for value in ref_values {
                     amax_ref = amax_ref.max(f64::from(value.abs()));
                 }
@@ -166,14 +166,27 @@ fn swiglu_q8_matches_the_host_reference() {
                     codes_d <= 1,
                     "{name} slot {slot} block {block}: d {d} vs {ref_d}"
                 );
-                // s: the butterfly sum of the f32 reference row, plus the __expf slack of the
-                // 32 values and one half ulp of the store (2^-11 RELATIVE — the absolute value,
-                // a negative sum must widen the bound, not shrink it).
-                let mut lanes = ref_values;
-                butterfly32(&mut lanes);
-                let s_ref = f64::from(lanes[0]);
-                let slack_s =
-                    32.0 * 1e-5 * amax_ref + f64::from(lanes[0]).abs() * 2.0f64.powi(-11) + 1e-24;
+                // s: matches the active q8_1 block rule (rounded d * sum(q) by default, or
+                // butterfly sum of f32 values when FIFI_CUDA_Q8_1_ROUNDED=0), plus transcendental
+                // and half-store slack.
+                let (s_ref, slack_s) = if crate::kernels::cuda::native::resident::rounded_q8_1() {
+                    let sr = f64::from(ref_s);
+                    (
+                        sr,
+                        32.0 * 1e-5 * amax_ref
+                            + sr.abs() * 2.0f64.powi(-11)
+                            + 4.0 * f64::from(ref_d)
+                            + 1e-24,
+                    )
+                } else {
+                    let mut lanes = ref_values;
+                    butterfly32(&mut lanes);
+                    let sr = f64::from(lanes[0]);
+                    (
+                        sr,
+                        32.0 * 1e-5 * amax_ref + sr.abs() * 2.0f64.powi(-11) + 1e-24,
+                    )
+                };
                 assert!(
                     (f64::from(s) - s_ref).abs() <= slack_s,
                     "{name} slot {slot} block {block}: s {s} vs {s_ref}"

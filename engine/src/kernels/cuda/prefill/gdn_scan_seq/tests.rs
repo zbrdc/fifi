@@ -1445,11 +1445,7 @@ fn gdn_scan_seq_near_zero_k_uses_the_ggml_l2_form() -> Result<(), EngError> {
         scan.run(&inp, m, 0, 1024, 0)?;
         scan.finish()?
     };
-    let (rows, state) = judge_scan(&inp, &got.out, &got.state, "test 8 ggml form");
-    assert!(rows <= E3, "test 8: rows {rows:.3e} above E3 {E3:.3e}");
-    assert!(state <= E3, "test 8: state {state:.3e} above E3 {E3:.3e}");
-    // The decode-form reference must NOT match (the mutant's kill), and the two forms'
-    // difference is reported.
+    let exact_l2 = crate::kernels::cuda::native::resident::exact_transcendentals();
     let ggml = scan_reference(&inp, RefOpts::default());
     let decode = scan_reference(
         &inp,
@@ -1458,17 +1454,34 @@ fn gdn_scan_seq_near_zero_k_uses_the_ggml_l2_form() -> Result<(), EngError> {
             ..Default::default()
         },
     );
+    let (expected_opts, opposite, label) = if exact_l2 {
+        (
+            RefOpts {
+                decode_norm_form: true,
+                ..Default::default()
+            },
+            &ggml,
+            "test 8 AddEps form",
+        )
+    } else {
+        (RefOpts::default(), &decode, "test 8 ggml form")
+    };
+    let (rows, state) = judge_scan_with(&inp, (&got.out, &got.state), label, expected_opts);
+    assert!(rows <= E3, "test 8: rows {rows:.3e} above E3 {E3:.3e}");
+    assert!(state <= E3, "test 8: state {state:.3e} above E3 {E3:.3e}");
+    // The opposite-form reference must NOT match (the mutant's kill), and the two forms'
+    // difference is reported.
     let forms = ggml
         .out
         .iter()
         .zip(&decode.out)
         .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
-    let scale = decode.out.iter().fold(1.0f64, |m, x| m.max(x.abs()));
+    let scale = opposite.out.iter().fold(1.0f64, |m, x| m.max(x.abs()));
     let mut mutant = 0.0f64;
     for t in 0..m {
         for h in 0..nv {
             let g = &got.out[(t * nv + h) * D..][..D];
-            let w = &decode.out[(t * nv + h) * D..][..D];
+            let w = &opposite.out[(t * nv + h) * D..][..D];
             let s = w.iter().fold(1.0f64, |m, x| m.max(x.abs()));
             mutant = g
                 .iter()
@@ -1478,12 +1491,12 @@ fn gdn_scan_seq_near_zero_k_uses_the_ggml_l2_form() -> Result<(), EngError> {
         }
     }
     println!(
-        "REPORTED: test 8 the two forms differ by {forms:.3e} (scale {scale:.3e}); the kernel against the DECODE form {mutant:.3e} > E3 {E3:.3e}: {}",
+        "REPORTED: test 8 the two forms differ by {forms:.3e} (scale {scale:.3e}); the kernel against the opposite form {mutant:.3e} > E3 {E3:.3e}: {}",
         mutant > E3
     );
     assert!(
         mutant > E3,
-        "the kernel also matches the decode form; the near-zero discrimination is gone"
+        "the kernel also matches the opposite form; the near-zero discrimination is gone"
     );
     Ok(())
 }

@@ -36,22 +36,22 @@ use std::mem::{offset_of, size_of};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-/// Opt-in switch (`FIFI_CUDA_EXACT_TRANSCENDENTALS=1`): selects `GdnL2::AddEps` for Qwen3.6
-/// prefill scans and routes decode `gdn_conv`, `gdn_delta`, and `swiglu_q8` to in-house IEEE
-/// `expf` kernels. Unset or anything other than `1` preserves default bits.
+/// Default-on switch (`FIFI_CUDA_EXACT_TRANSCENDENTALS`, set `0` to disable): selects
+/// `GdnL2::AddEps` for Qwen3.6 prefill scans and routes decode `gdn_conv`, `gdn_delta`, and
+/// `swiglu_q8` to in-house IEEE `expf` kernels.
 pub(in crate::kernels::cuda) fn exact_transcendentals() -> bool {
     static EXACT: OnceLock<bool> = OnceLock::new();
     *EXACT.get_or_init(|| {
-        std::env::var_os("FIFI_CUDA_EXACT_TRANSCENDENTALS").is_some_and(|v| v == "1")
+        !std::env::var_os("FIFI_CUDA_EXACT_TRANSCENDENTALS").is_some_and(|v| v == "0")
     })
 }
 
-/// Opt-in switch (`FIFI_CUDA_Q8_1_ROUNDED=1`): routes decode `block_q8_1` producers
-/// (`quantize_q8_1`, `add_rmsnorm_q8`, `swiglu_q8`, `block_ops`) to the f16-scale-consistent
-/// rounded-sum rule (`ds.y = d_f16 * sum(q)`). Default off.
+/// Default-on switch (`FIFI_CUDA_Q8_1_ROUNDED`, set `0` to disable): routes decode `block_q8_1`
+/// producers (`quantize_q8_1`, `add_rmsnorm_q8`, `swiglu_q8`, `block_ops`) to the
+/// f16-scale-consistent rounded-sum rule (`ds.y = d_f16 * sum(q)`).
 pub(in crate::kernels::cuda) fn rounded_q8_1() -> bool {
     static ROUNDED: OnceLock<bool> = OnceLock::new();
-    *ROUNDED.get_or_init(|| std::env::var_os("FIFI_CUDA_Q8_1_ROUNDED").is_some_and(|v| v == "1"))
+    *ROUNDED.get_or_init(|| !std::env::var_os("FIFI_CUDA_Q8_1_ROUNDED").is_some_and(|v| v == "0"))
 }
 
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
