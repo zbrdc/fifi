@@ -52,6 +52,7 @@ pub(crate) enum Role {
 
 impl Role {
     /// Short projection tag matched by `FIFI_CUDA_DECODE_DQ_ROLES`.
+    #[cfg(feature = "native-cuda")]
     pub(crate) fn dq_tag(self) -> &'static str {
         match self {
             Self::AttnQ => "attn_q",
