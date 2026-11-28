@@ -31,7 +31,7 @@ use crate::family::step::recipe::Layer;
 use crate::family::step::recipe::{Forward, Mixer};
 use crate::family::step::replay::Replay;
 use crate::family::step::rows::Map;
-use crate::family::step::scratch::{OnDevice, Zeroed};
+use crate::family::step::scratch::{Count, OnDevice, Zeroed};
 use crate::family::step::state::{Slots, State};
 use crate::family::step::tail::Tail;
 use crate::family::step::{attend, delta};
@@ -218,6 +218,72 @@ impl<'a> LoopStep<'a> {
     ) -> Result<Self, EngError> {
         let model = looped(shape, plan, rope);
         Self::open_model(ctx, weights, &model, plan.routing(), cache_rows)
+    }
+
+    /// The device bytes each cached position of `model` takes: the key and value planes of its
+    /// attention visits. Counted from the state's own declaration, so it is what an open
+    /// allocates per row.
+    pub(crate) fn bytes_per_position(model: &Model) -> Result<u64, EngError> {
+        let shape = &model.shape;
+        let (_, slots) = crate::family::qwen::recipe::layers(&model.visits, model.blocks);
+        let counted = |rows: usize| -> Result<u64, EngError> {
+            let count = Count::default();
+            State::new(
+                &count,
+                Slots {
+                    delta: slots.delta,
+                    ring: shape.conv_dim() * (shape.conv_kernel - 1),
+                    record: shape.delta_value_heads * shape.delta_key_dim * shape.delta_value_dim,
+                    attend: slots.attend,
+                    plane: rows * shape.heads_kv * shape.head_dim * 2,
+                    rows,
+                },
+            )?;
+            Ok(count.total())
+        };
+        Ok(counted(2)? - counted(1)?)
+    }
+
+    /// The executor with the deepest cache the device admits, up to `wanted` positions. It opens
+    /// the step once with a cache of one position, so that everything else the step holds is
+    /// allocated, reads the free memory, and gives the cache what is left after `keep_free`.
+    /// A model's trained context is `wanted`; the device decides how much of it is served.
+    pub(crate) fn open_planned(
+        ctx: Rc<CudaContext>,
+        weights: &'a CudaWeights,
+        model: &Model,
+        routing: Routing,
+        wanted: usize,
+        keep_free: u64,
+    ) -> Result<Self, EngError> {
+        if wanted == 0 {
+            return Err(EngError::BadRequest(format!(
+                "{}: requested context length must be at least 1",
+                model.family
+            )));
+        }
+        let per_position = Self::bytes_per_position(model)?;
+        let probe = Self::open_model(Rc::clone(&ctx), weights, model, routing, 1)?;
+        let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
+        drop(probe);
+        let affordable = free
+            .saturating_sub(keep_free)
+            .checked_div(per_position)
+            .unwrap_or(if free >= keep_free { u64::MAX } else { 0 });
+        let floor = wanted.min(prefill::PREFILL_ROWS);
+        let rows = wanted.min(usize::try_from(affordable).unwrap_or(usize::MAX));
+        if rows < floor {
+            return Err(EngError::MemoryPlan(format!(
+                "{}: the device has {free} bytes free after the step's scratch; with {keep_free} kept free that is {affordable} cached positions of {per_position} bytes, fewer than the minimum {floor}",
+                model.family
+            )));
+        }
+        Self::open_model(ctx, weights, model, routing, rows)
+    }
+
+    /// The positions the step's cache holds.
+    pub(crate) fn cache_rows(&self) -> usize {
+        self.cache_rows
     }
 
     /// The executor of any model of the lineage over a completed device load.

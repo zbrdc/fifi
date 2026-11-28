@@ -1398,6 +1398,68 @@ fn card_reports_the_served_greedy_step_with_and_without_the_device_pick() {
     );
 }
 
+/// The planned open of a lineage model (`LINEAGE_STEP_GGUF`): asked for `LINEAGE_STEP_WANTED`
+/// positions (default: more than any device holds), the step takes what the device admits and
+/// leaves the bytes it was told to keep free. The deepest position then takes a step, so the
+/// planned cache is a cache the kernels accept.
+#[test]
+fn the_planned_step_takes_the_context_the_device_admits() {
+    use crate::family::mem::DEVICE;
+    let Ok(path) = std::env::var("LINEAGE_STEP_GGUF") else {
+        eprintln!("skipped: set LINEAGE_STEP_GGUF");
+        return;
+    };
+    if !device_present("the planned step") {
+        return;
+    }
+    let wanted: usize =
+        std::env::var("LINEAGE_STEP_WANTED").map_or(1 << 22, |v| v.parse().unwrap());
+    let file = Arc::new(
+        GgufWeights::open_any_type(
+            &std::path::PathBuf::from(path),
+            GgufLimits {
+                max_header_bytes: 32 << 20,
+                max_tensor_bytes: 8 << 30,
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let (model, routing) = super::serve::model_of(&file).unwrap();
+    let ctx = Rc::new(CudaContext::new().unwrap());
+    let loaded = super::serve::load_model(&ctx, &file, &model).unwrap();
+    let keep_free = DEVICE.runtime_overhead_floor;
+    let per_position = LoopStep::bytes_per_position(&model).unwrap();
+    let before = ctx.memory_info().unwrap().free as u64;
+    let mut card =
+        LoopStep::open_planned(ctx.clone(), &loaded, &model, routing, wanted, keep_free).unwrap();
+    let rows = card.cache_rows();
+    let after = ctx.memory_info().unwrap().free as u64;
+    eprintln!(
+        "{}: {per_position} bytes per position; free {before} before the step, {after} after; {rows} positions planned of {wanted} wanted ({:.2} GiB of cache)",
+        model.family,
+        (rows as u64 * per_position) as f64 / (1u64 << 30) as f64
+    );
+    assert!(rows <= wanted && rows >= wanted.min(super::step::PREFILL_ROWS));
+    assert!(
+        after >= keep_free / 2,
+        "the plan left {after} bytes free, far under the {keep_free} it was told to keep"
+    );
+    let shape = model.shape;
+    let embd = crate::family::project::gguf::GgufMatrix::new(
+        file.header(),
+        "token_embd.weight",
+        shape.vocab,
+        shape.hidden,
+    )
+    .unwrap();
+    let mut projector = GgufProjector::new(file.clone());
+    let row = projector.rows(&embd, &[17]).unwrap();
+    card.decode(&row, rows - 1).unwrap();
+    assert!(worst_abs(&drain_row(&ctx, &card)).is_finite());
+    assert!(card.decode(&row, rows).is_err());
+}
+
 /// Timing, not a gate: the parts of one served decode step of a lineage model
 /// (`LINEAGE_STEP_GGUF`), after a prompt of `LINEAGE_STEP_PROMPT` hashed ids (default 512).
 /// Over 64 steps each: the host gather of the embedding row; the step with its upload, waited

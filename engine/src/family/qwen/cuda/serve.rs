@@ -24,6 +24,7 @@ use std::{
 use super::step::{LoopStep, PREFILL_ROWS, Routing, looped};
 use crate::EngError;
 use crate::family::executor::SerialDecode;
+use crate::family::mem::DEVICE;
 use crate::family::project::Projector;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeights, LoadOptions, WeightLayout, served_admission,
@@ -35,6 +36,7 @@ use crate::family::sampler::Sampler;
 use crate::family::session::{DecodeSession, TokenStepper, sample_logits};
 use crate::family::step::tail::device_table;
 use crate::kernels::cuda::CudaContext;
+use crate::kernels::cuda::resident::embed::EmbedTable;
 use crate::sched::worker::{Engine, ReadyNote, spawn_engine_noted};
 use crate::weights::{GgufLimits, GgufWeights, MetaValue};
 
@@ -79,37 +81,97 @@ pub(crate) fn load_model(
     )
 }
 
-/// Starts the card engine of one GGUF file. The context limit is also the step's cache depth.
+/// Starts the card engine of one GGUF file and returns it with the context it serves: the
+/// model's `trained` context, cut to the positions the device admits once the weights and the
+/// step's scratch are on it. The engine thread announces that number as soon as it is planned.
 pub(crate) fn start(
     file: PathBuf,
     limits: GgufLimits,
     ready_note: ReadyNote,
     eos: Vec<u32>,
     sampler_vocab: usize,
-    context_limit: u32,
-) -> Result<Engine, EngError> {
+    trained: u32,
+) -> Result<(Engine, u32), EngError> {
     let mut guard = BuildGuard::acquire()?;
-    let cache_rows = context_limit as usize;
+    let (announce, resolved) = std::sync::mpsc::sync_channel::<Result<u32, String>>(1);
     let engine = spawn_engine_noted(PREFILL_ROWS, ready_note, move |_| {
         let began = Instant::now();
-        let ctx = Rc::new(CudaContext::with_admission(&served_admission())?);
-        let gguf = Arc::new(GgufWeights::open_any_type(&file, limits, None)?);
-        let (model, routing) = model_of(&gguf)?;
-        let loaded = load_model(&ctx, &gguf, &model)?;
-        // Past this point the load is the process's: see the module note.
-        guard.commit();
-        let loaded: &'static CudaWeights = Box::leak(Box::new(loaded));
-        let step = LoopStep::open_model(Rc::clone(&ctx), loaded, &model, routing, cache_rows)?;
+        let opened = (|| -> Result<(CardStep, usize, &'static str), EngError> {
+            let ctx = Rc::new(CudaContext::with_admission(&served_admission())?);
+            let gguf = Arc::new(GgufWeights::open_any_type(&file, limits, None)?);
+            let (model, routing) = model_of(&gguf)?;
+            let loaded = load_model(&ctx, &gguf, &model)?;
+            // Past this point the load is the process's: see the module note.
+            guard.commit();
+            let loaded: &'static CudaWeights = Box::leak(Box::new(loaded));
+            // What the step still takes after its cache is sized: the embedding table of the
+            // token tail (when the device gather reads its stored type) and the allocations a
+            // serving process makes after it measures. If keeping room for the table leaves too
+            // little cache, fall back to host embeddings rather than refusing to start.
+            let table = gguf
+                .header()
+                .tensor("token_embd.weight")
+                .filter(|tensor| EmbedTable::gathers(tensor.ggml_type()))
+                .map_or(0, |tensor| tensor.byte_len());
+            let base_free = DEVICE
+                .runtime_overhead_floor
+                .max(DEVICE.embedding_table_reserve);
+            let step = match LoopStep::open_planned(
+                Rc::clone(&ctx),
+                loaded,
+                &model,
+                routing,
+                trained as usize,
+                base_free.saturating_add(table),
+            ) {
+                Ok(step) => step,
+                Err(EngError::MemoryPlan(_)) if table > 0 => LoopStep::open_planned(
+                    Rc::clone(&ctx),
+                    loaded,
+                    &model,
+                    routing,
+                    trained as usize,
+                    DEVICE.runtime_overhead_floor,
+                )?,
+                Err(error) => return Err(error),
+            };
+            let rows = step.cache_rows();
+            Ok((CardStep::new(step, &gguf, &model)?, rows, model.family))
+        })();
+        let (card, rows, family) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                let _ = announce.send(Err(error.describe()));
+                return Err(error);
+            }
+        };
+        let _ = announce.send(Ok(u32::try_from(rows).unwrap_or(u32::MAX)));
         eprintln!(
-            "{} cuda: ready in {:.1} s; the card step serves",
-            model.family,
+            "{family} cuda: ready in {:.1} s; the card step serves {rows} positions",
             began.elapsed().as_secs_f64()
         );
-        let card = CardStep::new(step, &gguf, &model)?;
-        let executor = SerialDecode::new(card, eos, sampler_vocab, cache_rows);
+        let executor = SerialDecode::new(card, eos, sampler_vocab, rows);
         Ok((executor, DecodeSession::default()))
     })?;
-    Ok(engine)
+    let context = match resolved.recv() {
+        Ok(Ok(context)) => context,
+        Ok(Err(cause)) => {
+            let _ = engine.shutdown();
+            return Err(EngError::Checkpoint(format!(
+                "the card start failed before the model was ready: {cause}"
+            )));
+        }
+        Err(_) => {
+            let report = engine.shutdown();
+            return Err(EngError::Checkpoint(format!(
+                "the card start failed before the model was ready: {}",
+                report
+                    .failure
+                    .unwrap_or_else(|| "the engine thread ended without a cause".into())
+            )));
+        }
+    };
+    Ok((engine, context))
 }
 
 /// The model side of one session: the card step over the leaked load, the file's embedding

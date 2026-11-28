@@ -26,8 +26,9 @@ use super::{
 
 // Every row is a synchronous host forward; allow cancellation between rows.
 const PREFILL_PIECE: usize = 1;
-// shortcut: cap the context at 4K until larger contexts have a memory plan (the host's f32 KV
-// cache, the card's attention cache depth).
+// The host reference step serves this many positions: it keeps an f32 cache in host memory and
+// takes minutes per token, so it is a reference, not a serving path. The card step has no such
+// constant: it serves the model's trained context, cut to what the device admits.
 pub(super) const CONTEXT_LIMIT: u32 = 4096;
 pub(super) const LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 32 << 20,
@@ -72,14 +73,20 @@ pub(crate) fn select_gguf(model: &Path) -> Result<PathBuf, EngError> {
     )))
 }
 
-fn context_limit(file: &Path) -> Result<u32, EngError> {
+/// The context the model was trained for, from its header.
+fn trained_context(file: &Path) -> Result<u32, EngError> {
     let header = shared_header(file, LIMITS.max_header_bytes)?;
     match header.meta("sensenova_loop.context_length") {
-        Some(MetaValue::U32(n)) if *n > 1 => Ok((*n).min(CONTEXT_LIMIT)),
+        Some(MetaValue::U32(n)) if *n > 1 => Ok(*n),
         _ => Err(EngError::Checkpoint(
             "sensenova: invalid context_length".into(),
         )),
     }
+}
+
+/// The context of the host reference step.
+fn context_limit(file: &Path) -> Result<u32, EngError> {
+    Ok(trained_context(file)?.min(CONTEXT_LIMIT))
 }
 
 /// `FIFI_SENSENOVA_CUDA=1` serves from the card step; without it the host step serves.
@@ -122,16 +129,8 @@ fn start_on_card(
     eos: Vec<u32>,
     sampler_vocab: usize,
 ) -> Result<(Engine, u32), EngError> {
-    let limit = context_limit(&file)?;
-    let engine = crate::family::qwen::cuda::serve::start(
-        file,
-        LIMITS,
-        ready_note,
-        eos,
-        sampler_vocab,
-        limit,
-    )?;
-    Ok((engine, limit))
+    let trained = trained_context(&file)?;
+    crate::family::qwen::cuda::serve::start(file, LIMITS, ready_note, eos, sampler_vocab, trained)
 }
 
 #[cfg(not(feature = "native-cuda"))]
