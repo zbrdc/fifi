@@ -195,40 +195,100 @@ pub(crate) fn mix(
         rank: d.rank,
     };
     let tiled = !io.exact && n > FEW_ROWS;
-    let absorb = if tiled {
-        BlockOp::mla_q_absorb_chunk
+    let unabsorbed_tile_keys =
+        if tiled && d.key_dim == 128 && d.head_dim == 128 && d.rank == 512 && d.rot_dims == 64 {
+            let by_k = rows.absorbed.bytes() / (d.heads * d.key_dim * 2);
+            let by_v = rows.mixed.bytes() / (d.heads * d.head_dim * 2);
+            let ml_need = n * d.heads * 2 * 4;
+            if rows.part.bytes() >= ml_need {
+                (by_k.min(by_v) / 32 * 32).min(4096)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+    if unabsorbed_tile_keys >= 32 {
+        let total_keys = p0 + n;
+        let q_range = rows.query.range(0, n * d.heads * query_row * 4)?;
+        let out_range = rows.attended.range(0, n * width * 4)?;
+        let ml_range = rows.part.range(0, n * d.heads * 2 * 4)?;
+        let mut k_base = 0;
+        while k_base < total_keys {
+            let k_len = unabsorbed_tile_keys.min(total_keys - k_base);
+            let k_tile = rows.absorbed.range(0, d.heads * k_len * d.key_dim * 2)?;
+            let v_tile = rows.mixed.range(0, d.heads * k_len * d.head_dim * 2)?;
+            io.run(BlockOp::mla_kv_expand(
+                k_len,
+                d.heads,
+                d.rank,
+                d.rot_dims,
+                d.key_dim,
+                k_base,
+                true,
+                rows.cache,
+                rows.key_factor,
+                k_tile,
+            )?)?;
+            io.run(BlockOp::mla_kv_expand(
+                k_len,
+                d.heads,
+                d.rank,
+                d.rot_dims,
+                d.head_dim,
+                k_base,
+                false,
+                rows.cache,
+                rows.value_factor,
+                v_tile,
+            )?)?;
+            io.run(BlockOp::mla_attn_unabsorbed(
+                shape,
+                d.head_dim,
+                (p0, k_base, k_len),
+                d.scale,
+                [q_range, k_tile, rows.cache, v_tile],
+                out_range,
+                ml_range,
+            )?)?;
+            k_base += k_len;
+        }
     } else {
-        BlockOp::mla_q_absorb
-    };
-    io.run(absorb(
-        shape,
-        rows.query.range(0, n * d.heads * query_row * 4)?,
-        rows.key_factor,
-        rows.absorbed.range(0, n * d.heads * row * 4)?,
-    )?)?;
-    let splits = score(io, d, rows, n, p0)?;
-    io.run(BlockOp::mla_reduce(
-        n,
-        d.heads,
-        d.rank,
-        splits,
-        rows.part.range(0, part_bytes(d, n, splits))?,
-        rows.mixed.range(0, n * d.heads * d.rank * 4)?,
-    )?)?;
-    let project = if tiled {
-        BlockOp::mla_project_chunk
-    } else {
-        BlockOp::mla_project
-    };
-    io.run(project(
-        n,
-        d.heads,
-        d.rank,
-        d.head_dim,
-        rows.mixed.range(0, n * d.heads * d.rank * 4)?,
-        rows.value_factor,
-        rows.attended.range(0, n * width * 4)?,
-    )?)?;
+        let absorb = if tiled {
+            BlockOp::mla_q_absorb_chunk
+        } else {
+            BlockOp::mla_q_absorb
+        };
+        io.run(absorb(
+            shape,
+            rows.query.range(0, n * d.heads * query_row * 4)?,
+            rows.key_factor,
+            rows.absorbed.range(0, n * d.heads * row * 4)?,
+        )?)?;
+        let splits = score(io, d, rows, n, p0)?;
+        io.run(BlockOp::mla_reduce(
+            n,
+            d.heads,
+            d.rank,
+            splits,
+            rows.part.range(0, part_bytes(d, n, splits))?,
+            rows.mixed.range(0, n * d.heads * d.rank * 4)?,
+        )?)?;
+        let project = if tiled {
+            BlockOp::mla_project_chunk
+        } else {
+            BlockOp::mla_project
+        };
+        io.run(project(
+            n,
+            d.heads,
+            d.rank,
+            d.head_dim,
+            rows.mixed.range(0, n * d.heads * d.rank * 4)?,
+            rows.value_factor,
+            rows.attended.range(0, n * width * 4)?,
+        )?)?;
+    }
     io.mv(&names.gate, rows.input, rows.gate, n)?;
     io.quantize(n, width, rows.attended, Some(rows.gate), rows.gated)?;
     io.mv(&names.out, rows.gated, rows.out, n)

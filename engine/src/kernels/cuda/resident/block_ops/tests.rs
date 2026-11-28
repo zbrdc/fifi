@@ -1254,3 +1254,134 @@ fn the_chunk_latent_absorb_and_project_match_the_row_path() {
         assert_close("mla_project_chunk", &got_o, &want_o, 2e-2);
     }
 }
+
+/// Tiled unabsorbed latent KV expansion and FlashAttention against the absorbed row path across
+/// single-tile and multi-tile non-aligned causal schedules, with NaN-poisoned future cache rows
+/// and NaN-initialized output/state buffers.
+#[test]
+fn the_unabsorbed_latent_expand_and_attention_match_the_absorbed_path() {
+    let Some(r) = rig("block_ops mla unabsorbed") else {
+        return;
+    };
+    let (nope, rope, rank, v_dim) = (128usize, 64usize, 512usize, 128usize);
+    let row = rank + rope;
+    let scale = 1.0f32 / ((nope + rope) as f32).sqrt();
+    for (n, pos0, heads, tile_keys) in [
+        (17usize, 0usize, 8usize, 64usize),
+        (135, 37, 16, 64),
+        (65, 0, 8, 32),
+    ] {
+        let total_keys = pos0 + n;
+        let cells = total_keys + 32;
+        let shape = MlaShape {
+            n,
+            heads,
+            nope,
+            rope,
+            rank,
+        };
+        let qb = r.up(&data(201 + n as u64, n * heads * (nope + rope), 0.35));
+        let wk = r.up(&data(202 + heads as u64, heads * rank * nope, 0.12));
+        let wv = r.up(&data(203 + heads as u64, heads * v_dim * rank, 0.12));
+
+        // Fill active cache rows with finite f16 values and trailing rows with f16 NaN.
+        let mut cache_bytes = f16_bytes(&data(204 + pos0 as u64, total_keys * row, 0.4));
+        cache_bytes.extend(0x7E00u16.to_le_bytes().repeat((cells - total_keys) * row));
+        let cache = r.up_bytes(&cache_bytes);
+
+        // Reference: absorbed exact-f32 row path.
+        let qeff = r.zeros(n * heads * row);
+        let splits = 1usize;
+        let kps = total_keys.next_multiple_of(32);
+        let part = r.zeros(n * (heads / MLA_GROUP) * splits * MLA_GROUP * (rank + 4));
+        let mix = r.zeros(n * heads * rank);
+        let out_ref = r.zeros(n * heads * v_dim);
+        r.run(BlockOp::mla_q_absorb(shape, whole(&qb), whole(&wk), whole(&qeff)).expect("absorb"));
+        r.run(
+            BlockOp::mla_attn(
+                shape,
+                (pos0, splits, kps),
+                scale,
+                [whole(&qeff), whole(&cache), whole(&part)],
+            )
+            .expect("attn"),
+        );
+        r.run(
+            BlockOp::mla_reduce(n, heads, rank, splits, whole(&part), whole(&mix)).expect("reduce"),
+        );
+        r.run(
+            BlockOp::mla_project(
+                n,
+                heads,
+                rank,
+                v_dim,
+                whole(&mix),
+                whole(&wv),
+                whole(&out_ref),
+            )
+            .expect("project"),
+        );
+        let want = r.read(&out_ref, n * heads * v_dim);
+
+        // Candidate: tiled unabsorbed expand + attention with NaN-initialized output and ml.
+        let k_buf = r.zero_bytes(heads * tile_keys * nope * 2);
+        let v_buf = r.zero_bytes(heads * tile_keys * v_dim * 2);
+        let out_unab = r.up(&vec![f32::NAN; n * heads * v_dim]);
+        let ml = r.up(&vec![f32::NAN; n * heads * 2]);
+        let mut k_base = 0;
+        while k_base < total_keys {
+            let k_len = tile_keys.min(total_keys - k_base);
+            let k_tile = k_buf.range(0, heads * k_len * nope * 2).expect("k_tile");
+            let v_tile = v_buf.range(0, heads * k_len * v_dim * 2).expect("v_tile");
+            r.run(
+                BlockOp::mla_kv_expand(
+                    k_len,
+                    heads,
+                    rank,
+                    rope,
+                    nope,
+                    k_base,
+                    true,
+                    whole(&cache),
+                    whole(&wk),
+                    k_tile,
+                )
+                .expect("expand k"),
+            );
+            r.run(
+                BlockOp::mla_kv_expand(
+                    k_len,
+                    heads,
+                    rank,
+                    rope,
+                    v_dim,
+                    k_base,
+                    false,
+                    whole(&cache),
+                    whole(&wv),
+                    v_tile,
+                )
+                .expect("expand v"),
+            );
+            r.run(
+                BlockOp::mla_attn_unabsorbed(
+                    shape,
+                    v_dim,
+                    (pos0, k_base, k_len),
+                    scale,
+                    [whole(&qb), k_tile, whole(&cache), v_tile],
+                    whole(&out_unab),
+                    whole(&ml),
+                )
+                .expect("unabsorbed attn"),
+            );
+            k_base += k_len;
+        }
+        let got = r.read(&out_unab, n * heads * v_dim);
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "unabsorbed output finite (n={n} pos0={pos0})"
+        );
+        assert_close("mla_unabsorbed", &got, &want, 2e-2);
+    }
+}

@@ -541,6 +541,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float *qeff, const 
 
 #include "resident/mla_attn_chunk.cuh"
 #include "resident/block_gemm.cuh"
+#include "resident/mla_unabsorbed.cuh"
 
 __global__ void __launch_bounds__(128) mla_reduce_kernel(const float *part, float *mix, int heads,
                                                          int splits) {
@@ -992,6 +993,77 @@ extern "C" int inference_cuda_block_ops_launch_mode(const inference_cuda_block_o
             mla_project_kernel<<<dim3((unsigned)n, (unsigned)heads), 128, (size_t)rank * 4, s>>>(
                 (const float *)p[0], (const float *)p[1], (float *)p[2], (int)heads, (int)rank,
                 (int)v);
+            return launch_status(out_stage);
+        }
+        case INFERENCE_CUDA_BLOCK_OP_MLA_KV_EXPAND: {
+            const long long k_len = i[0], heads = i[1], rank = i[2], rope = i[3];
+            const long long d_out = i[4], k_base = i[5], transpose_w = i[6];
+            if (k_len < 1 || k_len > 65536 || heads < 1 || heads > 256 || rank != kMlaRank ||
+                rope != kMlaRope || d_out != kUnabNope || k_base < 0 ||
+                (transpose_w != 0 && transpose_w != 1))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.use(0, (k_base + k_len) * (rank + rope) * 2, false);
+            slots.use(1, heads * rank * d_out * 4, false);
+            slots.use(2, heads * k_len * d_out * 2, true);
+            if (!slots.valid() || !aligned(p[0], 16) || !aligned(p[1], 16) || !aligned(p[2], 16))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            int err = 0;
+            const int arm = probe_sm80(mla_kv_expand_kernel<true>, out_stage, &err);
+            if (arm == 0) return err;
+            if (arm == 1) {
+                const dim3 grid((unsigned)(d_out / kUnabExpBn),
+                                (unsigned)((k_len + kUnabExpBm - 1) / kUnabExpBm),
+                                (unsigned)heads);
+                if (transpose_w) {
+                    mla_kv_expand_kernel<true><<<grid, 256, 0, s>>>(
+                        (const __half *)p[0], (const float *)p[1], (__half *)p[2], (int)k_len,
+                        (int)k_base);
+                } else {
+                    mla_kv_expand_kernel<false><<<grid, 256, 0, s>>>(
+                        (const __half *)p[0], (const float *)p[1], (__half *)p[2], (int)k_len,
+                        (int)k_base);
+                }
+            } else {
+                mla_kv_expand_fallback_kernel<<<dim3((unsigned)k_len, (unsigned)heads), kUnabNope,
+                                                0, s>>>(
+                    (const __half *)p[0], (const float *)p[1], (__half *)p[2], (int)k_len,
+                    (int)k_base, (int)transpose_w);
+            }
+            return launch_status(out_stage);
+        }
+        case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_UNABSORBED: {
+            const long long n = i[0], heads = i[1], nope = i[2], rope = i[3], rank = i[4];
+            const long long v_dim = i[5], pos0 = i[6], k_base = i[7], k_len = i[8];
+            if (n < 1 || n > 65536 || heads < 1 || heads > 256 || nope != kUnabNope ||
+                rope != kUnabRope || rank != kMlaRank || v_dim != kUnabV || pos0 < 0 ||
+                k_base < 0 || k_len < 1 || k_len > 65536 || k_base >= pos0 + n)
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.use(0, n * heads * (nope + rope) * 4, false);
+            slots.use(1, heads * k_len * nope * 2, false);
+            slots.use(2, (k_base + k_len) * (rank + rope) * 2, false);
+            slots.use(3, heads * k_len * v_dim * 2, false);
+            slots.use(4, n * heads * v_dim * 4, true);
+            slots.use(5, n * heads * 2 * 4, true);
+            if (!slots.valid() || !aligned(p[0], 8) || !aligned(p[1], 16) || !aligned(p[2], 16) ||
+                !aligned(p[3], 16) || !aligned(p[4], 8) || !aligned(p[5], 8))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            int err = 0;
+            const int arm = probe_sm80(mla_attn_unabsorbed_tile_kernel, out_stage, &err);
+            if (arm == 0) return err;
+            if (arm == 1) {
+                const unsigned tiles_q = (unsigned)((n + kUnabBr - 1) / kUnabBr);
+                mla_attn_unabsorbed_tile_kernel<<<dim3(tiles_q, (unsigned)heads), kUnabThreads, 0,
+                                                  s>>>(
+                    (const float *)p[0], (const __half *)p[1], (const __half *)p[2],
+                    (const __half *)p[3], (float *)p[4], (float *)p[5], (int)n, (int)heads,
+                    (int)pos0, (int)k_base, (int)k_len, f[0]);
+            } else {
+                mla_attn_unabsorbed_fallback_kernel<<<dim3((unsigned)n, (unsigned)heads), kUnabV, 0,
+                                                      s>>>(
+                    (const float *)p[0], (const __half *)p[1], (const __half *)p[2],
+                    (const __half *)p[3], (float *)p[4], (float *)p[5], (int)heads, (int)pos0,
+                    (int)k_base, (int)k_len, f[0]);
+            }
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_F16_GEMM: {

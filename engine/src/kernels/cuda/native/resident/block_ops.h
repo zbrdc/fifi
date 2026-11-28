@@ -82,6 +82,19 @@ extern "C" {
  *             to MLA_Q_ABSORB on < sm_80). Same slots and integers as MLA_Q_ABSORB.
  * 22 MLA_PROJECT_CHUNK batched MLA_PROJECT on tf32 tensor cores (f32 accumulation; falls back
  *             to MLA_PROJECT on < sm_80). Same slots and integers as MLA_PROJECT.
+ * 23 MLA_KV_EXPAND expands a tile of k_len cached latent rows into per-head f16 keys or values
+ *             (m16n8k16 fp16->f32 on sm_80+, scalar fallback otherwise). p0 cache f16
+ *             [cells][rank+rope] (16B aligned); p1 w f32 ([heads][rank][d_out] when transpose_w=1,
+ *             [heads][d_out][rank] when transpose_w=0, 16B aligned); p2 out f16
+ *             [heads][k_len][d_out] (W, 16B aligned). i0 k_len; i1 heads; i2 rank (512);
+ *             i3 rope (64); i4 d_out (128); i5 k_base; i6 transpose_w (0 or 1).
+ * 24 MLA_ATTN_UNABSORBED one key-tile pass of tiled unabsorbed FlashAttention (m16n8k16 on
+ *             sm_80+, scalar fallback otherwise). p0 qb f32 [n][heads][nope+rope] (8B aligned);
+ *             p1 k_nope f16 [heads][k_len][nope] (16B aligned); p2 cache f16 [cells][rank+rope]
+ *             (16B aligned, for shared k_rope); p3 v f16 [heads][k_len][v_dim] (16B aligned);
+ *             p4 out f32 [n][heads][v_dim] (W, 8B aligned); p5 ml f32 [n][heads][2] (W, 8B
+ *             aligned). i0 n; i1 heads; i2 nope (128); i3 rope (64); i4 rank (512); i5 v_dim
+ *             (128); i6 pos0; i7 k_base; i8 k_len; f0 scale.
  */
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,
@@ -101,7 +114,9 @@ enum {
     INFERENCE_CUDA_BLOCK_OP_MLA_KV_PREP_STEP = 19,
     INFERENCE_CUDA_BLOCK_OP_F16_GEMM = 20,
     INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB_CHUNK = 21,
-    INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT_CHUNK = 22
+    INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT_CHUNK = 22,
+    INFERENCE_CUDA_BLOCK_OP_MLA_KV_EXPAND = 23,
+    INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_UNABSORBED = 24
 };
 
 typedef struct inference_cuda_block_ops_args {

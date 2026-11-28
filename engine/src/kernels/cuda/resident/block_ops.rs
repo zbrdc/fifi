@@ -433,6 +433,71 @@ impl<'b> BlockOp<'b> {
             .write(2, out, bytes(&[n, heads, v, 4])?))
     }
 
+    /// Expands `k_len` cached latent rows starting at `k_base` into per-head f16 keys
+    /// (`transpose_w = true`, `w` shaped `[heads][rank][d_out]`) or values (`transpose_w = false`,
+    /// `w` shaped `[heads][d_out][rank]`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mla_kv_expand(
+        k_len: usize,
+        heads: usize,
+        rank: usize,
+        rope: usize,
+        d_out: usize,
+        k_base: usize,
+        transpose_w: bool,
+        cache: DeviceRange<'b>,
+        w: DeviceRange<'b>,
+        out: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        Ok(Self::new(
+            23,
+            &[
+                k_len,
+                heads,
+                rank,
+                rope,
+                d_out,
+                k_base,
+                usize::from(transpose_w),
+            ],
+            &[],
+        )?
+        .read(0, cache, bytes(&[k_base + k_len, rank + rope, 2])?)
+        .read(1, w, bytes(&[heads, rank, d_out, 4])?)
+        .write(2, out, bytes(&[heads, k_len, d_out, 2])?))
+    }
+
+    /// One key-tile pass of tiled unabsorbed latent attention over `[k_base .. k_base + k_len)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mla_attn_unabsorbed(
+        shape: MlaShape,
+        v_dim: usize,
+        (pos0, k_base, k_len): (usize, usize, usize),
+        scale: f32,
+        [qb, k_nope, cache, v]: [DeviceRange<'b>; 4],
+        out: DeviceRange<'b>,
+        ml: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        let MlaShape {
+            n,
+            heads,
+            nope,
+            rope,
+            rank,
+        } = shape;
+        Ok(Self::new(
+            24,
+            &[n, heads, nope, rope, rank, v_dim, pos0, k_base, k_len],
+            &[scale],
+        )?
+        .read(0, qb, bytes(&[n, heads, nope + rope, 4])?)
+        .read(1, k_nope, bytes(&[heads, k_len, nope, 2])?)
+        .read(2, cache, bytes(&[k_base + k_len, rank + rope, 2])?)
+        .read(3, v, bytes(&[heads, k_len, v_dim, 2])?)
+        .write(4, out, bytes(&[n, heads, v_dim, 4])?)
+        .write(5, ml, bytes(&[n, heads, 2, 4])?))
+    }
+
     /// Batched projection `y[n][rows] = x[n][cols] * w[rows][cols]^T` of f32 rows through an f16
     /// matrix on f16 tensor cores (f32 accumulation; scalar fallback on older architectures).
     pub(crate) fn f16_gemm(
