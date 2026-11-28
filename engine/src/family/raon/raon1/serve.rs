@@ -3,8 +3,9 @@
 //!
 //! One session per engine. The token side is the shared `DecodeSession` (`family::session`):
 //! it owns the committed tokens, the pending token and the finish rules. The model side is a
-//! `TokenStepper` over the device forward pass: prompt rows run as chunks without the head, and
-//! the pending token's step returns the logits that the host sampler draws from.
+//! `TokenStepper` over the device forward pass: prompt rows run as chunks without the head,
+//! greedy decode picks tokens on the device when the embedding table is resident, and other
+//! requests read the logits row back to the host sampler.
 
 use std::path::Path;
 

@@ -567,9 +567,10 @@ impl Raon1Device {
                 self.vocab
             )));
         }
-        if self.tail.is_none() {
+        if self.tail.is_none() || self.exact.get() || self.trace.borrow().is_some() {
             return Err(EngError::BadRequest(
-                "raon1: no device embedding table for token decode".into(),
+                "raon1: token decode requires a resident embedding table without exact or trace"
+                    .into(),
             ));
         }
         let params = StepParams::new(token as i32, pos as i32)?;

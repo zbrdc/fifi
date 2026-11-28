@@ -244,16 +244,21 @@ impl<'b> BlockOp<'b> {
         pos_word: Option<DeviceRange<'b>>,
     ) -> Result<Self, EngError> {
         let MlaShape {
-            heads, rank, rope, ..
+            n,
+            heads,
+            rank,
+            rope,
+            ..
         } = shape;
-        if !(MLA_GROUP..=64).contains(&heads)
+        if n != 1
+            || !(MLA_GROUP..=64).contains(&heads)
             || !heads.is_multiple_of(MLA_GROUP)
             || !(1..=64).contains(&splits)
             || cells == 0
             || (pos_word.is_none() && pos >= cells)
         {
             return Err(EngError::BadRequest(format!(
-                "mla_attn_decode: invalid shape heads={heads}, splits={splits}, pos={pos}, cells={cells}"
+                "mla_attn_decode: invalid shape n={n}, heads={heads}, splits={splits}, pos={pos}, cells={cells}"
             )));
         }
         if !qeff.offset().is_multiple_of(8)

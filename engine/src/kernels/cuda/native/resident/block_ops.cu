@@ -12,6 +12,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <type_traits>
 
 #include "abi.h"
 #include "device.h"
@@ -413,16 +414,14 @@ __device__ __forceinline__ void mla_decode_cp_wait_one() {
 #endif
 }
 
-__global__ void mla_attn_decode_kernel(const float *__restrict__ qeff,
-                                       const __half *__restrict__ cache, float *__restrict__ part,
-                                       const int *__restrict__ pos_ptr, int heads, int splits,
-                                       int pos_host, int cells, float scale) {
+template <int kHpw>
+__global__ void __launch_bounds__(256, 1) mla_attn_decode_kernel(
+    const float *__restrict__ qeff, const __half *__restrict__ cache, float *__restrict__ part,
+    const int *__restrict__ pos_ptr, int splits, int pos_host, int cells, float scale) {
     __shared__ __align__(16) __half kv_smem[2][kMlaDecodeTile * kMlaDecodeStride];
     const int sp = blockIdx.x;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int nthreads = blockDim.x;
-    const int h0 = warp * 2;
-    const int h1 = h0 + 1;
+    const int h_base = warp * kHpw;
     const int pos = pos_ptr != NULL ? *pos_ptr : pos_host;
     const int visible = (pos >= 0 && pos < cells) ? (pos + 1) : 0;
     const int per_split =
@@ -432,26 +431,18 @@ __global__ void mla_attn_decode_kernel(const float *__restrict__ qeff,
     const int lo = sp * per_split;
     const int hi = min(lo + per_split, visible);
 
-    float2 acc0[8], acc1[8];
+    float2 acc[kHpw][8];
+    float m[kHpw], l[kHpw];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        acc0[i] = make_float2(0.0f, 0.0f);
-        acc1[i] = make_float2(0.0f, 0.0f);
+    for (int hh = 0; hh < kHpw; ++hh) {
+        m[hh] = -INFINITY;
+        l[hh] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[hh][i] = make_float2(0.0f, 0.0f);
     }
-    float m0 = -INFINITY, l0 = 0.0f;
-    float m1 = -INFINITY, l1 = 0.0f;
 
     if (lo < hi) {
-        float2 q0[9], q1[9];
-        const float2 *q0p = reinterpret_cast<const float2 *>(qeff + (size_t)h0 * kMlaWidth);
-        const float2 *q1p = reinterpret_cast<const float2 *>(qeff + (size_t)h1 * kMlaWidth);
-#pragma unroll
-        for (int i = 0; i < 9; ++i) {
-            q0[i] = q0p[lane + 32 * i];
-            q1[i] = q1p[lane + 32 * i];
-        }
-
-        mla_decode_load_tile(kv_smem[0], cache, lo, min(kMlaDecodeTile, hi - lo), tid, nthreads);
+        mla_decode_load_tile(kv_smem[0], cache, lo, min(kMlaDecodeTile, hi - lo), tid, 256);
 #if __CUDA_ARCH__ >= 800
         inference::mma::cp_async_commit();
 #endif
@@ -462,7 +453,7 @@ __global__ void mla_attn_decode_kernel(const float *__restrict__ qeff,
             const int next_base = base + kMlaDecodeTile;
             if (next_base < hi) {
                 mla_decode_load_tile(kv_smem[cur ^ 1], cache, next_base,
-                                     min(kMlaDecodeTile, hi - next_base), tid, nthreads);
+                                     min(kMlaDecodeTile, hi - next_base), tid, 256);
 #if __CUDA_ARCH__ >= 800
                 inference::mma::cp_async_commit();
 #endif
@@ -480,48 +471,35 @@ __global__ void mla_attn_decode_kernel(const float *__restrict__ qeff,
                 float2 kv[9];
 #pragma unroll
                 for (int i = 0; i < 9; ++i) kv[i] = __half22float2(kr[lane + 32 * i]);
-                float d0 = 0.0f, d1 = 0.0f;
 #pragma unroll
-                for (int i = 0; i < 9; ++i) {
-                    d0 = fmaf(q0[i].x, kv[i].x, fmaf(q0[i].y, kv[i].y, d0));
-                    d1 = fmaf(q1[i].x, kv[i].x, fmaf(q1[i].y, kv[i].y, d1));
-                }
-                const float s0 = warp_sum(d0) * scale;
-                const float s1 = warp_sum(d1) * scale;
-                if (s0 > m0) {
-                    const float corr = m0 == -INFINITY ? 0.0f : expf(m0 - s0);
-                    l0 = l0 * corr + 1.0f;
-                    m0 = s0;
+                for (int hh = 0; hh < kHpw; ++hh) {
+                    const float2 *qp =
+                        reinterpret_cast<const float2 *>(qeff + (size_t)(h_base + hh) * kMlaWidth);
+                    float d = 0.0f;
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        acc0[i].x = fmaf(acc0[i].x, corr, kv[i].x);
-                        acc0[i].y = fmaf(acc0[i].y, corr, kv[i].y);
+                    for (int i = 0; i < 9; ++i) {
+                        const float2 qv = __ldg(qp + lane + 32 * i);
+                        d = fmaf(qv.x, kv[i].x, fmaf(qv.y, kv[i].y, d));
                     }
-                } else if (m0 != -INFINITY) {
-                    const float p0 = expf(s0 - m0);
-                    l0 += p0;
+                    const float s = warp_sum(d) * scale;
+                    /* !(s <= m) is true for both s > m and NaN s, so NaN propagates. */
+                    if (!(s <= m[hh])) {
+                        const float corr = m[hh] == -INFINITY ? 0.0f : expf(m[hh] - s);
+                        l[hh] = l[hh] * corr + 1.0f;
+                        m[hh] = s;
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        acc0[i].x = fmaf(p0, kv[i].x, acc0[i].x);
-                        acc0[i].y = fmaf(p0, kv[i].y, acc0[i].y);
-                    }
-                }
-                if (s1 > m1) {
-                    const float corr = m1 == -INFINITY ? 0.0f : expf(m1 - s1);
-                    l1 = l1 * corr + 1.0f;
-                    m1 = s1;
+                        for (int i = 0; i < 8; ++i) {
+                            acc[hh][i].x = fmaf(acc[hh][i].x, corr, kv[i].x);
+                            acc[hh][i].y = fmaf(acc[hh][i].y, corr, kv[i].y);
+                        }
+                    } else if (m[hh] != -INFINITY) {
+                        const float pw = expf(s - m[hh]);
+                        l[hh] += pw;
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        acc1[i].x = fmaf(acc1[i].x, corr, kv[i].x);
-                        acc1[i].y = fmaf(acc1[i].y, corr, kv[i].y);
-                    }
-                } else if (m1 != -INFINITY) {
-                    const float p1 = expf(s1 - m1);
-                    l1 += p1;
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        acc1[i].x = fmaf(p1, kv[i].x, acc1[i].x);
-                        acc1[i].y = fmaf(p1, kv[i].y, acc1[i].y);
+                        for (int i = 0; i < 8; ++i) {
+                            acc[hh][i].x = fmaf(pw, kv[i].x, acc[hh][i].x);
+                            acc[hh][i].y = fmaf(pw, kv[i].y, acc[hh][i].y);
+                        }
                     }
                 }
             }
@@ -529,21 +507,18 @@ __global__ void mla_attn_decode_kernel(const float *__restrict__ qeff,
         }
     }
 
-    const int g = h0 / kMlaGroup, hh0 = h0 % kMlaGroup, hh1 = h1 % kMlaGroup;
-    float *dst0 = part + (((size_t)g * splits + sp) * kMlaGroup + hh0) * kMlaPartStride;
-    float *dst1 = part + (((size_t)g * splits + sp) * kMlaGroup + hh1) * kMlaPartStride;
-    float2 *dst0_2 = reinterpret_cast<float2 *>(dst0);
-    float2 *dst1_2 = reinterpret_cast<float2 *>(dst1);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        dst0_2[lane + 32 * i] = acc0[i];
-        dst1_2[lane + 32 * i] = acc1[i];
-    }
-    if (lane == 0) {
-        dst0[kMlaRank] = m0;
-        dst0[kMlaRank + 1] = l0;
-        dst1[kMlaRank] = m1;
-        dst1[kMlaRank + 1] = l1;
+    for (int hh = 0; hh < kHpw; ++hh) {
+        const int h = h_base + hh;
+        const int g = h / kMlaGroup, hg = h % kMlaGroup;
+        float *dst = part + (((size_t)g * splits + sp) * kMlaGroup + hg) * kMlaPartStride;
+        float2 *dst2 = reinterpret_cast<float2 *>(dst);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) dst2[lane + 32 * i] = acc[hh][i];
+        if (lane == 0) {
+            dst[kMlaRank] = m[hh];
+            dst[kMlaRank + 1] = l[hh];
+        }
     }
 }
 
@@ -861,10 +836,23 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.maybe(3, 4, false);
             if (!slots.valid() || !aligned(p[0], 8) || !aligned(p[1], 16) || !aligned(p[2], 8))
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
-            const unsigned threads = (unsigned)((heads / 2) * 32);
-            mla_attn_decode_kernel<<<(unsigned)splits, threads, 0, s>>>(
-                (const float *)p[0], (const __half *)p[1], (float *)p[2], (const int *)p[3],
-                (int)heads, (int)splits, (int)pos, (int)cells, f[0]);
+            const auto launch = [&](auto hpw_tag) {
+                constexpr int kHpw = decltype(hpw_tag)::value;
+                mla_attn_decode_kernel<kHpw><<<(unsigned)splits, 256, 0, s>>>(
+                    (const float *)p[0], (const __half *)p[1], (float *)p[2], (const int *)p[3],
+                    (int)splits, (int)pos, (int)cells, f[0]);
+            };
+            switch (heads / kMlaGroup) {
+            case 1: launch(std::integral_constant<int, 1>{}); break;
+            case 2: launch(std::integral_constant<int, 2>{}); break;
+            case 3: launch(std::integral_constant<int, 3>{}); break;
+            case 4: launch(std::integral_constant<int, 4>{}); break;
+            case 5: launch(std::integral_constant<int, 5>{}); break;
+            case 6: launch(std::integral_constant<int, 6>{}); break;
+            case 7: launch(std::integral_constant<int, 7>{}); break;
+            case 8: launch(std::integral_constant<int, 8>{}); break;
+            default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN:

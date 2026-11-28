@@ -240,7 +240,7 @@ fn f16_bytes(values: &[f32]) -> Vec<u8> {
 fn the_mixed_residual_read_apply_and_mean_match_the_host() {
     let Some(r) = rig("block_ops hc") else { return };
     let (h, hc, mix) = (64usize, 4usize, 17usize);
-    for n in [1usize, 7] {
+    for n in [1usize, 4, 7] {
         let inp = data(31 + n as u64, n * hc * h, 1.0);
         let fn_w: Vec<f32> = data(32, mix * hc * h, 0.05)
             .into_iter()
@@ -738,7 +738,7 @@ fn the_shared_sigmoid_select_ranks_by_score_plus_bias_and_weights_the_scores() {
         RouterShape, RouterSigmoidBias, RouterSigmoidCall,
     };
     let (e, k) = (16usize, 4usize);
-    for n in [1usize, 7] {
+    for n in [1usize, 4, 7] {
         let logits = data(61 + n as u64, n * e, 2.0);
         let bias = data(63, e, 0.5);
         let (lb, bb) = (r.up(&logits), r.up(&bias));
@@ -989,6 +989,7 @@ fn the_decode_latent_score_and_step_kv_prep_match_the_row_path() {
         (8usize, 7usize, 16usize, true),
         (16, 300, 32, false),
         (40, 1500, 64, true),
+        (64, 128, 16, true),
     ] {
         let shape = MlaShape {
             n: 1,

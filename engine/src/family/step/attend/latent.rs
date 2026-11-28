@@ -154,7 +154,13 @@ pub(crate) fn mix(
         n,
     )?;
     io.mv(&names.latent, rows.input, rows.latent, n)?;
-    if let Some(pos_word) = rows.step_pos.filter(|_| n == 1 && !io.exact) {
+    if let Some(pos_word) = rows.step_pos {
+        if n != 1 || io.exact || !(MLA_GROUP..=64).contains(&d.heads) {
+            return Err(EngError::BadRequest(format!(
+                "{}: step_pos requires a single non-exact row with 8..=64 heads",
+                io.family
+            )));
+        }
         io.run(BlockOp::mla_kv_prep_step(
             d.rank,
             d.rot_dims,
@@ -240,6 +246,12 @@ pub(crate) fn score(
     let groups = d.heads / MLA_GROUP;
     // A single non-exact row uses the shared-KV decode kernel (all heads share one KV load per
     // split; fixed split count when reading pos from StepParams for graph capture).
+    if rows.step_pos.is_some() && (n != 1 || io.exact || !(MLA_GROUP..=64).contains(&d.heads)) {
+        return Err(EngError::BadRequest(format!(
+            "{}: step_pos requires a single non-exact row with 8..=64 heads",
+            io.family
+        )));
+    }
     if n == 1 && !io.exact && (MLA_GROUP..=64).contains(&d.heads) {
         let cap = MAX_SPLITS
             .min(rows.part.bytes() / part_bytes(d, 1, 1))
