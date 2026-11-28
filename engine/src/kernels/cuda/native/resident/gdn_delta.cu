@@ -102,55 +102,72 @@ __device__ __forceinline__ float softplus_ieee(float x) {
     return x > 20.f ? x : log1pf(expf(x));
 }
 
-__global__ void __launch_bounds__(kern::kStateDim) gated_delta_ieee_k(kern::DeltaArgs a) {
+/* Single-token decode kernel: computes decay, beta, and silu(z) with IEEE expf/log1pf before
+ * loading s[128] so the transcendental temporaries never overlap the state register file and
+ * force local-memory spills across the 30 DeltaNet layers. Multi-token calls invoke one launch
+ * per token so chunked and single-token calls are bit-identical by construction. */
+__global__ void __launch_bounds__(kern::kStateDim) gated_delta_ieee_m1_k(kern::DeltaArgs a) {
     constexpr int kDim = kern::kStateDim;
     __shared__ float qs[kDim], ks[kDim];
+    __shared__ float sh_decay, sh_beta;
     const int h = blockIdx.x;
     const int j = threadIdx.x;
     const int kh = h % a.n_k_heads;
+    const float *c = a.conv;
+    const float *p = a.proj;
+    const float qv = c[kh * kDim + j];
+    const float kv = c[(a.n_k_heads + kh) * kDim + j];
+    const float vv = c[2 * a.n_k_heads * kDim + h * kDim + j];
+    const float qn = rsqrtf(block_sum_ieee(qv * qv) + a.eps) * rsqrtf((float)kDim);
+    const float kn = rsqrtf(block_sum_ieee(kv * kv) + a.eps);
+    qs[j] = qv * qn;
+    ks[j] = kv * kn;
+    if (j == 0) {
+        sh_decay = expf(softplus_ieee(p[a.alpha_off + h] + a.dt_bias[h]) * a.a[h]);
+        sh_beta = 1.f / (1.f + expf(-p[a.beta_off + h]));
+    }
+    const float z = p[a.z_off + h * kDim + j];
+    const float silu_z = z / (1.f + expf(-z));
+    __syncthreads();
+    const float decay = sh_decay;
+    const float beta = sh_beta;
     float *st = a.state + (size_t)h * kDim * kDim;
     float s[kDim];
 #pragma unroll
     for (int i = 0; i < kDim; ++i) s[i] = st[i * kDim + j];
-
-    for (int t = 0; t < a.m; ++t) {
-        const float *c = a.conv + (size_t)t * a.conv_ld;
-        const float *p = a.proj + (size_t)t * a.ld;
-        const float qv = c[kh * kDim + j];
-        const float kv = c[(a.n_k_heads + kh) * kDim + j];
-        const float vv = c[2 * a.n_k_heads * kDim + h * kDim + j];
-        const float qn = rsqrtf(block_sum_ieee(qv * qv) + a.eps) * rsqrtf((float)kDim);
-        const float kn = rsqrtf(block_sum_ieee(kv * kv) + a.eps);
-        qs[j] = qv * qn;
-        ks[j] = kv * kn;
-        __syncthreads();
-        const float decay = expf(softplus_ieee(p[a.alpha_off + h] + a.dt_bias[h]) * a.a[h]);
-        const float beta = 1.f / (1.f + expf(-p[a.beta_off + h]));
-        float sk = 0.f;
+    float sk = 0.f;
 #pragma unroll
-        for (int i = 0; i < kDim; ++i) {
-            s[i] *= decay;
-            sk += s[i] * ks[i];
-        }
-        const float d = (vv - sk) * beta;
-        float o = 0.f;
+    for (int i = 0; i < kDim; ++i) {
+        s[i] *= decay;
+        sk += s[i] * ks[i];
+    }
+    const float d = (vv - sk) * beta;
+    float o = 0.f;
 #pragma unroll
-        for (int i = 0; i < kDim; ++i) {
-            s[i] += ks[i] * d;
-            o += s[i] * qs[i];
-        }
-        const float rstd = rsqrtf(block_sum_ieee(o * o) / (float)kDim + a.eps);
-        const float z = p[a.z_off + h * kDim + j];
-        a.out[(size_t)t * a.n_v_heads * kDim + h * kDim + j] =
-            o * rstd * a.norm_w[j] * (z / (1.f + expf(-z)));
+    for (int i = 0; i < kDim; ++i) {
+        s[i] += ks[i] * d;
+        o += s[i] * qs[i];
     }
 #pragma unroll
     for (int i = 0; i < kDim; ++i) st[i * kDim + j] = s[i];
+    const float rstd = rsqrtf(block_sum_ieee(o * o) / (float)kDim + a.eps);
+    a.out[(size_t)h * kDim + j] = o * rstd * a.norm_w[j] * silu_z;
 }
 
 cudaError_t launch_ieee(const kern::DeltaArgs &call, cudaStream_t stream) {
-    gated_delta_ieee_k<<<call.n_v_heads, kern::kStateDim, 0, stream>>>(call);
-    return cudaGetLastError();
+    kern::DeltaArgs step = call;
+    step.m = 1;
+    for (int t = 0; t < call.m; ++t) {
+        step.conv = call.conv + (size_t)t * (size_t)call.conv_ld;
+        step.proj = call.proj + (size_t)t * (size_t)call.ld;
+        step.out = call.out + (size_t)t * (size_t)call.n_v_heads * kern::kStateDim;
+        gated_delta_ieee_m1_k<<<step.n_v_heads, kern::kStateDim, 0, stream>>>(step);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    return cudaSuccess;
 }
 
 }  // namespace

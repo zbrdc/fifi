@@ -250,40 +250,55 @@ struct Q6kSide {
     __device__ __forceinline__ float result() const { return sum; }
 };
 
-/* Q8_0 super-group of 8 consecutive 34-byte blocks (256 values, 272 = 17 * 16 bytes): each
- * super-group starts 16-byte aligned when w is 16-byte aligned. Lane l (0..7) owns block l at
- * raw + 34 * l: f16 d at +0, 32 signed int8 codes at +2..+34. Flipping the sign bit of each
- * byte maps [-128..127] to [0..255] so code_at + (-8388736.0f) converts on the FMA pipe. */
-struct Q80Side {
-    static const bool kOffsetSum = false;
-    static const int kBlockBytes = 272;
-    float sum;
+/* Q8_0 decode dq matvec: one warp per weight row (8 warps / 256 threads per CTA, zero shared
+ * memory, zero barriers). Lane l walks blocks b = l, l + 32, ... of 34-byte Q8_0 blocks (f16
+ * scale d at +0, 32 signed int8 codes at +2..+34). Flipping the sign bit of each byte maps
+ * [-128..127] to [0..255] so code_at + (-8388736.0f) converts on the FMA pipe; two
+ * independent accumulators break the FMA latency chain within each block. */
+const int kQ80Warps = 8;
+const int kQ80BlockBytes = 34;
 
-    __device__ __forceinline__ void start() { sum = 0.0f; }
-
-    __device__ __forceinline__ void add(const unsigned char *raw, int l, const Run &x, float) {
-        const unsigned char *blk = raw + 34 * l;
-        const float d = __half2float(__ushort_as_half(load_half(blk)));
-        const Window q = load_window(blk + 2);
-        float sd = 0.0f;
+__global__ void __launch_bounds__(kQ80Warps * 32, 2) matvec_dq_q80_kernel(
+    const unsigned char *w, const float *x, float *y, int rows, int w_blocks) {
+    const int warp = (int)(threadIdx.x >> 5);
+    const int lane = (int)(threadIdx.x & 31u);
+    const int row = (int)blockIdx.x * kQ80Warps + warp;
+    if (row >= rows) {
+        return;
+    }
+    const unsigned char *wrow = w + (size_t)row * (size_t)w_blocks * kQ80BlockBytes;
+    float sum = 0.0f;
+    for (int b = lane; b < w_blocks; b += 32) {
+        const unsigned char *wb = wrow + (size_t)b * kQ80BlockBytes;
+        unsigned v[8];
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const unsigned biased = q.w[i] ^ 0x80808080u;
-            const float4 xv = x.v[i];
-            sd = fmaf(code_at(biased, 0) - 8388736.0f, xv.x, sd);
-            sd = fmaf(code_at(biased, 1) - 8388736.0f, xv.y, sd);
-            sd = fmaf(code_at(biased, 2) - 8388736.0f, xv.z, sd);
-            sd = fmaf(code_at(biased, 3) - 8388736.0f, xv.w, sd);
+            const uint16_t *p = reinterpret_cast<const uint16_t *>(wb + 2 + i * 4);
+            v[i] = ((unsigned)p[0] | ((unsigned)p[1] << 16)) ^ 0x80808080u;
         }
-        sum = fmaf(d, sd, sum);
+        const float d = __half2float(__ushort_as_half(load_half(wb)));
+        const float4 *xp = reinterpret_cast<const float4 *>(x + (size_t)b * 32);
+        float sd0 = 0.0f;
+        float sd1 = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float4 xv = xp[i];
+            const unsigned packed = v[i];
+            sd0 = fmaf(code_at(packed, 0) - 8388736.0f, xv.x, sd0);
+            sd1 = fmaf(code_at(packed, 1) - 8388736.0f, xv.y, sd1);
+            sd0 = fmaf(code_at(packed, 2) - 8388736.0f, xv.z, sd0);
+            sd1 = fmaf(code_at(packed, 3) - 8388736.0f, xv.w, sd1);
+        }
+        sum = fmaf(d, sd0 + sd1, sum);
     }
-
-    __device__ __forceinline__ void reduce(int bit) {
+    #pragma unroll
+    for (int bit = 16; bit > 0; bit >>= 1) {
         sum += __shfl_xor_sync(0xffffffffu, sum, bit);
     }
-
-    __device__ __forceinline__ float result() const { return sum; }
-};
+    if (lane == 0) {
+        y[row] = sum;
+    }
+}
 
 template <class Side>
 __global__ void __launch_bounds__(kWarps * 32) matvec_dq_kernel(const unsigned char *w,
@@ -342,7 +357,7 @@ extern "C" int inference_cuda_matvec_dq_launch(const inference_cuda_matvec_dq_ar
         }
         const size_t blocks = (size_t)k / kQK;
         const int block_bytes =
-            q4k ? Q4kSide::kBlockBytes : (q6k ? Q6kSide::kBlockBytes : Q80Side::kBlockBytes);
+            q4k ? Q4kSide::kBlockBytes : (q6k ? Q6kSide::kBlockBytes : 8 * kQ80BlockBytes);
         const size_t w_bytes = (size_t)rows * blocks * (size_t)block_bytes;
         const size_t x_bytes = (size_t)k * sizeof(float);
         const size_t y_bytes = (size_t)rows * sizeof(float);
@@ -351,16 +366,22 @@ extern "C" int inference_cuda_matvec_dq_launch(const inference_cuda_matvec_dq_ar
             !apart(args->y, y_bytes, args->x, x_bytes)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        const unsigned int grid = (unsigned int)(((size_t)rows + 15) / 16);
-        if (q4k) {
-            matvec_dq_kernel<Q4kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
-                (const unsigned char *)args->w, (const float *)args->x, args->y, rows, (int)blocks);
-        } else if (q6k) {
-            matvec_dq_kernel<Q6kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
-                (const unsigned char *)args->w, (const float *)args->x, args->y, rows, (int)blocks);
+        if (q80) {
+            const unsigned int q80_grid = (unsigned int)(((size_t)rows + kQ80Warps - 1) / kQ80Warps);
+            const int w_blocks = k / 32;
+            matvec_dq_q80_kernel<<<q80_grid, kQ80Warps * 32, 0, (cudaStream_t)stream>>>(
+                (const unsigned char *)args->w, (const float *)args->x, args->y, rows, w_blocks);
         } else {
-            matvec_dq_kernel<Q80Side><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
-                (const unsigned char *)args->w, (const float *)args->x, args->y, rows, (int)blocks);
+            const unsigned int grid = (unsigned int)(((size_t)rows + 15) / 16);
+            if (q4k) {
+                matvec_dq_kernel<Q4kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
+                    (const unsigned char *)args->w, (const float *)args->x, args->y, rows,
+                    (int)blocks);
+            } else {
+                matvec_dq_kernel<Q6kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
+                    (const unsigned char *)args->w, (const float *)args->x, args->y, rows,
+                    (int)blocks);
+            }
         }
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

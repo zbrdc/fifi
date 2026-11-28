@@ -7,7 +7,9 @@
 #ifndef INFERENCE_CUDA_RESIDENT_Q8_1_STORE_CUH
 #define INFERENCE_CUDA_RESIDENT_Q8_1_STORE_CUH
 
+#ifndef QK8_1
 #include "quant_blocks.h"
+#endif
 
 __device__ __forceinline__ void store_q8_1_block(block_q8_1 *y, float xi) {
   const int lane = threadIdx.x % 32;
