@@ -462,6 +462,22 @@ impl Raon1Device {
         self.exact.set(on);
     }
 
+    /// Queues the score of `n` rows at `p0..` in every latent layer, over the queries the last
+    /// chunk left, `rounds` times: the seconds one round took. It writes the partials only.
+    #[cfg(test)]
+    pub(crate) fn time_scores(&self, n: usize, p0: usize, rounds: usize) -> Result<f64, EngError> {
+        self.stream.synchronize()?;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            for slot in 0..self.mla.len() {
+                let (dims, rows) = Model::latent(self, slot, n)?;
+                latent::score(&self.io(), dims, &rows, n, p0)?;
+            }
+        }
+        self.stream.synchronize()?;
+        Ok(start.elapsed().as_secs_f64() / rounds as f64)
+    }
+
     fn snap(&self, name: &str, buffer: &DeviceBuffer, values: usize) -> Result<(), EngError> {
         if self.trace.borrow().is_none() {
             return Ok(());

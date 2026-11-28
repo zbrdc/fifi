@@ -7,14 +7,30 @@
 //! latent space, so the score of a head is one dot product over a cached row; a second factor
 //! carries the attended latent back to the head width. A projected gate scales the result
 //! before the output projection.
+//!
+//! The score has two forms over the same cache and the same partials. A step of one row, a
+//! chunk of up to [`FEW_ROWS`] rows and every chunk under the exact switch score a row at a time
+//! with f32 queries, so those rows keep the bits of a one-row step. A larger chunk scores all
+//! heads of 8 rows against a key tile as one matrix product on tensor cores, its queries
+//! rounded to f16 like the cached rows; a prompt at depth then costs a fraction of the row form.
 
-use super::super::rows::{Rows, StepIo};
+use super::super::rows::{FEW_ROWS, Rows, StepIo};
 use crate::EngError;
 use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP, MlaShape};
 use crate::kernels::cuda::{DeviceBuffer, DeviceRange};
 
 /// The partial rows a visit may launch at most; the scratch is sized for them.
 pub(crate) const PART_ROWS: usize = 320;
+
+/// Token rows of one query tile of the chunk score.
+const TILE_ROWS: usize = 8;
+/// The fewest keys a split of a score holds.
+const SPLIT_KEYS: usize = 1024;
+/// The blocks a chunk score launches at least when its keys allow: a short chunk at depth
+/// splits its keys so that every multiprocessor of a large card has a block.
+const SCORE_BLOCKS: usize = 160;
+/// The most key splits a score takes.
+const MAX_SPLITS: usize = 64;
 
 /// The tensors of one layer.
 pub(crate) struct Names {
@@ -162,34 +178,13 @@ pub(crate) fn mix(
         rows.key_factor,
         rows.absorbed.range(0, n * d.heads * row * 4)?,
     )?)?;
-    let keys = p0 + n;
-    let groups = d.heads / MLA_GROUP;
-    let splits = if n >= 64 {
-        1
-    } else {
-        keys.div_ceil(1024)
-            .clamp(1, 32)
-            .min(PART_ROWS / (n * groups))
-            .max(1)
-    };
-    let per_split = keys.div_ceil(splits).div_ceil(32) * 32;
-    let part_bytes = n * groups * splits * MLA_GROUP * (d.rank + 4) * 4;
-    io.run(BlockOp::mla_attn(
-        shape,
-        p0,
-        splits,
-        per_split,
-        d.scale,
-        rows.absorbed.range(0, n * d.heads * row * 4)?,
-        rows.cache,
-        rows.part.range(0, part_bytes)?,
-    )?)?;
+    let splits = score(io, d, rows, n, p0)?;
     io.run(BlockOp::mla_reduce(
         n,
         d.heads,
         d.rank,
         splits,
-        rows.part.range(0, part_bytes)?,
+        rows.part.range(0, part_bytes(d, n, splits))?,
         rows.mixed.range(0, n * d.heads * d.rank * 4)?,
     )?)?;
     io.run(BlockOp::mla_project(
@@ -204,4 +199,64 @@ pub(crate) fn mix(
     io.mv(&names.gate, rows.input, rows.gate, n)?;
     io.quantize(n, width, rows.attended, Some(rows.gate), rows.gated)?;
     io.mv(&names.out, rows.gated, rows.out, n)
+}
+
+/// Bytes of the partials of `n` rows over `splits` key splits.
+fn part_bytes(d: Dims, n: usize, splits: usize) -> usize {
+    n * (d.heads / MLA_GROUP) * splits * MLA_GROUP * (d.rank + 4) * 4
+}
+
+/// Scores the absorbed queries of `n` rows at `p0..` against the cached rows and leaves one
+/// partial softmax per row, head and key split in [`LatentRows::part`]. Returns the splits.
+pub(crate) fn score(
+    io: &StepIo<'_>,
+    d: Dims,
+    rows: &LatentRows<'_>,
+    n: usize,
+    p0: usize,
+) -> Result<usize, EngError> {
+    let row = d.rank + d.rot_dims;
+    let shape = MlaShape {
+        n,
+        heads: d.heads,
+        nope: d.key_dim,
+        rope: d.rot_dims,
+        rank: d.rank,
+    };
+    let keys = p0 + n;
+    let groups = d.heads / MLA_GROUP;
+    // A few rows keep the bits of a one-row step, and the exact route keeps its queries in f32:
+    // both score a row at a time. A larger chunk scores in tiles on tensor cores.
+    let tiled = !io.exact && n > FEW_ROWS;
+    let splits = if tiled {
+        keys.div_ceil(SPLIT_KEYS)
+            .min(SCORE_BLOCKS.div_ceil(n.div_ceil(TILE_ROWS) * groups))
+            .min(MAX_SPLITS)
+            .min(rows.part.bytes() / part_bytes(d, n, 1))
+            .max(1)
+    } else if n >= 64 {
+        1
+    } else {
+        keys.div_ceil(SPLIT_KEYS)
+            .clamp(1, 32)
+            .min(PART_ROWS / (n * groups))
+            .max(1)
+    };
+    let per_split = keys.div_ceil(splits).div_ceil(32) * 32;
+    let op = if tiled {
+        BlockOp::mla_attn_chunk
+    } else {
+        BlockOp::mla_attn
+    };
+    io.run(op(
+        shape,
+        p0,
+        splits,
+        per_split,
+        d.scale,
+        rows.absorbed.range(0, n * d.heads * row * 4)?,
+        rows.cache,
+        rows.part.range(0, part_bytes(d, n, splits))?,
+    )?)?;
+    Ok(splits)
 }

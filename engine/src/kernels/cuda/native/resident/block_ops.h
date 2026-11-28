@@ -59,6 +59,10 @@ extern "C" {
  *             optional); p3 y f32 [rows][w] (W, optional; one of p2 and p3 is present).
  *             i0 rows; i1 w.
  * 15 FILL     p0 f32 [i0] (W). i0 count. f0 value.
+ * 16 MLA_ATTN_CHUNK the slots, integers and partials of MLA_ATTN, for a chunk of rows:
+ *             query tiles of 8 rows x 8 heads on tensor cores, the queries and the
+ *             tile probabilities rounded to f16. p0 and p2 are 8-byte aligned, p1
+ *             16-byte. A device or an image without the kernel runs MLA_ATTN.
  */
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,
@@ -71,7 +75,8 @@ enum {
     INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT = 11,
     INFERENCE_CUDA_BLOCK_OP_SITU_QUANT = 12,
     INFERENCE_CUDA_BLOCK_OP_GATED_QUANT = 13,
-    INFERENCE_CUDA_BLOCK_OP_FILL = 15
+    INFERENCE_CUDA_BLOCK_OP_FILL = 15,
+    INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_CHUNK = 16
 };
 
 typedef struct inference_cuda_block_ops_args {

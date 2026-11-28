@@ -671,6 +671,64 @@ fn the_latent_attention_matches_the_host_with_split_keys() {
     assert_close("project", &r.read(&out, n * heads * v_dim), &want, 1e-4);
 }
 
+/// The chunk score against the row score over the same queries and cache: a ragged chunk (a
+/// last query tile of five rows), two head groups, three key splits of which the last ends
+/// inside a tile, and a chunk that starts at position zero.
+#[test]
+fn the_chunk_latent_score_matches_the_row_score() {
+    let Some(r) = rig("block_ops mla chunk score") else {
+        return;
+    };
+    let (heads, rope, rank) = (16usize, 64usize, 512usize);
+    let scale = 1.0 / 192f32.sqrt();
+    for (n, pos0, splits, per_split) in [(21usize, 300usize, 3usize, 128usize), (37, 0, 1, 64)] {
+        let shape = MlaShape {
+            n,
+            heads,
+            nope: 128,
+            rope,
+            rank,
+        };
+        let keys = pos0 + n;
+        let qeff = r.up(&data(71 + n as u64, n * heads * (rank + rope), 1.0));
+        let cache = r.up_bytes(&f16_bytes(&data(72 + n as u64, keys * (rank + rope), 1.0)));
+        let cells = n * (heads / 8) * splits * 8 * (rank + 4);
+        let mut mixes = Vec::new();
+        for chunk in [false, true] {
+            // Stale partials must not survive: every cell a reduce reads is written.
+            let part = r.up(&vec![f32::NAN; cells]);
+            let op = if chunk {
+                BlockOp::mla_attn_chunk
+            } else {
+                BlockOp::mla_attn
+            };
+            r.run(
+                op(
+                    shape,
+                    pos0,
+                    splits,
+                    per_split,
+                    scale,
+                    whole(&qeff),
+                    whole(&cache),
+                    whole(&part),
+                )
+                .expect("op"),
+            );
+            let mix = r.zeros(n * heads * rank);
+            r.run(
+                BlockOp::mla_reduce(n, heads, rank, splits, whole(&part), whole(&mix)).expect("op"),
+            );
+            mixes.push(r.read(&mix, n * heads * rank));
+        }
+        assert!(
+            mixes[1].iter().all(|v| v.is_finite()),
+            "chunk mix is finite"
+        );
+        assert_close("chunk mix", &mixes[1], &mixes[0], 5e-3);
+    }
+}
+
 #[test]
 fn the_shared_sigmoid_select_ranks_by_score_plus_bias_and_weights_the_scores() {
     let Some(r) = rig("router sigmoid select with a bias") else {

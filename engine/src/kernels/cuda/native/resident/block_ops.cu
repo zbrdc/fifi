@@ -3,7 +3,9 @@
  * Numerics: f32 throughout with IEEE expf/tanhf/logf (this unit is built without
  * -use_fast_math). Reductions run in a fixed order (warp shuffle tree, then the warp
  * partials summed in index order), so a launch repeats bit for bit. q8_1 blocks follow the
- * vendored quantize rule: d = amax / 127, q = roundf(x / d), s = the raw sum of the inputs. */
+ * vendored quantize rule: d = amax / 127, q = roundf(x / d), s = the raw sum of the inputs.
+ * The chunk form of the latent score (resident/mla_attn_chunk.cuh) alone multiplies f16
+ * operands on tensor cores; its sums are f32 and in a fixed order too. */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -13,6 +15,7 @@
 
 #include "abi.h"
 #include "device.h"
+#include "mma_f16.cuh"
 #include "resident/block_ops.h"
 
 // The vendored header defines block_q8_1 and keeps static host helpers that are unreferenced in
@@ -365,6 +368,8 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float *qeff, const 
     }
 }
 
+#include "resident/mla_attn_chunk.cuh"
+
 __global__ void __launch_bounds__(128) mla_reduce_kernel(const float *part, float *mix, int heads,
                                                          int splits) {
     const int t = blockIdx.x, h = blockIdx.y;
@@ -561,7 +566,9 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                                                            (int)pos0, f[0]);
             return launch_status(out_stage);
         }
-        case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN: {
+        case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN:
+        case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_CHUNK: {
+            const bool chunk = args->op == INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_CHUNK;
             const long long n = i[0], heads = i[1], rank = i[2], rope = i[3], pos0 = i[4];
             const long long splits = i[5], kps = i[6];
             if (n < 1 || n > 65536 || heads < kMlaGroup || heads > 256 || heads % kMlaGroup != 0 ||
@@ -572,13 +579,50 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(1, (pos0 + n) * (rank + rope) * 2, false);
             slots.use(2, n * (heads / kMlaGroup) * splits * kMlaGroup * kMlaPartStride * 4, true);
             if (!slots.valid() || !aligned(p[1], 4)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            // The chunk kernel reads float pairs and copies cached rows 16 bytes at a time.
+            if (chunk && (!aligned(p[0], 8) || !aligned(p[1], 16) || !aligned(p[2], 8)))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            int device = 0;
+            if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
+            if (chunk) {
+                // Asked once per device: 1 the tensor-core kernel, 2 the row kernel. The loaded
+                // image must be sm_80 or later and the device must grant the shared memory.
+                static int arm[16] = {};
+                if (arm[device] == 0) {
+                    Failure failure;
+                    cudaFuncAttributes attr = {};
+                    int limit = 0;
+                    failure.record(cudaFuncGetAttributes(&attr, mla_attn_chunk_kernel),
+                                   INFERENCE_CUDA_STAGE_LAUNCH);
+                    failure.record(cudaDeviceGetAttribute(
+                                       &limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device),
+                                   INFERENCE_CUDA_STAGE_LAUNCH);
+                    const bool fits =
+                        failure.ok() && attr.ptxVersion >= 80 && limit >= kMlaChunkSmem;
+                    if (fits)
+                        failure.record(
+                            cudaFuncSetAttribute(mla_attn_chunk_kernel,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 kMlaChunkSmem),
+                            INFERENCE_CUDA_STAGE_LAUNCH);
+                    report_stage(out_stage, failure.stage);
+                    if (!failure.ok()) return (int)failure.err;
+                    arm[device] = fits ? 1 : 2;
+                }
+                if (arm[device] == 1) {
+                    const unsigned tiles = (unsigned)((n + kMlaChunkTokens - 1) / kMlaChunkTokens);
+                    const dim3 grid(tiles, (unsigned)(heads / kMlaGroup), (unsigned)splits);
+                    mla_attn_chunk_kernel<<<grid, kMlaChunkThreads, kMlaChunkSmem, s>>>(
+                        (const float *)p[0], (const __half *)p[1], (float *)p[2], (int)n,
+                        (int)heads, (int)pos0, (int)splits, (int)kps, f[0]);
+                    return launch_status(out_stage);
+                }
+            }
             const size_t smem = (size_t)kMlaGroup * kMlaWidth * 4 +
                                 (size_t)kMlaTile * kMlaRowHalves * 2 +
                                 (size_t)kMlaGroup * kMlaTile * 4;
             // The dynamic shared-memory limit is a per-device attribute of the function.
             static bool configured[16] = {};
-            int device = 0;
-            if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
             if (!configured[device]) {
                 Failure failure;
                 failure.record(cudaFuncSetAttribute(mla_attn_kernel,

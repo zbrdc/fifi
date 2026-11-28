@@ -197,6 +197,46 @@ impl<'b> BlockOp<'b> {
         cache: DeviceRange<'b>,
         part: DeviceRange<'b>,
     ) -> Result<Self, EngError> {
+        Self::mla_score(
+            9,
+            shape,
+            (pos0, splits, keys_per_split),
+            scale,
+            [qeff, cache, part],
+        )
+    }
+
+    /// The same partials for a chunk of rows, scored on tensor cores in query tiles of 8 rows:
+    /// the queries and the probabilities of a key tile are rounded to f16, so its bits differ
+    /// from [`Self::mla_attn`]. A device without the kernel runs that one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mla_attn_chunk(
+        shape: MlaShape,
+        pos0: usize,
+        splits: usize,
+        keys_per_split: usize,
+        scale: f32,
+        qeff: DeviceRange<'b>,
+        cache: DeviceRange<'b>,
+        part: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        Self::mla_score(
+            16,
+            shape,
+            (pos0, splits, keys_per_split),
+            scale,
+            [qeff, cache, part],
+        )
+    }
+
+    /// The slots of both score operations: the queries, the cache and the partials.
+    fn mla_score(
+        op: i32,
+        shape: MlaShape,
+        (pos0, splits, keys_per_split): (usize, usize, usize),
+        scale: f32,
+        [qeff, cache, part]: [DeviceRange<'b>; 3],
+    ) -> Result<Self, EngError> {
         let MlaShape {
             n,
             heads,
@@ -206,7 +246,7 @@ impl<'b> BlockOp<'b> {
         } = shape;
         let part_bytes = bytes(&[n, heads / MLA_GROUP, splits, MLA_GROUP, rank + 4, 4])?;
         Ok(Self::new(
-            9,
+            op,
             &[n, heads, rank, rope, pos0, splits, keys_per_split],
             &[scale],
         )?

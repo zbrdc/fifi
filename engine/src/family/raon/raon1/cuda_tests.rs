@@ -747,6 +747,57 @@ fn the_device_reports_prefill_and_decode_rates() {
     }
 }
 
+/// Where a prompt chunk spends its time at the depths of `RAON_SCORE_DEPTHS` (comma separated,
+/// ascending): the seconds of two whole chunks fed at each depth, and of the latent attention's
+/// score alone in every layer, on the served route and under the exact switch.
+#[test]
+#[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
+fn the_device_times_the_latent_score_of_a_chunk() {
+    use super::cuda::CHUNK;
+    let path = model_path();
+    let depths: Vec<usize> = std::env::var("RAON_SCORE_DEPTHS")
+        .expect("RAON_SCORE_DEPTHS lists the depths")
+        .split(',')
+        .map(|v| v.trim().parse().expect("a depth"))
+        .collect();
+    require_device("the_device_times_the_latent_score_of_a_chunk");
+    let mut device = Raon1Device::load(&path, None, &mut |cells| {
+        eprintln!("planned context {cells}");
+    })
+    .expect("device load");
+    let token = |i: usize| 1000 + (i as u32 * 7919) % 200_000;
+    device.reset().expect("reset");
+    let mut fed = 0;
+    for depth in depths {
+        assert!(depth >= fed, "the depths ascend");
+        if depth > fed {
+            let tokens: Vec<u32> = (fed..depth).map(token).collect();
+            device.feed(&tokens, fed, HeadRows::None).expect("prefix");
+        }
+        let mut chunks = [0f64; 2];
+        for (index, seconds) in chunks.iter_mut().enumerate() {
+            let at = depth + index * CHUNK;
+            let tokens: Vec<u32> = (at..at + CHUNK).map(token).collect();
+            let start = std::time::Instant::now();
+            device.feed(&tokens, at, HeadRows::None).expect("chunk");
+            *seconds = start.elapsed().as_secs_f64();
+        }
+        fed = depth + 2 * CHUNK;
+        let served = device.time_scores(CHUNK, depth, 3).expect("served score");
+        device.set_exact(true);
+        let exact = device.time_scores(CHUNK, depth, 3).expect("exact score");
+        device.set_exact(false);
+        eprintln!(
+            "depth {depth}: chunks of {CHUNK} rows {:.1} ms and {:.1} ms | latent score of all layers: served {:.1} ms, exact {:.1} ms | chunk less the served score {:.1} ms",
+            chunks[0] * 1e3,
+            chunks[1] * 1e3,
+            served * 1e3,
+            exact * 1e3,
+            (chunks[0] - served) * 1e3
+        );
+    }
+}
+
 /// The last logits row of a synthetic prompt of `RAON_LAST_ROW_TOKENS` tokens, on the context the
 /// free device memory admits: writes the prompt ids as a JSON array to `RAON_LAST_ROW_OUT.ids.json`
 /// and the top 20 `id logit` pairs to `RAON_LAST_ROW_OUT.top20`, for comparison with another
