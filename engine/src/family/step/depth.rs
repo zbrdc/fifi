@@ -22,7 +22,7 @@ use super::recipe::{Layer, Repeat, Site};
 use super::walk::Half;
 use crate::EngError;
 use crate::kernels::cuda::resident::depth_attention::{
-    AddCall, MixStatesCall, MixStatesShape, SealCall, States, StreamShape,
+    AddCall, MAX_MIX_JOBS, MixJob, MixStatesCall, MixStatesShape, SealCall, States, StreamShape,
 };
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
@@ -112,6 +112,74 @@ pub(crate) struct Mix<'a> {
     pub(crate) stride: usize,
 }
 
+/// Bank-plane mixes a visit reads from the previous pass (`first_block..blocks` of the other
+/// plane), each as `(query, out)`.
+pub(crate) struct BankMix<'a> {
+    pub(crate) first_block: usize,
+    pub(crate) blocks: usize,
+    pub(crate) roles: Vec<(DeviceRange<'a>, DeviceRange<'a>)>,
+}
+
+/// Extra mixes batched with a depth-attention half's read on one token: previous-pass bank
+/// controller messages and any additional role queries against the active depth plane.
+pub(crate) struct BankRead<'a> {
+    pub(crate) bank: Option<BankMix<'a>>,
+    pub(crate) extra_roles: Vec<(DeviceRange<'a>, DeviceRange<'a>)>,
+}
+
+/// Launches a batched depth-attention mix over `extra` (optional bank-plane roles + extra
+/// current-plane roles) and an optional primary `(query, out)` on the active plane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mix_bank_jobs(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    depth_state: DeviceRange<'_>,
+    bank_state: Option<DeviceRange<'_>>,
+    primary: Option<(DeviceRange<'_>, DeviceRange<'_>)>,
+    extra: Option<BankRead<'_>>,
+    (blocks, width, eps): (usize, usize, f32),
+    health: DeviceRange<'_>,
+) -> Result<(), EngError> {
+    let mut jobs = Vec::with_capacity(MAX_MIX_JOBS);
+    if let Some(extra) = extra {
+        if let Some(bm) = extra.bank.filter(|bm| !bm.roles.is_empty()) {
+            let state = bank_state
+                .ok_or_else(|| EngError::BadRequest("the depth site has no bank plane".into()))?;
+            for (query, out) in bm.roles {
+                jobs.push(MixJob {
+                    state,
+                    query,
+                    out,
+                    first_block: bm.first_block,
+                    blocks: bm.blocks,
+                });
+            }
+        }
+        for (query, out) in extra.extra_roles {
+            jobs.push(MixJob {
+                state: depth_state,
+                query,
+                out,
+                first_block: 0,
+                blocks,
+            });
+        }
+    }
+    if let Some((query, out)) = primary {
+        jobs.push(MixJob {
+            state: depth_state,
+            query,
+            out,
+            first_block: 0,
+            blocks,
+        });
+    }
+    if !jobs.is_empty() {
+        ctx.depth_attention_mix_jobs(stream, &jobs, &health, (width, eps))?;
+    }
+    Ok(())
+}
+
 impl<'a> Depth<'a> {
     fn states_of(&self, n: usize) -> States {
         States {
@@ -158,6 +226,77 @@ impl<'a> Depth<'a> {
 
     fn health(&self) -> Result<DeviceRange<'_>, EngError> {
         self.health.range(0, F32)
+    }
+
+    /// The mix of every one of `n` states of `plane` holding `blocks` sealed rows, batched with
+    /// any previous-pass bank mixes and extra role queries when `n == 1`.
+    pub(crate) fn mix_read(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        (query, out): (Option<DeviceRange<'_>>, DeviceRange<'_>),
+        extra: Option<BankRead<'_>>,
+        (plane, blocks): (usize, usize),
+        n: usize,
+    ) -> Result<(), EngError> {
+        if let Some(extra) = extra {
+            let has_bank = extra.bank.as_ref().is_some_and(|b| !b.roles.is_empty());
+            if has_bank || !extra.extra_roles.is_empty() {
+                if n != 1 {
+                    return Err(EngError::BadRequest(
+                        "batched depth-bank reads serve one row at a time".into(),
+                    ));
+                }
+                let bank_state = extra
+                    .bank
+                    .as_ref()
+                    .filter(|bm| !bm.roles.is_empty())
+                    .map(|bm| {
+                        self.bank(plane)?
+                            .range(0, (bm.blocks + 1) * self.width * F32)
+                    })
+                    .transpose()?;
+                mix_bank_jobs(
+                    ctx,
+                    stream,
+                    self.used(plane, 1, blocks + 1)?,
+                    bank_state,
+                    query.map(|q| (q, out)),
+                    Some(extra),
+                    (blocks, self.width, self.eps),
+                    self.health()?,
+                )?;
+                if query.is_none() {
+                    return self.mix(
+                        ctx,
+                        stream,
+                        Mix {
+                            query: None,
+                            norm: None,
+                            first_block: 0,
+                            out,
+                            stride: self.width,
+                        },
+                        (plane, blocks),
+                        1,
+                    );
+                }
+                return Ok(());
+            }
+        }
+        self.mix(
+            ctx,
+            stream,
+            Mix {
+                query,
+                norm: None,
+                first_block: 0,
+                out,
+                stride: self.width,
+            },
+            (plane, blocks),
+            n,
+        )
     }
 
     /// The mix of every one of `n` states of `plane` holding `blocks` sealed rows.
@@ -286,7 +425,7 @@ mod tests {
                 seal,
                 repeat,
             },
-            mixer: Mixer::Own,
+            mixer: Mixer::Relative { slot: 0 },
             forward: Forward::Own,
         }
     }

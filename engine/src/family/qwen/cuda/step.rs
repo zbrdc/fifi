@@ -706,7 +706,7 @@ impl<'a> LoopStep<'a> {
                     let resolved = attend::resolve(&map, stem, self.attn_dims).expect("a layer");
                     weights.extend(resolved.projections());
                 }
-                Mixer::Latent { .. } | Mixer::Own => {}
+                Mixer::Latent { .. } | Mixer::Relative { .. } => {}
             }
             if let Forward::Dense(names) = &layer.forward {
                 weights.extend(names.iter().map(|n| map.native(n).expect("a projection")));

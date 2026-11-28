@@ -17,6 +17,7 @@ use crate::family::step::scratch::{Core, OnDevice, Widths};
 use crate::family::step::state::{Slots, State};
 use crate::family::step::walk;
 use crate::family::step::walk::Half;
+use crate::kernels::cuda::resident::depth_attention::{MixCall, MixShape};
 use crate::kernels::cuda::resident::word_rows::MAX_WORD_ROWS;
 use crate::weights::GgufType;
 
@@ -239,19 +240,31 @@ impl Model for ChainStep<'_> {
         self.f.math.rms_norm_eps
     }
 
-    fn own_mixer(&self, visit: usize, _n: usize, p0: usize) -> Result<(), EngError> {
-        self.execution(visit)?.mixer(self.cuda, p0)
+    fn depth_bank(
+        &self,
+        visit: usize,
+        half: Half,
+    ) -> Result<Option<step_depth::BankRead<'_>>, EngError> {
+        if half == Half::Mixer {
+            self.execution(visit)?.bank_read()
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn relative(&self, visit: usize, _slot: usize, _n: usize, p0: usize) -> Result<(), EngError> {
+        let ex = self.execution(visit)?;
+        ex.attention(self.cuda, p0, ex.layout.attention_input)
     }
 
     fn own_forward(&self, visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
         self.execution(visit)?.forward(self.cuda)
     }
 
-    /// The mixer mixes its attention input in the launch of its bank mixes, and the MLP's
-    /// convolution adds the output into the depth current row.
+    /// The MLP's convolution adds the output into the depth current row.
     fn own_fuses(&self, _visit: usize, half: Half) -> Fuses {
         Fuses {
-            read: half == Half::Mixer,
+            read: false,
             apply: half == Half::Forward,
         }
     }

@@ -8,7 +8,7 @@
 
 use super::attend::{self, At, AttendRows};
 use super::delta::{self, ChannelRows, DeltaNames, DeltaRows};
-use super::depth::{DepthSite, Mix};
+use super::depth::{BankRead, DepthSite};
 use super::rows::{Map, Norm, StepIo, q8, raw};
 use super::scratch::Core;
 use super::site::{self, MixWeights};
@@ -86,8 +86,9 @@ pub(crate) enum Mixer {
         names: Box<attend::latent::Names>,
         slot: usize,
     },
-    /// A mixer of the model's own.
-    Own,
+    /// Relative-position attention over K/V rings with learned distance bias, sinks, output
+    /// gate and K/V/output short convolutions, caching in slot `slot`.
+    Relative { slot: usize },
 }
 
 pub(crate) enum Forward {
@@ -118,8 +119,8 @@ pub(crate) enum Stage {
 }
 
 impl Layer {
-    /// Every tensor the layer names, in the order a load takes them. A mixer or a feed-forward
-    /// of the model's own names none here.
+    /// Every tensor the layer names, in the order a load takes them. Relative attention and a
+    /// feed-forward of the model's own name none here.
     pub(crate) fn tensors(&self) -> Vec<String> {
         let mut names: Vec<String> = self.norms.iter().flatten().cloned().collect();
         match &self.site {
@@ -138,7 +139,7 @@ impl Layer {
             Mixer::Latent { names: latent, .. } => {
                 names.extend(latent.tensors().into_iter().map(str::to_owned));
             }
-            Mixer::Own => {}
+            Mixer::Relative { .. } => {}
         }
         match &self.forward {
             Forward::Dense(dense) => names.extend(dense.iter().cloned()),
@@ -199,7 +200,7 @@ impl Layer {
                 )));
             }
             (Mixer::Latent { names, .. }, _) => names.check(map)?,
-            (Mixer::Own, _) => {}
+            (Mixer::Relative { .. }, _) => {}
         }
         match &self.forward {
             Forward::Dense(names) => names.iter().try_for_each(|n| map.native(n).map(drop)),
@@ -278,9 +279,14 @@ pub(crate) trait Model {
     ) -> Result<(attend::latent::Dims, attend::latent::LatentRows<'_>), EngError> {
         unsupported(self.family(), "a low-rank attention layer")
     }
-    /// The mixer of visit `visit`, for a layer whose mixer is the model's own.
-    fn own_mixer(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
-        unsupported(self.family(), "a mixer of the model's own")
+    /// The relative-attention mixer of visit `visit` (slot `slot`) over `n` rows at `p0`,
+    /// reading the depth site's mixed inputs and writing `core.mix_out`.
+    fn relative(&self, _visit: usize, _slot: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
+        unsupported(self.family(), "a relative-attention layer")
+    }
+    /// Extra bank and role mixes a depth-attention visit batches with its `half` read.
+    fn depth_bank(&self, _visit: usize, _half: Half) -> Result<Option<BankRead<'_>>, EngError> {
+        Ok(None)
     }
     /// The feed-forward of visit `visit`, for a layer whose feed-forward is the model's own: it
     /// reads the normed rows and writes the forward rows, as the shared blocks do.
@@ -336,7 +342,7 @@ impl<M: Model> Walk<'_, M> {
     /// What the model fuses of `half`: nothing unless the half's branch is the model's own.
     fn fuses(&self, layer: &Layer, visit: usize, half: Half) -> Fuses {
         let own = match half {
-            Half::Mixer => matches!(layer.mixer, Mixer::Own),
+            Half::Mixer => false,
             Half::Forward => matches!(layer.forward, Forward::Own),
         };
         if own {
@@ -425,19 +431,20 @@ impl<M: Model> Visits for Walk<'_, M> {
                 // The forward half reads after the mixer half's seal.
                 let blocks = blocks + usize::from(*seal && half == Half::Forward);
                 let query = match &queries[half as usize] {
-                    // A query may hold several rows (one per input of the model's own mixer):
-                    // the walk mixes under the first, and such a mixer mixes the others itself.
+                    // A query may hold several rows (one per role of a relative mixer): the walk
+                    // mixes under the first, and batches any extra bank/role queries beside it.
                     Some(name) => Some(io.raw(name)?.slice(0, h * 4)?),
                     None => None,
                 };
-                let mix = Mix {
-                    query,
-                    norm: None,
-                    first_block: 0,
-                    out: site.input.range(0, n * h * 4)?,
-                    stride: h,
-                };
-                site.depth.mix(io.ctx, io.stream, mix, (plane, blocks), n)?;
+                let extra = m.depth_bank(visit, half)?;
+                site.depth.mix_read(
+                    io.ctx,
+                    io.stream,
+                    (query, site.input.range(0, n * h * 4)?),
+                    extra,
+                    (plane, blocks),
+                    n,
+                )?;
                 (site.input.range(0, n * h * 4)?, None)
             }
         };
@@ -484,7 +491,7 @@ impl<M: Model> Visits for Walk<'_, M> {
                     let (dims, rows) = m.latent(*slot, n)?;
                     attend::latent::mix(&io, names, dims, &rows, n, p0)?;
                 }
-                Mixer::Own => m.own_mixer(visit, n, p0)?,
+                Mixer::Relative { slot } => m.relative(visit, *slot, n, p0)?,
             },
             Half::Forward => match &layer.forward {
                 Forward::Dense([gate, up, down]) => {

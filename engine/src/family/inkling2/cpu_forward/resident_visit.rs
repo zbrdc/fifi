@@ -18,14 +18,15 @@ use crate::{
             resident_mlp::ResidentMlpRequest,
         },
     },
-    family::step::conv::{self, Ring, Row as ConvRow, Variant},
+    family::step::{
+        conv::{self, Ring, Row as ConvRow, Variant},
+        depth::{BankMix, BankRead, mix_bank_jobs},
+    },
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         resident::{
             dense_gemv::DenseDtype,
-            depth_attention::{
-                AddCall, MAX_BLOCKS, MAX_MIX_JOBS, MixCall, MixJob, MixShape, SealCall, StreamShape,
-            },
+            depth_attention::{AddCall, MAX_BLOCKS, SealCall, StreamShape},
             relative_prep::PrepMath,
         },
     },
@@ -632,8 +633,8 @@ struct Execution<'a> {
     context: &'a CudaContext,
 }
 
-impl Execution<'_> {
-    fn row(&self, span: Region) -> Result<DeviceRange<'_>, EngError> {
+impl<'a> Execution<'a> {
+    fn row(&self, span: Region) -> Result<DeviceRange<'a>, EngError> {
         if let Some(s) = self.shared {
             let l = self.layout;
             let walk = s.walk.map(|w| {
@@ -659,84 +660,85 @@ impl Execution<'_> {
     fn enqueue(&self, cuda: &GgufCuda, position: usize) -> Result<(), EngError> {
         self.mixer(cuda, position)?;
         let blocks = self.advance_depth()?;
-        self.mix(
-            (self.layout.depth, 0),
-            blocks,
-            self.weights.mlp_query,
-            self.layout.mlp_input,
+        let (l, width) = (self.layout, self.plan.shape.widths.hidden);
+        mix_bank_jobs(
+            self.context,
+            self.stream,
+            self.row(l.depth.row((blocks + 1) * width))?,
+            None,
+            Some((
+                self.weights.row(self.weights.mlp_query)?,
+                self.row(l.mlp_input)?,
+            )),
+            None,
+            (blocks, width, MIX_EPS),
+            self.row(l.glue_health)?,
         )?;
         self.forward(cuda)
     }
 
-    /// The mixer half from its depth mixes, in one launch: the bank queries' messages and the
-    /// attention query's mix; then the attention, which writes `attention_out`.
     fn mixer(&self, cuda: &GgufCuda, position: usize) -> Result<(), EngError> {
-        let l = self.layout;
-        let shape = self.plan.shape;
+        let (l, shape) = (self.layout, self.plan.shape);
         let width = shape.widths.hidden;
-        // The bank queries and the attention query read different stream states (the bank and
-        // the depth), so one launch runs them all, a block per mix.
-        let job = |(state, first_block): (Region, usize), blocks: usize, query, out| {
-            Ok::<_, EngError>(MixJob {
-                state: self.row(state.row((blocks + 1) * width))?,
-                query: self.weights.row(query)?,
-                out: self.row(out)?,
-                first_block,
-                blocks,
-            })
-        };
-        let (depth, bank) = ((l.depth, 0), (l.bank, shape.bank_first));
-        let mut jobs = Vec::with_capacity(MAX_MIX_JOBS);
-        for (query, out) in self
+        let extra = self.bank_read()?;
+        let bank = extra
+            .as_ref()
+            .and_then(|e| e.bank.as_ref())
+            .map(|bm| self.row(l.bank.row((bm.blocks + 1) * width)))
+            .transpose()?;
+        let primary = self
             .weights
-            .bank_queries
-            .into_iter()
-            .flatten()
-            .zip(l.messages)
-        {
-            jobs.push(job(bank, shape.bank_blocks, query, out)?);
-        }
-        let input = match self.weights.attention_query {
-            Some(query) => {
-                jobs.push(job(depth, shape.blocks, query, l.attention_input)?);
-                l.attention_input
-            }
-            None => l.depth.row(width),
-        };
-        if !jobs.is_empty() {
-            self.context.depth_attention_mix_jobs(
-                self.stream,
-                &jobs,
-                &self.row(l.glue_health)?,
-                (width, MIX_EPS),
-            )?;
-        }
-        self.attention(cuda, position, input)
-    }
-
-    fn mix(
-        &self,
-        (state, first_block): (Region, usize),
-        blocks: usize,
-        query: Region,
-        out: Region,
-    ) -> Result<(), EngError> {
-        let width = self.plan.shape.widths.hidden;
-        self.context.depth_attention_mix(
+            .attention_query
+            .map(|q| Ok::<_, EngError>((self.weights.row(q)?, self.row(l.attention_input)?)))
+            .transpose()?;
+        let depth = self.row(l.depth.row((shape.blocks + 1) * width))?;
+        let health = self.row(l.glue_health)?;
+        mix_bank_jobs(
+            self.context,
             self.stream,
-            MixCall {
-                state: self.row(state.row((blocks + 1) * width))?,
-                query: self.weights.row(query)?,
-                out: self.row(out)?,
-                health: self.row(self.layout.glue_health)?,
-            },
-            MixShape {
-                first_block,
-                blocks,
-                width,
-                eps: MIX_EPS,
+            depth,
+            bank,
+            primary,
+            extra,
+            (shape.blocks, width, MIX_EPS),
+            health,
+        )?;
+        self.attention(
+            cuda,
+            position,
+            if primary.is_some() {
+                l.attention_input
+            } else {
+                l.depth.row(width)
             },
         )
+    }
+
+    fn bank_read(&self) -> Result<Option<BankRead<'a>>, EngError> {
+        let (l, shape) = (self.layout, self.plan.shape);
+        let pairs = |qs: &[Region], outs: &[Region]| -> Result<Vec<_>, EngError> {
+            qs.iter()
+                .zip(outs)
+                .map(|(&q, &o)| Ok((self.weights.row(q)?, self.row(o)?)))
+                .collect()
+        };
+        let bank = self
+            .weights
+            .bank_queries
+            .map(|qs| {
+                Ok::<_, EngError>(BankMix {
+                    first_block: shape.bank_first,
+                    blocks: shape.bank_blocks,
+                    roles: pairs(&qs, &l.messages)?,
+                })
+            })
+            .transpose()?;
+        let extra_roles = match (self.weights.global_roles, l.global_scratch) {
+            (Some((qs, _)), Some((ins, _))) => pairs(&qs, &ins)?,
+            (Some(_), None) => return Err(bad("global decode lacks scratch")),
+            _ => Vec::new(),
+        };
+        Ok((bank.is_some() || !extra_roles.is_empty()).then_some(BankRead { bank, extra_roles }))
     }
 
     fn attention(&self, cuda: &GgufCuda, position: usize, input: Region) -> Result<(), EngError> {
@@ -770,81 +772,58 @@ impl Execution<'_> {
             log: self.row(l.log)?,
             status: self.row(l.attention_status)?,
         };
-        if let Some((queries, gammas)) = self.weights.global_roles {
+        let global = if let Some((_, gammas)) = self.weights.global_roles {
             let (inputs, coeff) = l
                 .global_scratch
                 .ok_or_else(|| bad("global decode lacks scratch"))?;
-            for (query, out) in queries.into_iter().zip(inputs) {
-                self.mix((l.depth, 0), self.plan.shape.blocks, query, out)?;
-            }
             request.gammas = [
                 self.weights.row(gamma)?,
                 self.weights.row(gammas[0])?,
                 self.weights.row(gammas[1])?,
             ];
-            if !self.plan.shape.banked {
-                return cuda.enqueue_plain_decode(
-                    self.stream,
-                    request,
-                    [self.row(q)?, self.row(k)?, self.row(v)?],
-                    Some((
-                        [self.row(inputs[0])?, self.row(inputs[1])?],
-                        [self.row(coeff[0])?, self.row(coeff[1])?],
-                    )),
-                );
-            }
-            return cuda.enqueue_banked_global(
-                self.stream,
-                request,
+            Some((
                 [self.row(inputs[0])?, self.row(inputs[1])?],
                 [self.row(coeff[0])?, self.row(coeff[1])?],
-            );
-        }
+            ))
+        } else {
+            None
+        };
         if !self.plan.shape.banked {
-            return cuda.enqueue_plain_decode(
-                self.stream,
-                request,
-                [self.row(q)?, self.row(k)?, self.row(v)?],
-                None,
-            );
+            let normed = [self.row(q)?, self.row(k)?, self.row(v)?];
+            return cuda.enqueue_plain_decode(self.stream, request, normed, global);
         }
-        cuda.enqueue_local_decode(self.stream, request)
+        match global {
+            Some((roles, coeff)) => cuda.enqueue_banked_global(self.stream, request, roles, coeff),
+            None => cuda.enqueue_local_decode(self.stream, request),
+        }
     }
 
     fn advance_depth(&self) -> Result<usize, EngError> {
-        let shape = self.plan.shape;
-        let l = self.layout;
+        let (shape, l) = (self.plan.shape, self.layout);
+        let width = shape.widths.hidden;
+        let health = self.row(l.glue_health)?;
         if !shape.seal {
-            self.add(l.attention_out)?;
+            let add = AddCall {
+                state: self.row(l.depth.row(width))?,
+                row: self.row(l.attention_out)?,
+                health,
+            };
+            self.context.depth_attention_add(self.stream, add, width)?;
             return Ok(shape.blocks);
         }
-        self.context.depth_attention_seal(
-            self.stream,
-            SealCall {
-                state: self.row(l.depth)?,
-                next: self.row(l.attention_out)?,
-                health: self.row(l.glue_health)?,
-            },
-            StreamShape {
-                blocks: shape.blocks,
-                width: shape.widths.hidden,
-                eps: MIX_EPS,
-            },
-        )?;
-        Ok(shape.blocks + 1)
-    }
-
-    fn add(&self, addend: Region) -> Result<(), EngError> {
-        let width = self.plan.shape.widths.hidden;
-        self.context.depth_attention_add(
-            self.stream,
-            AddCall {
-                state: self.row(self.layout.depth.row(width))?,
-                row: self.row(addend)?,
-                health: self.row(self.layout.glue_health)?,
-            },
+        let seal = SealCall {
+            state: self.row(l.depth)?,
+            next: self.row(l.attention_out)?,
+            health,
+        };
+        let stream_shape = StreamShape {
+            blocks: shape.blocks,
             width,
-        )
+            eps: MIX_EPS,
+        };
+        self.context
+            .depth_attention_seal(self.stream, seal, stream_shape)?;
+        Ok(shape.blocks + 1)
     }
 
     /// The forward half from its mixed input `mlp_input`: the MLP and its convolution into
