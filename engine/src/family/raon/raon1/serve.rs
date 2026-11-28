@@ -43,7 +43,7 @@ mod device {
     use crate::family::executor::SerialDecode;
     use crate::family::raon::raon1::cuda::{CHUNK, HeadRows, Raon1Device};
     use crate::family::session::{DecodeSession, Kept};
-    use crate::family::step::stepper::{DeviceStep, DeviceStepper};
+    use crate::family::step::stepper::{DeviceStep, DeviceStepper, ShortlistIo};
     use crate::sched::worker::spawn_engine_noted;
 
     /// The served stepper of Raon-1: shared position/generation/failure tracking over
@@ -58,13 +58,12 @@ mod device {
             Ok(())
         }
 
-        fn logits(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngError> {
-            self.feed(&[token], pos, HeadRows::Last)?
-                .pop()
-                .ok_or_else(|| EngError::Backend {
-                    operation: "raon1",
-                    message: "the head returned no logits row".into(),
-                })
+        fn decode_to_logits(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
+            self.step_decode(token, pos)
+        }
+
+        fn shortlist_io(&self) -> Option<ShortlistIo<'_>> {
+            Some(self.shortlist_io())
         }
 
         fn takes_tokens(&self) -> bool {

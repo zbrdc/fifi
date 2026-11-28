@@ -32,7 +32,8 @@ use crate::family::step::replay::Replay;
 use crate::family::step::rows::{Map, Rows, StepIo};
 use crate::family::step::scratch::{Alloc, Core, Count, OnDevice, Widths, Zeroed};
 use crate::family::step::state::{Slots, State};
-use crate::family::step::tail::Tail;
+use crate::family::step::stepper::ShortlistIo;
+use crate::family::step::tail::{Tail, f32_bytes, f32_values, read_logits_row};
 use crate::family::step::walk::{self, ChunkStep, Half};
 use crate::family::step::{delta, ffn, head, moe, site};
 use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP};
@@ -104,19 +105,6 @@ const KV_BYTES_PER_POSITION: u64 = SPEC.mla_layers.len() as u64 * MLA_ROW as u64
 const MIN_CONTEXT: usize = 2048;
 /// The model's trained context.
 const MAX_CONTEXT: usize = 262_144;
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn f32_values(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect()
-}
 
 fn plan_error(message: String) -> EngError {
     EngError::MemoryPlan(format!("raon1: {message}"))
@@ -539,13 +527,13 @@ impl Raon1Device {
         pos0: usize,
         head: HeadRows,
     ) -> Result<Vec<Vec<f32>>, EngError> {
-        if tokens.len() == 1
-            && head == HeadRows::Last
-            && !self.exact.get()
-            && self.trace.borrow().is_none()
-            && self.tail.is_some()
-        {
-            return Ok(vec![self.decode_logits_replayed(tokens[0], pos0)?]);
+        if tokens.len() == 1 && head == HeadRows::Last {
+            self.step_decode(tokens[0], pos0)?;
+            return Ok(vec![read_logits_row(
+                &self.stream,
+                &self.sc.core.logits,
+                self.vocab,
+            )?]);
         }
         crate::family::step::walk::feed(self, tokens, pos0, head)
     }
@@ -601,21 +589,50 @@ impl Raon1Device {
         run
     }
 
-    fn decode_logits_replayed(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngError> {
-        self.check_single_step(token, pos)?;
-        let params = StepParams::new(token as i32, pos as i32)?;
-        self.params
-            .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
-        let mut replay = std::mem::take(&mut self.decode_replay);
+    fn run_replayed(
+        &mut self,
+        token: u32,
+        pos: usize,
+        pick_vocab: Option<usize>,
+    ) -> Result<(), EngError> {
+        let bytes = StepParams::new(token as i32, pos as i32)?.to_bytes();
+        self.params.write_at_enqueue(&self.stream, 0, &bytes)?;
+        if let Some(vocab) = pick_vocab
+            && self.tail_vocab != vocab
+        {
+            (self.tail_replay, self.tail_vocab) = (Replay::default(), vocab);
+        }
+        let mut replay = match pick_vocab {
+            Some(_) => std::mem::take(&mut self.tail_replay),
+            None => std::mem::take(&mut self.decode_replay),
+        };
         let left = replay.run(&self.ctx, &self.stream, || {
-            let tail = self.tail.as_ref().expect("checked");
-            self.run_step_graph(tail, None)
+            self.run_step_graph(self.tail.as_ref().expect("checked"), pick_vocab)
         });
-        self.decode_replay = replay;
+        match pick_vocab {
+            Some(_) => self.tail_replay = replay,
+            None => self.decode_replay = replay,
+        }
         self.sc.core.cur.set(left?);
-        let mut bytes = vec![0u8; self.vocab * 4];
-        self.sc.core.logits.read_at(&self.stream, 0, &mut bytes)?;
-        Ok(f32_values(&bytes))
+        Ok(())
+    }
+
+    /// Runs one decode step at `pos`, leaving the logits row on the device (replaying the captured
+    /// graph when the embedding table is resident and neither exact nor trace is active).
+    pub(crate) fn step_decode(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
+        self.check_single_step(token, pos)?;
+        if self.tail.is_some() && !self.exact.get() && self.trace.borrow().is_none() {
+            return self.run_replayed(token, pos, None);
+        }
+        self.chunk(&[token], pos)?;
+        self.queue_head(0)
+    }
+
+    /// Device buffers for logits readback and host-equal shortlist sampling.
+    pub(crate) fn shortlist_io(&self) -> ShortlistIo<'_> {
+        self.sc
+            .core
+            .shortlist_io(&self.ctx, &self.stream, self.vocab)
     }
 
     /// Runs one greedy decode step on the device and returns the picked token id (8-byte readback).
@@ -638,19 +655,7 @@ impl Raon1Device {
                     .into(),
             ));
         }
-        let params = StepParams::new(token as i32, pos as i32)?;
-        self.params
-            .write_at_enqueue(&self.stream, 0, &params.to_bytes())?;
-        if self.tail_vocab != sampler_vocab {
-            (self.tail_replay, self.tail_vocab) = (Replay::default(), sampler_vocab);
-        }
-        let mut replay = std::mem::take(&mut self.tail_replay);
-        let left = replay.run(&self.ctx, &self.stream, || {
-            let tail = self.tail.as_ref().expect("checked");
-            self.run_step_graph(tail, Some(sampler_vocab))
-        });
-        self.tail_replay = replay;
-        self.sc.core.cur.set(left?);
+        self.run_replayed(token, pos, Some(sampler_vocab))?;
         self.tail.as_ref().expect("checked").picked(&self.stream)
     }
 
@@ -788,9 +793,7 @@ impl Raon1Device {
     /// The output head of row `row` of the last chunk: stream mean, norm, vocabulary matvec.
     fn logits_row(&self, row: usize) -> Result<Vec<f32>, EngError> {
         self.queue_head(row)?;
-        let mut bytes = vec![0u8; self.vocab * 4];
-        self.sc.core.logits.read_at(&self.stream, 0, &mut bytes)?;
-        Ok(f32_values(&bytes))
+        read_logits_row(&self.stream, &self.sc.core.logits, self.vocab)
     }
 }
 

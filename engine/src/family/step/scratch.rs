@@ -8,9 +8,11 @@ use std::cell::Cell;
 
 use super::delta::DeltaRows;
 use super::rows::{Rows, q8};
+use super::stepper::ShortlistIo;
 use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as product_q8_bytes;
-use crate::kernels::cuda::{CudaContext, DeviceBuffer};
+use crate::kernels::cuda::resident::shortlist;
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 
 pub(crate) trait Alloc {
     type Buf;
@@ -129,6 +131,7 @@ pub(crate) struct Core<B = DeviceBuffer> {
     pub(crate) product_q8: B,
     pub(crate) fixup: B,
     pub(crate) logits: B,
+    pub(crate) shortlist: B,
 }
 
 impl<B> Core<B> {
@@ -151,6 +154,7 @@ impl<B> Core<B> {
             product_q8: a.bytes(product_q8_bytes(w.product, n)?)?,
             fixup: a.bytes(w.fixup)?,
             logits: a.floats(w.vocab)?,
+            shortlist: a.bytes(shortlist::MASS_SCRATCH_BYTES)?,
         })
     }
 }
@@ -170,6 +174,22 @@ impl Core {
             read: Rows::both(&self.read_q8, &self.read),
             out: &self.mix_out,
             channel: None,
+        }
+    }
+
+    /// Device buffers for logits readback and host-equal shortlist sampling.
+    pub(crate) fn shortlist_io<'a>(
+        &'a self,
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        vocab: usize,
+    ) -> ShortlistIo<'a> {
+        ShortlistIo {
+            ctx,
+            stream,
+            logits: &self.logits,
+            scratch: &self.shortlist,
+            vocab,
         }
     }
 }

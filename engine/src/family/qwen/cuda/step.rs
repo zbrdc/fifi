@@ -576,6 +576,13 @@ impl<'a> LoopStep<'a> {
         &self.rows.core.logits
     }
 
+    /// Device buffers for logits readback and host-equal shortlist sampling.
+    pub(crate) fn shortlist_io(&self) -> crate::family::step::stepper::ShortlistIo<'_> {
+        self.rows
+            .core
+            .shortlist_io(&self.ctx, &self.stream, self.shape.vocab)
+    }
+
     /// Clears the carried state for a new session on the same card: the GDN state, the conv
     /// rings and the attention planes return to the zeros of [`LoopStep::open`] (the planes too,
     /// so a session that ended on a non-finite value leaves nothing a masked read could meet),

@@ -1440,3 +1440,95 @@ fn a_reused_turn_has_the_bits_of_its_cold_start_with_the_same_boundary_mark() {
     );
     drop(engine.shutdown());
 }
+
+/// Non-greedy sampled decode through `RaonStep::next_token` (device shortlist + softmax-mass
+/// certificate) matches host `Sampler::sample` token-for-token and top-2 margin bit-for-bit across
+/// bounded `top_k <= 20`, open-vocabulary `top_k == 0`, and host-fallback (`top_k > 20`, capture).
+#[test]
+#[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
+fn device_sampled_requests_match_host_sampler_token_for_token() {
+    use std::time::Instant;
+
+    use super::serve::RaonStep;
+    use crate::family::sampler::{Sampler, SamplingParams};
+    use crate::family::session::TokenStepper;
+
+    let path = model_path();
+    require_device("device_sampled_requests_match_host_sampler_token_for_token");
+    let device = Raon1Device::load(&path, Some(2048), &mut |_| {}).expect("device load");
+    let vocab = device.vocab();
+    let mut step = RaonStep::over(device);
+    let prompt = &PROMPT[..];
+    let steps = 16usize;
+
+    let cases = [
+        (
+            "bounded_k20",
+            SamplingParams::new(0.8, 0.9, 20).unwrap(),
+            42u64,
+        ),
+        (
+            "open_p95",
+            SamplingParams::new(0.8, 0.95, 0).unwrap(),
+            42u64,
+        ),
+        ("open_p100", SamplingParams::new(1.0, 1.0, 0).unwrap(), 7u64),
+        (
+            "fallback_k50",
+            SamplingParams::new(0.8, 0.95, 50).unwrap(),
+            99u64,
+        ),
+    ];
+
+    for (label, params, seed) in cases {
+        // Host reference via full logits readback + Sampler::sample.
+        step.reset().expect("reset host");
+        step.feed_rows(&prompt[..prompt.len() - 1])
+            .expect("prefill host");
+        let mut host_sampler = Sampler::new(params, seed);
+        let mut tok = *prompt.last().unwrap();
+        let mut want = Vec::with_capacity(steps);
+        let t_host = Instant::now();
+        for _ in 0..steps {
+            let logits = step.logits(tok).expect("logits");
+            tok = host_sampler.sample(&logits[..vocab]).expect("host sample");
+            want.push(tok);
+        }
+        let host_s = t_host.elapsed().as_secs_f64();
+
+        // Device shortlist / certificate path via TokenStepper::next_token.
+        step.reset().expect("reset dev");
+        step.feed_rows(&prompt[..prompt.len() - 1])
+            .expect("prefill dev");
+        let mut dev_sampler = Sampler::new(params, seed);
+        let mut tok = *prompt.last().unwrap();
+        let mut got = Vec::with_capacity(steps);
+        let t_dev = Instant::now();
+        for _ in 0..steps {
+            tok = step
+                .next_token(tok, &mut dev_sampler, vocab)
+                .expect("next_token");
+            got.push(tok);
+        }
+        let dev_s = t_dev.elapsed().as_secs_f64();
+
+        assert!(
+            step.device().decode_replayed(),
+            "{label}: decode graph was not replayed"
+        );
+        assert_eq!(got, want, "{label}: token stream mismatch");
+        assert_eq!(
+            dev_sampler.first_top2_margin().map(f32::to_bits),
+            host_sampler.first_top2_margin().map(f32::to_bits),
+            "{label}: first_top2_margin mismatch"
+        );
+        eprintln!(
+            "raon sampled {label}: {steps} tokens match host exact | host {:.1} tok/s ({:.3} s) | \
+             device {:.1} tok/s ({:.3} s)",
+            steps as f64 / host_s,
+            host_s,
+            steps as f64 / dev_s,
+            dev_s,
+        );
+    }
+}

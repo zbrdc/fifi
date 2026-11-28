@@ -11,8 +11,10 @@
 
 use crate::EngError;
 use crate::family::mem::DEVICE;
+use crate::family::sampler::Sampler;
 use crate::kernels::cuda::resident::block_ops::BlockOp;
 use crate::kernels::cuda::resident::embed::{EmbedTable, check_host_ids};
+use crate::kernels::cuda::resident::shortlist::{self, ShortlistCall, ShortlistMassCall};
 use crate::kernels::cuda::resident::step_params::{
     ARGMAX_PART_BYTES, ArgmaxCall, OFFSET_STATUS, OFFSET_TOKEN_ID, RESULT_PAIR_BYTES, ResultPair,
     STEP_PARAMS_BYTES,
@@ -218,4 +220,147 @@ impl Tail {
             message: format!("the device picked the id {picked}"),
         })
     }
+}
+
+/// Whether `sampler` can draw on the device via the host-equal top-20 shortlist (for `top_k` in
+/// `1..=20`) or the top-20 shortlist with softmax-mass certificate (for open-vocabulary `top_k == 0`
+/// with a finite positive f32 inverse temperature).
+pub(crate) fn can_shortlist_sample(sampler: &Sampler) -> bool {
+    if sampler.capture_armed() || sampler.is_greedy() {
+        return false;
+    }
+    let params = sampler.params();
+    if (1..=shortlist::K as u32).contains(&params.top_k()) {
+        return true;
+    }
+    if sampler.open_draw_on_device() {
+        let inv_temp = (1.0 / params.temperature()) as f32;
+        return inv_temp.is_finite() && inv_temp > 0.0;
+    }
+    false
+}
+
+/// Encodes f32 values as little-endian bytes.
+pub(crate) fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Decodes little-endian bytes into f32 values.
+pub(crate) fn f32_values(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect()
+}
+
+/// Reads the first `vocab` f32 logits of `logits` from the device on `stream`.
+pub(crate) fn read_logits_row(
+    stream: &DeviceStream,
+    logits: &DeviceBuffer,
+    vocab: usize,
+) -> Result<Vec<f32>, EngError> {
+    let byte_len = vocab
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| EngError::BadRequest("logits row byte length overflows".to_owned()))?;
+    if byte_len == 0 || byte_len > logits.bytes() {
+        return Err(EngError::BadRequest(format!(
+            "logits read of {vocab} values exceeds buffer of {} bytes",
+            logits.bytes()
+        )));
+    }
+    let mut bytes = vec![0u8; byte_len];
+    logits.read_at(stream, 0, &mut bytes)?;
+    Ok(f32_values(&bytes))
+}
+
+fn decode_shortlist(bytes: &[u8], vocab: usize) -> Result<Vec<(u32, f32)>, EngError> {
+    if bytes.len() < shortlist::RESULT_BYTES {
+        return Err(EngError::Backend {
+            operation: "shortlist",
+            message: "shortlist readback buffer is truncated".to_owned(),
+        });
+    }
+    if bytes[160..164] != [0; 4] {
+        return Err(EngError::Backend {
+            operation: "shortlist",
+            message: "device shortlist found non-finite logits".to_owned(),
+        });
+    }
+    Ok(bytes[..vocab.min(shortlist::K) * 8]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|entry| {
+            (
+                u32::from_le_bytes(entry[4..8].try_into().expect("candidate id word")),
+                f32::from_le_bytes(entry[..4].try_into().expect("candidate logit word")),
+            )
+        })
+        .collect())
+}
+
+/// Draws one token from the logits row already on the device using the host-equal shortlist
+/// (`top_k` 1..=20, 176-byte readback) or the shortlist plus softmax-mass certificate
+/// (`top_k == 0`, 240-byte readback, reading the full logits row only when the certificate
+/// declines). The token stream equals the host sampler's for every seed.
+pub(crate) fn sample_shortlist(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    logits: &DeviceBuffer,
+    scratch: &DeviceBuffer,
+    sampler: &mut Sampler,
+    sampler_vocab: usize,
+) -> Result<u32, EngError> {
+    let logits_bytes = sampler_vocab
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| EngError::BadRequest("device shortlist vocabulary overflows".to_owned()))?;
+    if sampler_vocab == 0 || logits_bytes > logits.bytes() {
+        return Err(EngError::BadRequest(format!(
+            "device shortlist vocabulary {sampler_vocab} is outside 1..={}",
+            logits.bytes() / size_of::<f32>()
+        )));
+    }
+    let logits_range = logits.range(0, logits_bytes)?;
+    ctx.shortlist(
+        stream,
+        ShortlistCall {
+            k: shortlist::K,
+            logits: logits_range,
+            scratch: scratch.range(0, shortlist::SCRATCH_BYTES)?,
+            n: sampler_vocab,
+        },
+    )?;
+    if sampler.open_draw_on_device() {
+        let inv_temperature = (1.0 / sampler.params().temperature()) as f32;
+        ctx.shortlist_mass(
+            stream,
+            ShortlistMassCall {
+                k: shortlist::K,
+                logits: logits_range,
+                scratch: scratch.range(0, shortlist::MASS_SCRATCH_BYTES)?,
+                n: sampler_vocab,
+                inv_temperature,
+            },
+        )?;
+        // Final shortlist record (RESULT_BYTES) and MASS_PARTS f64 partials sit contiguously.
+        const COMBINED: usize = shortlist::RESULT_BYTES + shortlist::MASS_PARTS * 8;
+        let mut buf = [0u8; COMBINED];
+        scratch.read_at(stream, shortlist::RESULT_OFFSET, &mut buf)?;
+        let candidates = decode_shortlist(&buf[..shortlist::RESULT_BYTES], sampler_vocab)?;
+        let mass: f64 = buf[shortlist::RESULT_BYTES..]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|part| f64::from_le_bytes(*part))
+            .sum();
+        return sampler.sample_open_shortlist(&candidates, sampler_vocab, mass, || {
+            read_logits_row(stream, logits, sampler_vocab)
+        });
+    }
+    let mut buf = [0u8; shortlist::RESULT_BYTES];
+    scratch.read_at(stream, shortlist::RESULT_OFFSET, &mut buf)?;
+    let candidates = decode_shortlist(&buf, sampler_vocab)?;
+    sampler.sample_shortlist(&candidates, sampler_vocab)
 }

@@ -33,7 +33,7 @@ use crate::family::project::gguf::{GgufMatrix, GgufProjector};
 use crate::family::qwen::recipe::{Model, ROUTED_EXPERTS, layers, routed_experts, tensors};
 use crate::family::qwen::sensenova::weights::LoopWeights;
 use crate::family::session::{DecodeSession, Kept};
-use crate::family::step::stepper::{DeviceStep, DeviceStepper};
+use crate::family::step::stepper::{DeviceStep, DeviceStepper, ShortlistIo};
 use crate::family::step::tail::device_table;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::resident::embed::EmbedTable;
@@ -238,19 +238,13 @@ impl DeviceStep for CardDevice {
         self.step.prefill(&rows, pos)
     }
 
-    fn logits(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngError> {
+    fn decode_to_logits(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
         let row = self.projector.rows(&self.embd, &[token])?;
-        self.step.decode(&row, pos)?;
-        // The read is enqueued on the step's stream, behind its kernels.
-        let logits = self.step.logits_row();
-        let mut bytes = vec![0u8; logits.bytes()];
-        logits.read_at(self.step.stream(), 0, &mut bytes)?;
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| f32::from_le_bytes(*word))
-            .collect())
+        self.step.decode(&row, pos)
+    }
+
+    fn shortlist_io(&self) -> Option<ShortlistIo<'_>> {
+        Some(self.step.shortlist_io())
     }
 
     fn takes_tokens(&self) -> bool {
