@@ -57,11 +57,13 @@ bool apart(const void *a, long long a_bytes, const void *b, long long b_bytes) {
 
 long long ceil_div(long long a, long long b) { return (a + b - 1) / b; }
 
-/* The shape rules: the K grid before every other k rule, then m, n, ld, the destination reach
+/* The shape rules: the K block before every other k rule, then m, n, ld, the destination reach
  * and the tile grid. The Rust wrapper checks the same set in its own order (the grid, the int
  * conversions, then the reach); only which tag wins for a call that breaks two differs. */
 bool shape_ok(const inference_cuda_mmq_dense_args *a, BlockShape shape) {
-    if (shape.values == 0 || a->k % kKGrid != 0 || a->k <= 0 || a->k > kKMax) return false;
+    if (shape.values == 0 || a->k % shape.values != 0 || a->k < kKGrid || a->k > kKMax) {
+        return false;
+    }
     if (a->m < 1 || a->m > kColsMax || a->n < 1) return false;
     if (a->col_off < 0 || (long long)a->ld < (long long)a->col_off + a->n) return false;
     /* The vendored kernels index the destination in 32-bit int (mmq.cuh:907/953/1041/1130/1273):
@@ -80,8 +82,10 @@ bool valid_dense(const inference_cuda_mmq_dense_args *a, BlockShape shape) {
     if ((a->fixup == NULL) != (a->fixup_bytes == 0)) return false;
     if (!aligned_to(a->w, 16) || !aligned_to(a->y, 16) || !aligned_to(a->dst, 4)) return false;
     if (a->fixup != NULL && !aligned_to(a->fixup, 16)) return false;
-    const long long w_bytes = (long long)a->n * (a->k / shape.values) * shape.bytes;
-    const long long y_bytes = ceil_div(a->k, 128) * a->m * kQ8BlockBytes + kQ8Pad;
+    const long long k_padded = ceil_div(a->k, kKGrid) * kKGrid;
+    const long long w_bytes =
+        ((long long)(a->n - 1) * (a->k / shape.values) + k_padded / shape.values) * shape.bytes;
+    const long long y_bytes = (k_padded / 128) * a->m * kQ8BlockBytes + kQ8Pad;
     const long long dst_bytes = ((long long)(a->m - 1) * a->ld + a->col_off + a->n) * 4;
     if (!apart(a->dst, dst_bytes, a->w, w_bytes) || !apart(a->dst, dst_bytes, a->y, y_bytes)) {
         return false;
@@ -212,7 +216,7 @@ constexpr BlockShape kNvfp4Shape = {
 
 bool valid_nvfp4_dense(const inference_cuda_mmq_nvfp4_args *a) {
     if (a == nullptr || a->matrix.type != GGML_TYPE_NVFP4 || a->y_scale == nullptr ||
-        a->matrix.ld != a->matrix.n || a->matrix.col_off != 0 ||
+        a->matrix.k % kKGrid != 0 || a->matrix.ld != a->matrix.n || a->matrix.col_off != 0 ||
         !aligned_to(a->y_scale, 4) || !valid_dense(&a->matrix, kNvfp4Shape)) {
         return false;
     }

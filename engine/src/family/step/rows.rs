@@ -271,8 +271,7 @@ impl<'a> StepIo<'a> {
     /// type and the row length allow it and the rows exist as f32.
     fn batched(&self, weight: &NativeWeight, x: Rows<'_>, n: usize, packed: bool) -> bool {
         (n > MATVEC_ROWS || (n > FEW_ROWS && !packed))
-            && weight.k().is_multiple_of(256)
-            && mmq_dense::takes(weight.quant())
+            && mmq_dense::serves(weight)
             && x.f32.is_some()
     }
 

@@ -6,7 +6,7 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 use crate::kernels::cuda::prefill::mmq_dense::{
-    MmqDenseCall, MmqDenseInputCall, check_dense_rules, takes,
+    MmqDenseCall, MmqDenseInputCall, check_dense_rules, dense_needs, takes,
 };
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes;
@@ -122,6 +122,10 @@ impl PlaneGemm {
             && x.offset().is_multiple_of(16)
             && ld_x.is_multiple_of(4);
         if !aligned || check_dense_rules(quant, cols, rows, m, ld_y, 0).is_err() {
+            return None;
+        }
+        let need = dense_needs(quant, cols, rows, m, ld_y, 0).ok()?;
+        if codes.bytes() < need.w {
             return None;
         }
         BorrowedNativeWeight::new(codes, quant, cols, rows).ok()

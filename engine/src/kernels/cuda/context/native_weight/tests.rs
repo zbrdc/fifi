@@ -218,6 +218,42 @@ fn upload_native_round_trips_the_file_bytes_of_every_type_and_a_stack() {
 }
 
 #[test]
+fn upload_native_zero_pads_an_off_grid_k_weight() {
+    const NAME: &str = "upload_native_zero_pads_an_off_grid_k_weight";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let mut rng = testkit::Rng::new(0x5258_0576);
+    let (k, n_rows) = (576usize, 10usize);
+    let row_bytes = (k / 32) * 34;
+    let source: Vec<u8> = (0..n_rows * row_bytes)
+        .map(|_| (rng.next_u64() >> 24) as u8 | 1)
+        .collect();
+    let tensor = QuantTensor {
+        name: "w_off_grid",
+        ty: GgufType::Q80,
+        n_rows,
+        k,
+        source_len: source.len(),
+    };
+    let weight = ctx
+        .upload_native(tensor, 3 * row_bytes, &mut |at, buf| {
+            buf.copy_from_slice(&source[at..at + buf.len()]);
+            Ok(())
+        })
+        .expect("upload");
+    assert_eq!(weight.buffer().bytes(), source.len() + WEIGHT_TAIL_BYTES);
+    let mut back = vec![0xffu8; weight.buffer().bytes()];
+    ctx.download(weight.buffer(), &mut back).expect("download");
+    assert_eq!(&back[..source.len()], &source[..]);
+    assert!(
+        back[source.len()..].iter().all(|&b| b == 0),
+        "trailing MMQ tail bytes must be zero"
+    );
+}
+
+#[test]
 fn the_upload_ring_grows_for_a_wider_chunk_and_the_bytes_still_land_in_file_order() {
     const NAME: &str =
         "the_upload_ring_grows_for_a_wider_chunk_and_the_bytes_still_land_in_file_order";

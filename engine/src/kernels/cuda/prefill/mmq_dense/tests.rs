@@ -8,6 +8,7 @@ use crate::kernels::cuda::native::prefill::mmq_dense::{MmqDenseRaw, mmq_dense_la
 use crate::kernels::cuda::prefill::mmq_quant::MmqQuantizeCall;
 use crate::kernels::cuda::prefill::mmq_size::{
     MmqConfig, MmqType, NCOLS_LIMIT, Q8_1_PAD, fixup_floats_exact, fixup_floats_max, j_best, j_ub,
+    k_read,
 };
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit::Rng;
@@ -53,15 +54,23 @@ fn mmq_dense_refuses_a_type_without_a_case_by_tag() {
 }
 
 #[test]
-fn mmq_dense_refuses_the_k_grid_by_tag() {
-    // The K-grid rule: K = 384 is a multiple of 128 and of every flat qk but not of 256; it
-    // must reach THIS tag for every type, Q4_K and Q6_K included, and before the k extent rule
-    // (33,000 is off the grid AND above the extent).
-    for ty in [QuantType::Q80, QuantType::Q4K, QuantType::Q6K] {
+fn mmq_dense_refuses_the_k_block_by_tag() {
+    // The K-block rule: K must be a whole number of the weight type's blocks (256 for K-quants,
+    // 32 for Q8_0), checked before the k extent rule.
+    for ty in [QuantType::Q4K, QuantType::Q6K] {
         for k in [384usize, 260, 130, 33_000] {
             let text = refusal(check_dense_rules(ty, k, 512, 8, 512, 0));
-            assert!(text.contains("mmq_dense: K-grid"), "{ty:?} {k}: {text}");
+            assert!(text.contains("mmq_dense: K-block"), "{ty:?} {k}: {text}");
         }
+    }
+    for k in [260usize, 130, 33_000] {
+        let text = refusal(check_dense_rules(QuantType::Q80, k, 512, 8, 512, 0));
+        assert!(text.contains("mmq_dense: K-block"), "Q80 {k}: {text}");
+    }
+    for k in [384usize, 576, 1088] {
+        check_dense_rules(QuantType::Q80, k, 512, 8, 512, 0).expect("off-grid Q8_0");
+    }
+    for ty in [QuantType::Q80, QuantType::Q4K, QuantType::Q6K] {
         for k in [256usize, 512, 2048, 4096, 32_768] {
             check_dense_rules(ty, k, 512, 8, 512, 0).expect("on the k grid");
         }
@@ -70,8 +79,8 @@ fn mmq_dense_refuses_the_k_grid_by_tag() {
 
 #[test]
 fn mmq_dense_refuses_the_k_extent_by_tag() {
-    // 0 and 33,024 are both on the 256 grid, so only the extent rule can refuse them.
-    for k in [0usize, 33_024] {
+    // 0, 128 and 33,024 are multiples of Q8_0's 32-value block, so the extent rule refuses them.
+    for k in [0usize, 128, 33_024] {
         let text = refusal(check_dense_rules(QuantType::Q80, k, 512, 8, 512, 0));
         assert!(text.contains("mmq_dense: K extent"), "{k}: {text}");
     }
@@ -759,7 +768,7 @@ fn gated_slice(run: &Run, case: &Case) -> Vec<f64> {
         "{}: the canary after dst was written",
         case.name
     );
-    let blocks = (case.k / 128) * case.m * 144;
+    let blocks = (k_read(case.k).expect("k_read") / 128) * case.m * 144;
     assert!(
         run.y[blocks..].iter().all(|b| *b == POISON),
         "{}: the q8_1 pad was written",
@@ -2355,4 +2364,40 @@ fn mmq_dense_every_type_matches_the_f64_reference() {
         inputs.len(),
         refused.join("\n")
     );
+}
+
+#[test]
+fn mmq_dense_off_grid_k_matches_the_f64_reference() {
+    const NAME: &str = "mmq_dense_off_grid_k_matches_the_f64_reference";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let inputs: Vec<CaseInput> = [
+        (576usize, 512usize, 64usize),
+        (1088, 256, 130),
+        (576, 129, 37),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, shape)| input(dense(NAME, QuantType::Q80, shape), 0x6457_0000 + i as u64))
+    .collect();
+    let runs = run_cases(&inputs).expect("off-grid dense device phase");
+    for (input, run) in inputs.iter().zip(&runs) {
+        let c = &input.case;
+        let dev = gated_slice(run, c);
+        let stat = nmse(&dev, &reference(c, &input.w, &input.x), c.n, c.m);
+        println!(
+            "{NAME}: {:?} K{} N{} M{}: NMSE {:.3e}, max {:.3e}",
+            c.ty, c.k, c.n, c.m, stat.global, stat.max
+        );
+        assert!(
+            stat.global <= Q8X_DENSE_Q80,
+            "{:?} K{} N{} M{}: NMSE {:.3e} > {Q8X_DENSE_Q80:.3e}",
+            c.ty,
+            c.k,
+            c.n,
+            c.m,
+            stat.global
+        );
+    }
 }

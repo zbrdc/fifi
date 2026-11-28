@@ -186,6 +186,7 @@ fn the_dense_fill_pins_every_mmq_args_field() {
 #[test]
 fn the_dense_entry_refuses_each_bad_argument_at_its_own_guard() {
     fill(&base()).expect("the base call is valid");
+    fill(&MmqDenseArgsRaw { k: 576, ..base() }).expect("off-grid Q8_0 k is valid");
     // The grid-limit pair: 2^20 row tiles of Q8_0 at K = 32,768 reach 2^30 exactly.
     // The weight is 4.7 TB there, so the other ranges sit beyond its end.
     let tiles = |row_tiles: usize| {
@@ -240,7 +241,16 @@ fn the_dense_entry_refuses_each_bad_argument_at_its_own_guard() {
         ),
         ("IQ1_M has no case", MmqDenseArgsRaw { ty: 29, ..base() }),
         ("F32 has no case", MmqDenseArgsRaw { ty: 0, ..base() }),
-        ("K off the k grid", MmqDenseArgsRaw { k: 384, ..base() }),
+        ("K off the Q8_0 block", MmqDenseArgsRaw { k: 260, ..base() }),
+        (
+            "K off the Q4_K block",
+            MmqDenseArgsRaw {
+                ty: 12,
+                k: 384,
+                ..base()
+            },
+        ),
+        ("K below the k tile", MmqDenseArgsRaw { k: 128, ..base() }),
         ("K zero", MmqDenseArgsRaw { k: 0, ..base() }),
         ("K negative", MmqDenseArgsRaw { k: -256, ..base() }),
         (

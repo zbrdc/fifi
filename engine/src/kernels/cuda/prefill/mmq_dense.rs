@@ -10,15 +10,14 @@
 //! requires the device maximum ([`CudaContext::mmq_fixup_bytes`]).
 //!
 //! Every refusal is a `BadRequest` tagged `mmq_dense: <rule>`, in this order: the weight type
-//! (IQ1_M has no case), the K grid (`K % 256`, before any other k rule so K = 384 reaches this tag
-//! for every type; every block size divides 256, so it implies `K % qk` and no separate qk rule
-//! exists),
-//! the k extent, the column count `M` (the 2,048 chunk cap, `mmq_size`'s `NCOLS_LIMIT`), the row
+//! (IQ1_M has no case), the K block (`K % qk`, before any other k rule), the k extent (`256..=32768`),
+//! the column count `M` (the chunk cap, `mmq_size`'s `NCOLS_LIMIT`), the row
 //! count, the destination stride, the `2^30` tile-grid limit of the vendored launch (mmq.cuh:1402),
 //! bounded with the smallest tile width J = 8 because the launch picks J, the conversions to the C
 //! ABI's `int`, and the destination reach (`dst reach`: `(m - 1) * ld + n` must not exceed
 //! `i32::MAX`, because the kernels index the destination in 32-bit `int`). The byte sizes are
-//! `mmq_size`'s: the q8_1 range `q8_1_bytes(K, M)` carries the one constant pad.
+//! `mmq_size`'s: the weight range includes `weight_tail(ty, K)` past the last row when `K` is off
+//! the 256-value k tile, and the q8_1 range `q8_1_bytes(K, M)` carries the one constant pad.
 
 use std::ffi::c_int;
 
@@ -28,12 +27,12 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::prefill::mmq_dense::{MmqDenseRaw, mmq_dense_launch};
 use crate::kernels::cuda::prefill::mmq_quant::MmqQuantizeCall;
-use crate::kernels::cuda::prefill::mmq_size::{MmqType, NCOLS_LIMIT, q8_1_bytes};
+use crate::kernels::cuda::prefill::mmq_size::{
+    K_GRID, MmqType, NCOLS_LIMIT, q8_1_bytes, weight_tail,
+};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::{NativeBlocks, NativeWeight};
 
-/// The MMQ k grid: the k loop reads 256 values per iteration with no k clamp (mmq.cuh:856).
-const K_GRID: usize = 256;
 /// The k extent bound (the tree's `MAX_DIM`).
 const K_MAX: usize = 32_768;
 /// The smallest tile width J of any table row, and the `I` tile of every kept row.
@@ -115,13 +114,14 @@ pub(super) fn check_dense_mmq_rules(
     ld: usize,
     col_off: usize,
 ) -> Result<DenseInts, EngError> {
-    if !k.is_multiple_of(K_GRID) {
+    let qk = ty.block_values();
+    if !k.is_multiple_of(qk) {
         return Err(rule(
-            "K-grid",
-            &format!("k is {k}, not a multiple of {K_GRID} (the MMQ k grid)"),
+            "K-block",
+            &format!("k is {k}, not a multiple of {qk} (the {ty:?} block)"),
         ));
     }
-    if k == 0 || k > K_MAX {
+    if !(K_GRID..=K_MAX).contains(&k) {
         return Err(rule(
             "K extent",
             &format!("k is {k}, not {K_GRID}..={K_MAX}"),
@@ -195,8 +195,9 @@ fn check_grid(qk: usize, k: usize, n: usize, m: usize) -> Result<(), EngError> {
     }
 }
 
-/// Bytes of a dense call's ranges: `n` rows of `k` values of native blocks, `q8_1_bytes(k,
-/// m)` with the constant pad, and the destination reach `(m - 1) * ld + col_off + n` floats.
+/// Bytes of a dense call's ranges: `n` rows of `k` values of native blocks plus any trailing
+/// k-tile bytes when `k` is off `K_GRID`, `q8_1_bytes(k, m)` with the constant pad, and the
+/// destination reach `(m - 1) * ld + col_off + n` floats.
 pub(crate) fn dense_needs(
     ty: QuantType,
     k: usize,
@@ -206,7 +207,11 @@ pub(crate) fn dense_needs(
     col_off: usize,
 ) -> Result<DenseNeeds, EngError> {
     let overflow = || rule("size overflow", "a range size overflows");
-    let w = ty.weight_bytes(n, k).ok_or_else(overflow)?;
+    let mmq = mmq_type_of(ty)?;
+    let w = ty
+        .weight_bytes(n, k)
+        .and_then(|base| base.checked_add(weight_tail(mmq, k)?))
+        .ok_or_else(overflow)?;
     let dst = m
         .checked_sub(1)
         .and_then(|last| last.checked_mul(ld))
@@ -239,6 +244,27 @@ pub(crate) struct MmqDenseInputCall<'b, W: ?Sized = NativeWeight> {
 /// a type joins this set when the same measurement adds it.
 pub(crate) fn takes(ty: QuantType) -> bool {
     matches!(ty, QuantType::Q80 | QuantType::Q4K | QuantType::Q6K)
+}
+
+/// Whether the dense product serves `weight`: its type is in [`takes`], `k` is a whole number of
+/// weight blocks in `K_GRID..=K_MAX`, and its device buffer holds the trailing k-tile pad when
+/// `k` is off `K_GRID`.
+pub(crate) fn serves(weight: &NativeWeight) -> bool {
+    let (quant, k) = (weight.quant(), weight.k());
+    let Ok(mmq) = mmq_type_of(quant) else {
+        return false;
+    };
+    if !takes(quant) || !(K_GRID..=K_MAX).contains(&k) || !k.is_multiple_of(mmq.block_values()) {
+        return false;
+    }
+    let Some(base) = quant.weight_bytes(weight.n_rows(), k) else {
+        return false;
+    };
+    let Some(tail) = weight_tail(mmq, k) else {
+        return false;
+    };
+    base.checked_add(tail)
+        .is_some_and(|need| weight.buffer().bytes() >= need)
 }
 
 /// The q8_1 scale layout follows the weight type of the GEMM that reads the buffer; a mismatch

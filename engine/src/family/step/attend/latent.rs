@@ -145,14 +145,12 @@ pub(crate) fn mix(
         rows.out,
         rows.query_low_q8,
     )?;
-    // The served routes read the rounded rows only: f32 rows beside them would move a chunk
-    // onto another product.
-    let normed = if io.exact {
-        Rows::both(rows.query_low_q8, rows.out)
-    } else {
-        Rows::q8(rows.query_low_q8)
-    };
-    io.mv(&names.query, normed, rows.query, n)?;
+    io.mv(
+        &names.query,
+        Rows::both(rows.query_low_q8, rows.out),
+        rows.query,
+        n,
+    )?;
     io.mv(&names.latent, rows.input, rows.latent, n)?;
     io.run(BlockOp::mla_kv_prep(
         n,

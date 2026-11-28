@@ -4,7 +4,8 @@
 
 use super::{DqMmidCall, MmidIds, MmidLaunchCall, MmidQuantCall, MmidWeight, mmq_type_of};
 use crate::EngError;
-use crate::kernels::cuda::prefill::mmq_size::Q8_1Layout;
+use crate::kernels::cuda::prefill::mmq_quant::{K_GRID, K_MAX};
+use crate::kernels::cuda::prefill::mmq_size::{Q8_1Layout, weight_tail};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, NativeWeight};
 
@@ -82,18 +83,38 @@ pub(crate) struct RoutedX<'a, 'q> {
     pub(crate) quant: RoutedQuant<'q>,
 }
 
-/// Whether `weight` takes the dequantizing GEMM: the in-house types, and a type both routes
-/// decode whose row length is off the 256-value grid of the vendored grouped MMQ.
+/// Whether the vendored grouped MMQ serves `weight`: its type has an MMQ case, `k` is a whole
+/// number of weight blocks in `K_GRID..=K_MAX`, and the stack holds the trailing zero pad the
+/// last k tile reads when `k` is off `K_GRID`.
+fn mmq_serves_weight(weight: &NativeWeight) -> bool {
+    let (quant, k) = (weight.quant(), weight.k());
+    let Ok(mmq) = mmq_type_of(quant) else {
+        return false;
+    };
+    if !(K_GRID..=K_MAX).contains(&k) || !k.is_multiple_of(mmq.block_values()) {
+        return false;
+    }
+    let Some(base) = quant.weight_bytes(weight.n_rows(), k) else {
+        return false;
+    };
+    let Some(tail) = weight_tail(mmq, k) else {
+        return false;
+    };
+    base.checked_add(tail)
+        .is_some_and(|need| weight.buffer().bytes() >= need)
+}
+
+/// Whether `weight` takes the dequantizing GEMM: the in-house types, and a stack whose shape or
+/// padding the vendored grouped MMQ does not accept.
 fn takes_dq(weight: &NativeWeight) -> bool {
     let quant = weight.quant();
     quant.uses_dequantizing_gemm()
-        || (!weight.k().is_multiple_of(256) && super::grouped_dq_serves(quant))
+        || (!mmq_serves_weight(weight) && super::grouped_dq_serves(quant))
 }
 
 /// Whether a routed GEMM serves the stack `weight`.
 pub(crate) fn routed_serves(weight: &NativeWeight) -> bool {
-    takes_dq(weight)
-        || (weight.k().is_multiple_of(256) && super::mmq_type_of(weight.quant()).is_ok())
+    takes_dq(weight) || mmq_serves_weight(weight)
 }
 
 /// One routed GEMM of `weight` over `ids`: the dequantizing GEMM for the in-house types and for

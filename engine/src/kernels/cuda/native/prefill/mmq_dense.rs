@@ -11,7 +11,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::prefill::mmq_dense::DenseInts;
-use crate::kernels::cuda::prefill::mmq_size::{MmqType, q8_1_bytes};
+use crate::kernels::cuda::prefill::mmq_size::{MmqType, q8_1_bytes, weight_tail};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 
 /// Mirror of `inference_cuda_mmq_dense_args`, field for field.
@@ -82,7 +82,10 @@ fn check_dense(io: &MmqDenseRaw<'_>) -> Result<(), DeviceFailure> {
     let (k, n, m) = (size(ints.k)?, size(ints.n)?, size(ints.m)?);
     let (ld, col_off) = (size(ints.ld)?, size(ints.col_off)?);
     let quant = quant_of(ints.ty)?;
-    let w_need = quant.weight_bytes(n, k).ok_or_else(invalid_argument)?;
+    let mmq = MmqType::of(quant).ok_or_else(invalid_argument)?;
+    let w_base = quant.weight_bytes(n, k).ok_or_else(invalid_argument)?;
+    let w_tail = weight_tail(mmq, k).ok_or_else(invalid_argument)?;
+    let w_need = w_base.checked_add(w_tail).ok_or_else(invalid_argument)?;
     let y_need = q8_1_bytes(k, m).map_err(|_| invalid_argument())?;
     let dst_need = m
         .checked_sub(1)

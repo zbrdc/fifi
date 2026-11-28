@@ -696,13 +696,7 @@ impl Model for Raon1Device {
         n: usize,
     ) -> Result<((moe::Dims, ffn::Join), &moe::Scratch, ffn::Scratch<'_>), EngError> {
         let sc = &self.sc;
-        // The served routes read the rounded rows only; f32 rows beside them would move a
-        // chunk onto another product.
-        let act = if self.exact.get() {
-            Rows::both(&sc.q8_ffn, &sc.act_ffn)
-        } else {
-            Rows::q8(&sc.q8_ffn)
-        };
+        let act = Rows::both(&sc.q8_ffn, &sc.act_ffn);
         let shared = sc.ffn_scratch(n, MOE_INTER, act)?;
         Ok(((MOE, self.situ_join()), &sc.moe, shared))
     }

@@ -31,6 +31,9 @@ pub(crate) struct Nvfp4DenseShape {
 
 impl Nvfp4DenseShape {
     pub(crate) fn new(k: usize, n: usize, m: usize) -> Result<Self, EngError> {
+        if !k.is_multiple_of(super::mmq_size::K_GRID) {
+            return Err(bad("k must be a multiple of 256"));
+        }
         let ints = check_dense_mmq_rules(MmqType::Nvfp4, k, n, m, n, 0)?;
         let blocks = n
             .checked_mul(k / 64)

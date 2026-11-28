@@ -15,6 +15,7 @@
 
 use crate::EngError;
 use crate::kernels::cuda::native;
+use crate::kernels::cuda::prefill::mmq_size::{K_GRID, WEIGHT_TAIL_BYTES};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use std::{marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 
@@ -270,7 +271,15 @@ impl CudaContext {
             ))
         })?;
         let plan = RowChunkPlan::new(tensor.n_rows, row_bytes, chunk_limit);
-        let buffer = self.alloc(tensor.source_len)?;
+        let tail = if tensor.k >= K_GRID && !tensor.k.is_multiple_of(K_GRID) {
+            WEIGHT_TAIL_BYTES
+        } else {
+            0
+        };
+        let alloc_bytes = tensor.source_len.checked_add(tail).ok_or_else(|| {
+            EngError::Checkpoint(format!("tensor {name} allocation size overflows"))
+        })?;
+        let buffer = self.alloc(alloc_bytes)?;
         let raw = self.owned(&buffer)?;
         let chunk_bytes = plan.per_chunk * row_bytes;
         if !self.upload_through_ring(&buffer, &plan, row_bytes, chunk_bytes, read)? {
@@ -282,6 +291,10 @@ impl CudaContext {
                 let _dispatch = self.enter()?;
                 super::host_write(&buffer, raw, first * row_bytes, part)?;
             }
+        }
+        if tail > 0 {
+            let _dispatch = self.enter()?;
+            super::host_write(&buffer, raw, tensor.source_len, &[0u8; WEIGHT_TAIL_BYTES])?;
         }
         Ok(NativeWeight {
             buffer,
