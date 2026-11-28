@@ -593,18 +593,26 @@ fn relative_attention_is_timed() {
 
 /// Checks one shape against the reference, then prints its time: the median of 21 single steps
 /// and the mean of 16 steps back to back, with the rate of the K and V rows read, and the 21 single
-/// steps in their order.
+/// steps in their order, each with its host instant from the upload of the buffers.
 fn time_step(rig: &Rig, rng: &mut Rng, shape: RelativeAttentionShape, position: i32) {
     let c = Case::new(rng, shape, position);
     check(rig, &c, 0);
+    let since = Instant::now();
     let b = buffers(rig, &c, 0);
-    time_buffers(rig, &b, shape, position);
+    time_buffers(rig, &b, shape, position, since);
 }
 
 /// The time of one step over the uploaded buffers `b`: the median of 21 single steps and the
 /// mean of 16 back to back, with the rate of the bytes of K and V the step reads. The 21 single
-/// steps also print in their order: a single step's time moves between runs at the long ring.
-fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position: i32) {
+/// steps also print in their order, each at its host instant from `since`, which the caller takes
+/// before it uploads the buffers: a single step's time moves between runs at the long ring.
+fn time_buffers(
+    rig: &Rig,
+    b: &Buffers,
+    shape: RelativeAttentionShape,
+    position: i32,
+    since: Instant,
+) {
     let one = || {
         rig.ctx
             .relative_attention_timed(call(b, shape, None), 1)
@@ -613,7 +621,13 @@ fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position:
     for _ in 0..3 {
         one();
     }
-    let singles: Vec<u64> = (0..21).map(|_| one()).collect();
+    let made = since.elapsed().as_micros();
+    let mut singles = Vec::with_capacity(21);
+    let mut at = Vec::with_capacity(21);
+    for _ in 0..21 {
+        at.push(since.elapsed().as_micros());
+        singles.push(one());
+    }
     let mut sorted = singles.clone();
     sorted.sort_unstable();
     let single = sorted[sorted.len() / 2];
@@ -638,10 +652,12 @@ fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position:
         rate(chain),
     );
     println!(
-        "relative attention, ring format {:?}, ring {} at position {position}, the 21 single steps in us, in their order: {:?}",
+        "relative attention, ring format {:?}, ring {} at position {position}, the 21 single steps in us, in their order: {:?}, the first single began {} us after the upload's start, the host instant of each single from the upload's start, in us: {:?}",
         shape.format,
         shape.capacity,
         singles.iter().map(|ns| ns / 1000).collect::<Vec<u64>>(),
+        made,
+        at,
     );
 }
 
@@ -1050,8 +1066,9 @@ fn the_ring_formats_are_timed() {
             };
             let c = Case::new(&mut rng, s, position);
             let rings = (ring_bytes(format, &c.ring_k), ring_bytes(format, &c.ring_v));
+            let since = Instant::now();
             let b = buffers_with_rings(&rig, &c, 0, Some((&rings.0, &rings.1)));
-            time_buffers(&rig, &b, s, position);
+            time_buffers(&rig, &b, s, position, since);
         }
     }
 }
