@@ -63,6 +63,8 @@ extern "C" {
  *             query tiles of 8 rows x 8 heads on tensor cores, the queries and the
  *             tile probabilities rounded to f16. p0 and p2 are 8-byte aligned, p1
  *             16-byte. A device or an image without the kernel runs MLA_ATTN.
+ * 17 HC_BROADCAST copies each row into every residual stream, bit for bit. p0 src f32
+ *             [n][h]; p1 dst f32 [n][streams][h] (W). i0 n; i1 streams; i2 h.
  */
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,
@@ -76,7 +78,8 @@ enum {
     INFERENCE_CUDA_BLOCK_OP_SITU_QUANT = 12,
     INFERENCE_CUDA_BLOCK_OP_GATED_QUANT = 13,
     INFERENCE_CUDA_BLOCK_OP_FILL = 15,
-    INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_CHUNK = 16
+    INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_CHUNK = 16,
+    INFERENCE_CUDA_BLOCK_OP_HC_BROADCAST = 17
 };
 
 typedef struct inference_cuda_block_ops_args {

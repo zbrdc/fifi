@@ -118,6 +118,19 @@ impl<'b> BlockOp<'b> {
             .write(1, out, bytes(&[h, 4])?))
     }
 
+    /// Copies each of `n` rows of `h` floats into all `streams` residual streams, bit for bit.
+    pub(crate) fn hc_broadcast(
+        n: usize,
+        streams: usize,
+        h: usize,
+        src: DeviceRange<'b>,
+        dst: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        Ok(Self::new(17, &[n, streams, h], &[])?
+            .read(0, src, bytes(&[n, h, 4])?)
+            .write(1, dst, bytes(&[n, streams, h, 4])?))
+    }
+
     /// Finishes the inputs of the shared delta-rule scan in the per-channel form: the `v`
     /// third of the `[q | k | v]` conv rows (`qkv`) scaled in place by the fold of its beta and
     /// delta logits, one decay value per key channel (`decay`) and the projection rows

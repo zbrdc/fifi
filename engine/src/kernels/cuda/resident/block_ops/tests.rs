@@ -905,3 +905,32 @@ fn the_mixing_apply_with_an_identity_matrix_is_the_in_place_apply() {
         "the two applies differ"
     );
 }
+
+#[test]
+fn the_stream_broadcast_copies_each_row_into_every_stream_bit_for_bit() {
+    let Some(r) = rig("block_ops hc_broadcast") else {
+        return;
+    };
+    let (n, streams, h) = (7usize, 4usize, 300usize);
+    let mut src = data(81, n * h, 2.0);
+    // Include signed zero and subnormal bit patterns to check a bitwise copy.
+    src[0] = -0.0;
+    src[h + 1] = f32::from_bits(1);
+    let sb = r.up(&src);
+    let dst = r.zeros(n * streams * h);
+    r.run(BlockOp::hc_broadcast(n, streams, h, whole(&sb), whole(&dst)).expect("op"));
+    let got = r.read(&dst, n * streams * h);
+    for t in 0..n {
+        let row = &src[t * h..(t + 1) * h];
+        for s in 0..streams {
+            let at = (t * streams + s) * h;
+            assert!(
+                got[at..at + h]
+                    .iter()
+                    .zip(row)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "row {t} stream {s} differs"
+            );
+        }
+    }
+}

@@ -9,10 +9,10 @@
 //! larger chunks take the batched product; the routed experts run per token up to 8 rows and as
 //! grouped products, one per expert stack, above that.
 //!
-//! The embedding table stays in the file: each token's row is dequantized on the host and
-//! uploaded into the four residual streams. The latent keys of the seven attention layers are
-//! kept as f16 rows of 576 values; the delta-rule state and the convolution history of the
-//! other eighteen layers are f32.
+//! The embedding table is gathered on the device when free memory admits and broadcast into the
+//! four residual streams, falling back to host dequantization otherwise. The latent keys of the
+//! seven attention layers are kept as f16 rows of 576 values; the delta-rule state and the
+//! convolution history of the other eighteen layers are f32.
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
@@ -29,6 +29,7 @@ use crate::family::step::recipe::{Forward, Layer, Mixer, Model, Site, Stage as W
 use crate::family::step::rows::{Map, Rows, StepIo};
 use crate::family::step::scratch::{Alloc, Core, Count, OnDevice, Widths, Zeroed};
 use crate::family::step::state::{Slots, State};
+use crate::family::step::tail::ChunkEmbed;
 use crate::family::step::walk::{self, ChunkStep, Half};
 use crate::family::step::{delta, ffn, head, moe, site};
 use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP};
@@ -253,6 +254,7 @@ pub(crate) struct Raon1Device {
     state: State,
     /// `[mla layers][cells][576]` f16 latent cache.
     cache: DeviceBuffer,
+    embed: Option<ChunkEmbed>,
     cells: usize,
     vocab: usize,
     trace: RefCell<Option<Vec<Stage>>>,
@@ -392,6 +394,13 @@ impl Raon1Device {
         let sc = scratch(&OnDevice(&ctx), vocab, fixup)?;
         let state = State::new(&Zeroed(OnDevice(&ctx)), slots(spec, cells))?;
         let cache = ctx.upload(&vec![0u8; spec.mla_layers.len() * cells * MLA_ROW * 2])?;
+        let embed = ChunkEmbed::open(
+            &ctx,
+            model.weights(),
+            "token_embd.weight",
+            (vocab, HIDDEN),
+            CHUNK,
+        )?;
         Ok(Self {
             ctx,
             stream,
@@ -405,6 +414,7 @@ impl Raon1Device {
             sc,
             state,
             cache,
+            embed,
             cells,
             vocab,
             trace: RefCell::new(None),
@@ -521,15 +531,28 @@ impl Raon1Device {
 
     fn chunk(&mut self, tokens: &[u32], pos0: usize) -> Result<(), EngError> {
         let n = tokens.len();
-        let mut resid = vec![0f32; n * STREAMS * HIDDEN];
-        for (t, &token) in tokens.iter().enumerate() {
-            let row = self.embedding_row(token)?;
-            for s in 0..STREAMS {
-                let at = (t * STREAMS + s) * HIDDEN;
-                resid[at..at + HIDDEN].copy_from_slice(&row);
+        if let Some(embed) = &self.embed {
+            let resid = &self.sc.core.resid[0];
+            embed.gather(
+                &self.ctx,
+                &self.stream,
+                tokens,
+                self.vocab,
+                (STREAMS, HIDDEN),
+                &self.sc.branch,
+                resid,
+            )?;
+        } else {
+            let mut resid = vec![0f32; n * STREAMS * HIDDEN];
+            for (t, &token) in tokens.iter().enumerate() {
+                let row = self.embedding_row(token)?;
+                for s in 0..STREAMS {
+                    let at = (t * STREAMS + s) * HIDDEN;
+                    resid[at..at + HIDDEN].copy_from_slice(&row);
+                }
             }
+            self.sc.core.resid[0].write_at(&self.stream, 0, &f32_bytes(&resid))?;
         }
-        self.sc.core.resid[0].write_at(&self.stream, 0, &f32_bytes(&resid))?;
         self.rows.set(n);
         walk::visits(&Walk(&*self), n, pos0, |_, _| Ok(()))
     }

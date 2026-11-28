@@ -184,6 +184,13 @@ __global__ void hc_mean_kernel(const float *resid, float *out, int row, int h) {
     out[k] = acc / (float)kHcStreams;
 }
 
+__global__ void hc_broadcast_kernel(const unsigned *src, unsigned *dst, int streams, int h) {
+    const int t = blockIdx.x, s = blockIdx.y;
+    const unsigned *in = src + (size_t)t * h;
+    unsigned *out = dst + ((size_t)t * streams + s) * h;
+    for (int k = threadIdx.x; k < h; k += blockDim.x) out[k] = in[k];
+}
+
 /* ---- quantize -------------------------------------------------------------------------- */
 
 __global__ void __launch_bounds__(256) gated_quant_kernel(const float *x, const float *g,
@@ -515,6 +522,17 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
             hc_mean_kernel<<<(unsigned)((h + 255) / 256), 256, 0, s>>>(
                 (const float *)p[0], (float *)p[1], (int)row, (int)h);
+            return launch_status(out_stage);
+        }
+        case INFERENCE_CUDA_BLOCK_OP_HC_BROADCAST: {
+            const long long n = i[0], streams = i[1], h = i[2];
+            if (n < 1 || n > 65536 || streams < 1 || streams > 16 || h < 1 || h > 16384)
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.use(0, n * h * 4, false);
+            slots.use(1, n * streams * h * 4, true);
+            if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            hc_broadcast_kernel<<<dim3((unsigned)n, (unsigned)streams), 256, 0, s>>>(
+                (const unsigned *)p[0], (unsigned *)p[1], (int)streams, (int)h);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_RDA_PACK: {
