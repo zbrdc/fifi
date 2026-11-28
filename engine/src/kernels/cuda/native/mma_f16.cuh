@@ -1,5 +1,6 @@
 /* The f16 tensor-core primitives the attention and scan kernels share: the shared-memory
- * address of a pointer, the 8x8 ldmatrix loads and the m16n8k16 MMA with f32 accumulation.
+ * address of a pointer, the 8x8 ldmatrix loads, the m16n8k16 MMA with f32 accumulation, the
+ * 16-byte asynchronous copy into shared memory and the named barrier of four warps.
  * They exist for sm_75 and later only, so no older device pass sees one; a caller guards its
  * uses the same way. */
 #ifndef INFERENCE_CUDA_MMA_F16_CUH
@@ -50,6 +51,36 @@ __device__ __forceinline__ void mma_16816(float *d, const unsigned *a, unsigned 
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(b0), "r"(a[2]), "r"(a[3]), "r"(b1));
 #endif
+}
+
+/* 16 bytes global -> shared, bypassing L1; src_bytes 0 reads nothing and writes zeros. */
+__device__ inline void cp_async16(unsigned dst, const void *src, int src_bytes) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
+                 "r"(src_bytes));
+#else
+    // Turing uses the single-stage path: the surrounding block barriers protect
+    // reuse and publish these synchronous, aligned vector copies.
+    auto *out = reinterpret_cast<uint4 *>(__cvta_shared_to_generic(dst));
+    *out = src_bytes ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0, 0, 0, 0);
+#endif
+}
+
+__device__ inline void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+__device__ inline void cp_async_wait_all() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#endif
+}
+
+/* The named barrier of one row group's four warps (ids 1..4; 0 is __syncthreads). */
+__device__ inline void bar_row_group(int rg) {
+    asm volatile("bar.sync %0, 128;\n" ::"r"(1 + rg) : "memory");
 }
 
 }  // namespace mma

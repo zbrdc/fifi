@@ -172,6 +172,10 @@ __device__ inline bool block_of(const Args &a, int s, int kvh, int tile, Block &
 }
 
 #if __CUDA_ARCH__ >= 750
+using inference::mma::bar_row_group;
+using inference::mma::cp_async16;
+using inference::mma::cp_async_commit;
+using inference::mma::cp_async_wait_all;
 using inference::mma::ldsm_x4;
 using inference::mma::ldsm_x4_trans;
 using inference::mma::mma_16816;
@@ -290,36 +294,6 @@ __device__ inline float exp_score_delta(float delta) {
 template <int kHeadDim>
 __device__ inline unsigned swz(int key, int chunk) {
     return key * (2 * kHeadDim) + ((chunk ^ (key & 7)) << 4);
-}
-
-/* 16 bytes global -> shared, bypassing L1; src_bytes 0 reads nothing and writes zeros. */
-__device__ inline void cp_async16(unsigned dst, const void *src, int src_bytes) {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
-                 "r"(src_bytes));
-#else
-    // Turing uses the single-stage path: the surrounding block barriers protect
-    // reuse and publish these synchronous, aligned vector copies.
-    auto *out = reinterpret_cast<uint4 *>(__cvta_shared_to_generic(dst));
-    *out = src_bytes ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0, 0, 0, 0);
-#endif
-}
-
-__device__ inline void cp_async_commit() {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.commit_group;\n" ::);
-#endif
-}
-
-__device__ inline void cp_async_wait_all() {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-#endif
-}
-
-/* The named barrier of one row group's four warps (ids 1..4; 0 is __syncthreads). */
-__device__ inline void bar_row_group(int rg) {
-    asm volatile("bar.sync %0, 128;\n" ::"r"(1 + rg) : "memory");
 }
 
 /* Issues the K and V of the key tile at visible index base into the stage at byte `stage`
