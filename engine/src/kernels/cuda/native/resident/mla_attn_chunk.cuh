@@ -305,7 +305,6 @@ mla_attn_decode_tc_kernel(const float *qeff, const __half *cache, float *part,
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int rg = warp >> 2, dq = warp & 3;
     const int g = lane >> 2, c = (lane & 3) * 2;
-    const bool active_rg = ht * 64 + 16 * rg < heads;
     const int head[2] = {ht * 64 + 16 * rg + g, ht * 64 + 16 * rg + g + 8};
     float4 *const xs = reinterpret_cast<float4 *>(smem + 2 * kMlaStageBytes) +
                        rg * (kMlaGroupSlots * 32);
@@ -316,7 +315,7 @@ mla_attn_decode_tc_kernel(const float *qeff, const __half *cache, float *part,
     float *const xsum = reinterpret_cast<float *>(xp + 16 * kMlaProbRow);
 
     unsigned qf[kMlaScoreQuarter / 16][4];
-    if (lo < hi && active_rg) {
+    if (lo < hi) {
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const float *q = qeff + (size_t)head[i] * kMlaWidth + kMlaScoreQuarter * dq + c;
@@ -348,7 +347,6 @@ mla_attn_decode_tc_kernel(const float *qeff, const __half *cache, float *part,
         __syncthreads();
         if (base + kMlaTile < hi)
             mla_issue_tile(cache, base + kMlaTile, hi, stages + ((it + 1) & 1) * kMlaStageBytes);
-        if (!active_rg) continue;
         const unsigned kst = stages + (it & 1) * kMlaStageBytes;
 
         float sq[4][4];
@@ -455,7 +453,6 @@ mla_attn_decode_tc_kernel(const float *qeff, const __half *cache, float *part,
             }
         }
     }
-    if (!active_rg) return;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         if (head[i] >= heads) continue;
