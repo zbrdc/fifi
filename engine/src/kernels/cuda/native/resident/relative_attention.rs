@@ -10,7 +10,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::resident::relative_attention::{
-    RANGES, RelativeAttentionShape, RelativeAttentionTile, WRITTEN,
+    LogScale, RANGES, RelativeAttentionShape, RelativeAttentionTile, WRITTEN,
 };
 
 #[repr(C)]
@@ -54,6 +54,9 @@ unsafe extern "C" {
         gap: c_int,
         q_limit: f32,
         rel_limit: f32,
+        first: c_int,
+        log_floor: c_int,
+        log_alpha: f32,
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
@@ -65,9 +68,17 @@ pub(in crate::kernels::cuda) fn clip_queries(
     shape: RelativeAttentionShape,
     [rows, gap]: [usize; 2],
     limits: [f32; 2],
+    log: Option<(LogScale, usize)>,
 ) -> Result<(), DeviceFailure> {
     let [_, _, _, _, q, _, _, rel, _, sink, gate, _] =
         shape.region_bytes().ok_or_else(invalid_argument)?;
+    let (first, floor, alpha) = match log {
+        None => (0, 0, 0.0),
+        Some((log, first)) if log.valid() && c_int::try_from(first + rows).is_ok() => {
+            (first as c_int, log.floor as c_int, log.alpha)
+        }
+        Some(_) => return Err(invalid_argument()),
+    };
     if !(1..=512).contains(&rows)
         || !limits.iter().all(|x| x.is_finite() && *x > 0.0)
         || !gap.is_multiple_of(4)
@@ -99,6 +110,9 @@ pub(in crate::kernels::cuda) fn clip_queries(
             (gap / 4) as c_int,
             limits[0],
             limits[1],
+            first,
+            floor,
+            alpha,
             stream.as_ptr(),
             &mut stage,
         )

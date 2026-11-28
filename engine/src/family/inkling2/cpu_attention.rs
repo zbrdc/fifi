@@ -77,7 +77,7 @@ pub(super) struct VisitState {
     // KV rows are immutable after append, so prefix snapshots share their storage.
     keys: VecDeque<Arc<Vec<f32>>>,
     values: VecDeque<Arc<Vec<f32>>>,
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    /// The position of the visit's next row.
     position: usize,
     conv: VisitConvs,
     /// Set while the K/V rows and the four convolution histories of this visit exist only in
@@ -161,22 +161,27 @@ impl CpuForward {
         heads: Heads,
         state: &mut VisitState,
         projected: AttentionProjection,
+        scale: f32,
     ) -> Result<PreparedAttention, EngError> {
-        self.prepare_attention_row(attn, heads, state, projected, false)
+        self.prepare_attention_row(attn, heads, state, projected, (false, scale))
     }
 
+    /// The row's prepared Q, K, V and relative coefficients. `scale` is the row's
+    /// [`TextMath::query_scale`], applied to the clipped query and relative coefficients
+    /// unless the device clips them (`resident_query`).
     fn prepare_attention_row(
         &self,
         attn: &str,
         heads: Heads,
         state: &mut VisitState,
         projected: AttentionProjection,
-        resident_query: bool,
+        (resident_query, scale): (bool, f32),
     ) -> Result<PreparedAttention, EngError> {
         let [mut q, k, v, mut relative, sinks, gates, k_taps, v_taps] = projected;
         if !resident_query {
             self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
             clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
+            scale_rows(&mut q, scale);
         }
         let mut k = self.attention_plane(attn, "k", [k, k_taps], heads, &mut state.conv.k)?;
         let mut v = self.attention_plane(attn, "v", [v, v_taps], heads, &mut state.conv.v)?;
@@ -191,6 +196,7 @@ impl CpuForward {
                 self.math.d_rel,
                 self.math.rel_l2_clip_threshold,
             );
+            scale_rows(&mut relative, scale);
         }
         Ok(PreparedAttention {
             q,
@@ -210,18 +216,20 @@ impl CpuForward {
         attn: &str,
         heads: Heads,
         projected: AttentionProjection,
-        resident_query: bool,
+        (resident_query, scale): (bool, f32),
     ) -> Result<PreparedAttention, EngError> {
         let [mut q, _, _, mut relative, sinks, gates, _, _] = projected;
         if !resident_query {
             self.scale_channels(&mut q, &format!("{attn}.q_l2_clip.scale"))?;
             clip_rows(&mut q, heads.width, self.math.qk_l2_clip_threshold);
+            scale_rows(&mut q, scale);
             self.scale_channels(&mut relative, &format!("{attn}.rel_l2_clip.scale"))?;
             clip_rows(
                 &mut relative,
                 self.math.d_rel,
                 self.math.rel_l2_clip_threshold,
             );
+            scale_rows(&mut relative, scale);
         }
         Ok(PreparedAttention {
             q,
@@ -246,6 +254,8 @@ impl CpuForward {
                 qk_limit: self.math.qk_l2_clip_threshold,
                 rel_limit: self.math.rel_l2_clip_threshold,
                 eps: self.math.rms_norm_eps,
+                // Only a local visit chains this decode.
+                log: None,
             },
             read_weights,
             raw: [&state.conv.k.0, &state.conv.v.0],
@@ -288,7 +298,8 @@ impl CpuForward {
     ) -> Result<Vec<f32>, EngError> {
         let heads = self.heads(visit.attention);
         let attn = format!("{layer}.attn");
-        let prepared = self.prepare_attention(&attn, heads, state, projected)?;
+        let scale = self.math.query_scale(visit.attention, state.position());
+        let prepared = self.prepare_attention(&attn, heads, state, projected, scale)?;
         let output_name = format!("{attn}.wo_ud.weight");
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         let device_output = if let Weights::Gguf(weights) = &self.weights
@@ -392,10 +403,15 @@ impl CpuForward {
         let mut outputs = Vec::with_capacity(projections.len());
         let mut projections = projections.into_iter();
         while projections.len() != 0 {
+            let first = state.position();
             let tile = projections
                 .by_ref()
                 .take(capacity)
-                .map(|p| self.prepare_attention(&prefix, heads, state, p))
+                .enumerate()
+                .map(|(i, p)| {
+                    let scale = self.math.query_scale(visit.attention, first + i);
+                    self.prepare_attention(&prefix, heads, state, p, scale)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let rows: Vec<_> = tile.iter().map(PreparedAttention::device_row).collect();
             let values = {
@@ -567,6 +583,7 @@ impl CpuForward {
     fn prefill_query_clip<'a>(
         &self,
         scales: &'a [std::borrow::Cow<'_, [f32]>; 2],
+        attention: Attention,
     ) -> attention::prefill::QueryClip<'a> {
         attention::prefill::QueryClip {
             scales: scales.each_ref().map(AsRef::as_ref),
@@ -574,6 +591,7 @@ impl CpuForward {
                 self.math.qk_l2_clip_threshold,
                 self.math.rel_l2_clip_threshold,
             ],
+            log: self.math.log_scale(attention),
         }
     }
 
@@ -790,7 +808,6 @@ impl CpuForward {
 }
 
 impl VisitState {
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn position(&self) -> usize {
         self.position
     }
@@ -996,10 +1013,7 @@ impl VisitState {
             self.keys.push_back(key);
             self.values.push_back(value);
         }
-        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        {
-            self.position -= 1;
-        }
+        self.position -= 1;
         // A resident state has no host rows to undo; its first host consumer materializes.
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         debug_assert!(!self.resident && !self.ring_only);
@@ -1021,9 +1035,9 @@ impl VisitState {
         self.values.push_front(Arc::new(value));
         self.keys.truncate(length);
         self.values.truncate(length);
+        self.position += 1;
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         {
-            self.position += 1;
             self.resident = false;
         }
     }
@@ -1206,7 +1220,7 @@ impl PrefillBridge<'_> {
         let query = self
             .scales
             .as_ref()
-            .map(|scales| forward.prefill_query_clip(scales));
+            .map(|scales| forward.prefill_query_clip(scales, self.visit.attention));
         let stride = self.stride;
         let count = host.len();
         if count.checked_mul(stride) != Some(range.bytes()) {
@@ -1258,12 +1272,17 @@ impl PrefillBridge<'_> {
         }
         let mut prepared = Vec::new();
         let mut coefficients = Vec::new();
-        for p in host {
+        let first = state.position();
+        for (i, p) in host.enumerate() {
+            let query = (
+                resident_query,
+                forward.math.query_scale(self.visit.attention, first + i),
+            );
             prepared.push(if self.kv {
                 coefficients.extend(p[6].iter().chain(&p[7]));
-                forward.prepare_attention_query(&self.prefix, self.heads, p, resident_query)?
+                forward.prepare_attention_query(&self.prefix, self.heads, p, query)?
             } else {
-                forward.prepare_attention_row(&self.prefix, self.heads, state, p, resident_query)?
+                forward.prepare_attention_row(&self.prefix, self.heads, state, p, query)?
             });
         }
         let kv = self
@@ -1360,6 +1379,15 @@ pub(super) fn note_resident_queries(chained: bool) {
             "Inkling CUDA kept {path} prefill attention Q, relative, sinks and gates resident"
         )
     });
+}
+
+/// Multiplies every value by `scale`; a scale of exactly 1 leaves the rows alone.
+fn scale_rows(rows: &mut [f32], scale: f32) {
+    if scale != 1.0 {
+        for value in rows {
+            *value *= scale;
+        }
+    }
 }
 
 pub(super) fn clip_rows(rows: &mut [f32], width: usize, limit: f32) {

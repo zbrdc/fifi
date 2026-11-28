@@ -349,6 +349,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/inkling_iq2_visit_tile.cuh",
     "src/kernels/cuda/native/resident/inkling_controller_pair.cuh",
     "src/kernels/cuda/native/resident/lane_sum.cuh",
+    "src/kernels/cuda/native/resident/log_query_scale.cuh",
     "src/kernels/cuda/native/resident/dense_gemv_panel_visit.cuh",
     "src/kernels/cuda/native/resident/inkling_splitn_visit.cuh",
     "src/kernels/cuda/native/resident/inkling_grid_split.cuh",

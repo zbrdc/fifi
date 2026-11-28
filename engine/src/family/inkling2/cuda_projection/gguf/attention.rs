@@ -1151,6 +1151,7 @@ mod tests {
         let query = prefill::QueryClip {
             scales: [&q_scale, &rel_scale],
             limits: [1.25, 0.5],
+            log: None,
         };
         let raw_q = std::array::from_fn::<_, 4, _>(|r| {
             std::array::from_fn::<_, HEAD_DIM, _>(|i| {

@@ -20,6 +20,21 @@ use crate::kernels::cuda::native::resident::relative_attention::{
 };
 
 pub(crate) const HEAD_DIM: usize = 128;
+
+/// The factor a long-context attention applies to its clipped query and relative coefficients
+/// at a position (`native/resident/log_query_scale.cuh`): `1 + alpha * ln((pos + 1) / floor)`
+/// past `floor`, and exactly 1 through it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LogScale {
+    pub(crate) floor: u32,
+    pub(crate) alpha: f32,
+}
+
+impl LogScale {
+    pub(crate) fn valid(self) -> bool {
+        (1..=MAX_WORD as u32).contains(&self.floor) && self.alpha.is_finite() && self.alpha >= 0.0
+    }
+}
 const MAX_HEADS: usize = 64;
 const MAX_WORD: usize = (1 << 30) - 1;
 const MAX_STRIDE: usize = 1 << 20;
@@ -120,13 +135,14 @@ impl RelativeAttentionShape {
 }
 
 impl CudaContext {
-    /// Clips Q and relative coefficients in the packed prefill sidecar in place.
+    /// Clips Q and relative coefficients in the packed prefill sidecar in place; with a `log`
+    /// scale and the first row's position, scales them by each row's position.
     pub(crate) fn relative_attention_clip_queries(
         &self,
         stream: &DeviceStream,
         shape: RelativeAttentionShape,
         [rows, gap]: [usize; 2],
-        limits: [f32; 2],
+        (limits, log): ([f32; 2], Option<(LogScale, usize)>),
         [side, scales, status]: [DeviceRange<'_>; 3],
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
@@ -162,7 +178,7 @@ impl CudaContext {
             self.raw_range(&status)?,
         ];
         self.launch_on(stream, |raw| {
-            clip_queries(raw, ranges, shape, [rows, gap], limits)
+            clip_queries(raw, ranges, shape, [rows, gap], limits, log)
         })
     }
 

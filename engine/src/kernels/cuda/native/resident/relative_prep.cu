@@ -5,6 +5,7 @@
 #include "abi.h"
 #include "device.h"
 #include "resident/lane_sum.cuh"
+#include "resident/log_query_scale.cuh"
 
 namespace {
 constexpr int kWidth = 128, kTaps = 4;
@@ -16,8 +17,11 @@ struct Args {
     const float *q_scale, *rel_scale, *kernel_k, *kernel_v;
     float *past_k, *past_v;
     uint32_t *status;
-    int queries, kv, dims, history;
-    float qk_limit, rel_limit, eps;
+    // The row's position, read only with a positive `log_floor`: the clipped query and
+    // relative coefficients then take `log_query_scale`.
+    const int *pos;
+    int queries, kv, dims, history, log_floor;
+    float qk_limit, rel_limit, eps, log_alpha;
 };
 
 // One block per head and plane. Use the host's reduction and tap order; these
@@ -77,7 +81,11 @@ __global__ void relative_prep(Args a) {
         valid &= isfinite(sum);
     }
     __syncthreads();
-    const float result = x * scale;
+    float result = x * scale;
+    if (a.log_floor > 0 && blockIdx.x < 2 * a.queries) {
+        const float tau = log_query_scale(*a.pos, a.log_floor, a.log_alpha);
+        if (tau != 1.f) result = __fmul_rn(result, tau);
+    }
     const int invalid = __syncthreads_or(!valid || !isfinite(x) || !isfinite(result));
     if (d < width) *output = result;
     // Only one block writes status; per-head prep flags are distinct words.
@@ -235,8 +243,12 @@ extern "C" int inference_cuda_relative_prep_rows(void *const *p, const int *shap
 }
 
 extern "C" int inference_cuda_relative_prep(void *const *p, int queries, int kv,
-    int dims, int history, float qk_limit, float rel_limit, float eps, void *stream,
-    int *out_stage) {
+    int dims, int history, float qk_limit, float rel_limit, float eps, const int *pos,
+    int log_floor, float log_alpha, void *stream, int *out_stage) {
+    if (log_floor > 0 && (pos == nullptr || uintptr_t(pos) % 4 != 0 || !isfinite(log_alpha) ||
+                          log_alpha < 0.f)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
     Args args{static_cast<float *>(p[0]), static_cast<float *>(p[1]),
               static_cast<float *>(p[2]), static_cast<float *>(p[3]),
               static_cast<float *>(p[4]), static_cast<float *>(p[5]),
@@ -245,7 +257,8 @@ extern "C" int inference_cuda_relative_prep(void *const *p, int queries, int kv,
               static_cast<const float *>(p[10]), static_cast<const float *>(p[11]),
               static_cast<float *>(p[12]), static_cast<float *>(p[13]),
               static_cast<uint32_t *>(p[14]),
-              queries, kv, dims, history, qk_limit, rel_limit, eps};
+              pos, queries, kv, dims, history, log_floor, qk_limit, rel_limit, eps,
+              log_alpha};
     relative_prep<<<2 * (queries + kv), kWidth, 0, (cudaStream_t)stream>>>(args);
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

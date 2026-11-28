@@ -5,7 +5,7 @@ use crate::family::inkling2::switches::Switch;
 use crate::{
     family::inkling2::cuda_projection::{DEVICE_HEADROOM, q8_row_reuse},
     kernels::cuda::resident::{
-        relative_attention::{QUERY_TILE_LIMIT, RelativeAttentionTile},
+        relative_attention::{LogScale, QUERY_TILE_LIMIT, RelativeAttentionTile},
         relative_prep::{KvPrepShape, OutputConvShape, PrepShape},
     },
 };
@@ -83,6 +83,8 @@ impl Workspace {
 pub(in crate::family::inkling2) struct QueryClip<'a> {
     pub scales: [&'a [f32]; 2],
     pub limits: [f32; 2],
+    /// The scale by position of a visit that attends over the whole context.
+    pub log: Option<LogScale>,
 }
 
 #[derive(Clone, Copy)]
@@ -832,6 +834,7 @@ impl ResidentAttention {
                 side,
                 kv.zip(kv_history),
                 device_rows.then_some(position),
+                position,
             ),
             (projection, tile, destination),
         )?;
@@ -854,11 +857,12 @@ impl ResidentAttention {
         visit: Visit,
         layout: Layout,
         work: &mut Workspace,
-        (offsets, side, kv, first): (
+        (offsets, side, kv, first, position): (
             &[[usize; 8]],
             Option<Sidecar<'_>>,
             Option<(&KvPrep<'_>, usize)>,
             Option<usize>,
+            usize,
         ),
         (projection, tile, destination): (
             Option<&OutputProjection<'_>>,
@@ -927,7 +931,7 @@ impl ResidentAttention {
                     &self.stream,
                     visit.shape,
                     [count, layout.resident[1] + layout.resident[2]],
-                    query.limits,
+                    (query.limits, query.log.map(|log| (log, position))),
                     [
                         side.range,
                         work.device.range(scales_at, layout.scales)?,

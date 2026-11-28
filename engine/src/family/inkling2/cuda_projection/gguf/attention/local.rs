@@ -372,7 +372,7 @@ impl ResidentAttention {
             0,
             aux.buffer().range(aux.offset(), aux_uploaded)?,
         )?;
-        context.relative_prep(stream, ranges, layout.prep, count, math)?;
+        context.relative_prep(stream, ranges, layout.prep, count, (math, None))?;
         let attention_out = scratch.range(base + layout.attention_at, q.bytes())?;
         context.relative_attention(
             stream,
@@ -687,6 +687,7 @@ impl ResidentAttention {
                 key_history: request.raw_history[0],
                 value_history: request.raw_history[1],
                 status: health.prep,
+                pos: request.pos,
             },
         )?;
         Ok(PrepRows {

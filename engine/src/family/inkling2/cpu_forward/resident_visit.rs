@@ -418,6 +418,7 @@ impl Workspace {
                 qk_limit: forward.math.qk_l2_clip_threshold,
                 rel_limit: forward.math.rel_l2_clip_threshold,
                 eps: forward.math.rms_norm_eps,
+                log: forward.math.log_scale(visit.attention),
             },
             controls: Controls {
                 names,

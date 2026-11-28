@@ -6,6 +6,7 @@
 use std::mem::size_of;
 
 use crate::EngError;
+pub(crate) use crate::kernels::cuda::resident::relative_attention::LogScale;
 use crate::kernels::cuda::{
     CudaContext, DeviceRange, DeviceStream,
     context::{Claim, require_apart, require_fit},
@@ -95,6 +96,9 @@ pub(crate) struct PrepMath {
     pub qk_limit: f32,
     pub rel_limit: f32,
     pub eps: f32,
+    /// The scale of the clipped query and relative coefficients by the row's position, for a
+    /// visit that attends over the whole context; `None` leaves them as clipped.
+    pub log: Option<LogScale>,
 }
 
 #[derive(Clone, Copy)]
@@ -330,7 +334,7 @@ impl CudaContext {
         ranges: [DeviceRange<'_>; 10],
         shape: PrepShape,
         history: usize,
-        math: PrepMath,
+        (math, pos): (PrepMath, Option<DeviceRange<'_>>),
     ) -> Result<(), EngError> {
         let [a, b, c, d, e, f, g, h, aux, status] = ranges;
         let [qs, rs, kk, kv, pk, pv] = shape.split_aux(aux)?;
@@ -339,27 +343,40 @@ impl CudaContext {
             [a, b, c, d, e, f, g, h, qs, rs, kk, kv, pk, pv, status],
             shape,
             history,
-            math,
+            (math, pos),
         )
     }
 
     /// [`Self::relative_prep`] over the caller's own weight rows and K/V conv histories:
     /// nothing is staged. The kernel shifts the two history ranges in place (`history` rows
-    /// of `kv * 128` words each, newest first).
+    /// of `kv * 128` words each, newest first). With a [`PrepMath::log`] scale, `pos` is the
+    /// row's position word, and nothing else.
     pub(crate) fn relative_prep_direct(
         &self,
         stream: &DeviceStream,
         ranges: [DeviceRange<'_>; 15],
         shape: PrepShape,
         history: usize,
-        math: PrepMath,
+        (math, pos): (PrepMath, Option<DeviceRange<'_>>),
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
+        let pos = match (math.log, pos) {
+            (None, None) => None,
+            (Some(_), Some(pos)) => {
+                require_fit("relative prep position", &pos, WORD, WORD)?;
+                Some(self.raw_range(&pos)?)
+            }
+            _ => {
+                return Err(EngError::BadRequest(
+                    "a relative prep reads the row's position exactly when it scales by it".into(),
+                ));
+            }
+        };
         let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o] =
             ranges.each_ref().map(|range| self.raw_range(range));
         let ranges = [a?, b?, c?, d?, e?, f?, g?, h?, i?, j?, k?, l?, m?, n?, o?];
         self.launch_on(stream, |raw| {
-            resident::relative_prep::launch(raw, ranges, shape, history, math)
+            resident::relative_prep::launch(raw, ranges, shape, history, (math, pos))
         })
     }
 }

@@ -73,6 +73,7 @@ pub(super) struct TextMath {
     pub(super) qk_l2_clip_threshold: f32,
     pub(super) rel_l2_clip_threshold: f32,
     log_scaling_n_floor: usize,
+    log_scaling_alpha: f32,
     final_logit_softcapping: f32,
     mlp_gate_softcap: f32,
     mlp_up_softcap: f32,
@@ -87,6 +88,33 @@ pub(super) struct TextMath {
 impl TextMath {
     fn expert_activation(&self, gate: f32, up: f32) -> f32 {
         softcap(gate, self.mlp_gate_softcap) * sigmoid(gate) * softcap(up, self.mlp_up_softcap)
+    }
+
+    /// The factor of the clipped query and relative coefficients of a visit at `position`:
+    /// `1 + alpha * ln((position + 1) / floor)` on a global visit past the floor, and exactly 1
+    /// on a local visit and through the floor.
+    pub(super) fn query_scale(&self, attention: Attention, position: usize) -> f32 {
+        let rows = position + 1;
+        if attention == Attention::Local || rows <= self.log_scaling_n_floor {
+            return 1.0;
+        }
+        // The log runs in double and is rounded once, as on the device.
+        let ratio = rows as f32 / self.log_scaling_n_floor as f32;
+        1.0 + self.log_scaling_alpha * f64::from(ratio).ln() as f32
+    }
+
+    /// [`Self::query_scale`] as the device applies it, for a visit of `attention`.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn log_scale(
+        &self,
+        attention: Attention,
+    ) -> Option<crate::kernels::cuda::resident::relative_attention::LogScale> {
+        (attention == Attention::Global).then_some(
+            crate::kernels::cuda::resident::relative_attention::LogScale {
+                floor: self.log_scaling_n_floor as u32,
+                alpha: self.log_scaling_alpha,
+            },
+        )
     }
 }
 
@@ -1132,6 +1160,7 @@ impl CpuConfig {
             qk_l2_clip_threshold: float("attention.qk_clip")?,
             rel_l2_clip_threshold: float("attention.relative_clip")?,
             log_scaling_n_floor: int("attention.log_scale_floor")?,
+            log_scaling_alpha: float("attention.log_scale_alpha")?,
             final_logit_softcapping: float("final_logit_softcapping")?,
             mlp_gate_softcap: float("activation.situ_beta")?,
             mlp_up_softcap: float("activation.situ_linear_beta")?,
@@ -1159,11 +1188,18 @@ impl CpuConfig {
 
 impl TextMath {
     fn validate(&self, context: usize, spec: &TextSpec) -> Result<(), EngError> {
-        let max = self.log_scaling_n_floor.min(spec.model_max_length as usize);
+        let max = spec.model_max_length as usize;
         if !(1..=max).contains(&context) {
-            return Err(bad(format!(
-                "Inkling text context must be in 1..={max} with the current attention implementation"
-            )));
+            return Err(bad(format!("Inkling text context must be in 1..={max}")));
+        }
+        if self.log_scaling_n_floor == 0
+            || u32::try_from(self.log_scaling_n_floor).is_err()
+            || !self.log_scaling_alpha.is_finite()
+            || self.log_scaling_alpha < 0.0
+        {
+            return Err(bad(
+                "Inkling log query scale needs a positive floor and a finite, non-negative alpha",
+            ));
         }
         // The CPU pilot accepts the released Mini attention and convolution sizes.
         let attention_dims = [
@@ -1352,4 +1388,52 @@ fn logits_probe(prepare: impl FnOnce(&mut CpuForward)) {
         }
     }
     output.flush().unwrap();
+}
+
+#[cfg(test)]
+mod query_scale_tests {
+    use super::{Attention, TextMath};
+
+    fn math() -> TextMath {
+        serde_json::from_value(serde_json::json!({
+            "d_rel": 16, "rel_extent": 1024, "sconv_kernel_size": 4, "rms_norm_eps": 1e-6,
+            "qk_l2_clip_threshold": 1.0, "rel_l2_clip_threshold": 1.0,
+            "log_scaling_n_floor": 8192, "log_scaling_alpha": 0.1,
+            "final_logit_softcapping": 30.0, "mlp_gate_softcap": 1.0, "mlp_up_softcap": 1.0,
+            "route_scale": 1.0, "q_bias": false, "o_bias": false,
+            "attn_res_normalize_values": true, "use_value_norm_no_gamma": true,
+            "use_gate_bias": true
+        }))
+        .unwrap()
+    }
+
+    /// Exactly 1 on a local visit and through the floor, so a context of at most the floor
+    /// keeps its bits; past it, `1 + alpha * ln((position + 1) / floor)`.
+    #[test]
+    fn the_query_scale_is_one_through_the_floor_and_logarithmic_past_it() {
+        let math = math();
+        for position in [0, 1023, 8191] {
+            assert_eq!(
+                math.query_scale(Attention::Global, position).to_bits(),
+                1f32.to_bits()
+            );
+        }
+        for position in [8191, 100_000, 1 << 20] {
+            assert_eq!(
+                math.query_scale(Attention::Local, position).to_bits(),
+                1f32.to_bits()
+            );
+        }
+        for (position, want) in [
+            (8192, 1.0 + 0.1 * (8193f64 / 8192.0).ln()),
+            (16_383, 1.0 + 0.1 * 2f64.ln()),
+            (262_143, 1.0 + 0.1 * 32f64.ln()),
+        ] {
+            let got = f64::from(math.query_scale(Attention::Global, position));
+            assert!(
+                (got - want).abs() <= 1e-6,
+                "position {position}: {got} against {want}"
+            );
+        }
+    }
 }

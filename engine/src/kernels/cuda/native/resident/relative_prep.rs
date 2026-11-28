@@ -46,6 +46,9 @@ unsafe extern "C" {
         qk_limit: f32,
         rel_limit: f32,
         eps: f32,
+        pos: *const c_int,
+        log_floor: c_int,
+        log_alpha: f32,
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
@@ -176,8 +179,17 @@ pub(in crate::kernels::cuda) fn launch(
     ranges: [RawRange<'_>; 15],
     shape: PrepShape,
     history: usize,
-    math: PrepMath,
+    (math, pos): (PrepMath, Option<RawRange<'_>>),
 ) -> Result<(), DeviceFailure> {
+    if math.log.is_some_and(|log| !log.valid()) || math.log.is_some() != pos.is_some() {
+        return Err(invalid_argument());
+    }
+    let (floor, alpha) = math
+        .log
+        .map_or((0, 0.0), |log| (log.floor as c_int, log.alpha));
+    let pos = pos.map_or(std::ptr::null(), |pos| {
+        pos.address().cast_const().cast::<c_int>()
+    });
     if !(1..=128).contains(&shape.queries)
         || !(1..=128).contains(&shape.kv)
         || !(1..=PrepShape::WIDTH).contains(&shape.dims)
@@ -203,6 +215,9 @@ pub(in crate::kernels::cuda) fn launch(
             math.qk_limit,
             math.rel_limit,
             math.eps,
+            pos,
+            floor,
+            alpha,
             stream.0.as_ptr(),
             &mut stage,
         )

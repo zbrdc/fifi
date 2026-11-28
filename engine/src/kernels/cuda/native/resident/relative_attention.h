@@ -45,10 +45,13 @@ int inference_cuda_relative_attention_tile_launch(
     int input_stride, int query_stride, int side_stride, void *stream, int *out_stage);
 
 /* Each side row packs raw Q, relative coefficients, sinks, then gates. Scale
- * and clip the first two planes in place; OR errors into the per-row status. */
+ * and clip the first two planes in place; OR errors into the per-row status.
+ * With a positive log_floor, row r sits at position first + r and its clipped
+ * planes take log_query_scale (resident/log_query_scale.cuh). */
 int inference_cuda_relative_attention_clip_queries(
     float *side, const float *scales, uint32_t *status, int rows, int heads,
-    int dims, int gap, float q_limit, float rel_limit, void *stream, int *out_stage);
+    int dims, int gap, float q_limit, float rel_limit, int first, int log_floor,
+    float log_alpha, void *stream, int *out_stage);
 
 #ifdef __cplusplus
 }

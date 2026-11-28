@@ -288,6 +288,7 @@ impl Harness {
             qk_limit: 0.5,
             rel_limit: 1.0,
             eps: 1e-5,
+            log: None,
         };
         Self {
             stream,

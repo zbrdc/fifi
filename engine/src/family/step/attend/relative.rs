@@ -43,8 +43,8 @@ pub(crate) struct PrepWeights<'a> {
 
 /// One row's prep: the shape, the limits, the rows (the prep rewrites `q` and `relative` in
 /// place and writes `k` and `v` from the raw projections), the `TAPS - 1` newest raw keys and
-/// values of the visit (shifted in place), and the prep status words (one shared word, then
-/// one per head).
+/// values of the visit (shifted in place), the prep status words (one shared word, then one
+/// per head), and the row's position word, which only a [`PrepMath::log`] scale reads.
 pub(crate) struct PrepRow<'a> {
     pub(crate) shape: PrepShape,
     pub(crate) math: PrepMath,
@@ -55,6 +55,7 @@ pub(crate) struct PrepRow<'a> {
     pub(crate) key_history: DeviceRange<'a>,
     pub(crate) value_history: DeviceRange<'a>,
     pub(crate) status: DeviceRange<'a>,
+    pub(crate) pos: DeviceRange<'a>,
 }
 
 /// Makes one row's projections final for [`attend_row`]. A sink or gate that is not finite,
@@ -95,7 +96,7 @@ pub(crate) fn prep_row(
         ],
         row.shape,
         PrepShape::TAPS - 1,
-        row.math,
+        (row.math, row.math.log.map(|_| row.pos)),
     )
 }
 
@@ -188,3 +189,6 @@ pub(crate) fn attend_row(
         },
     )
 }
+
+#[cfg(test)]
+mod tests;
