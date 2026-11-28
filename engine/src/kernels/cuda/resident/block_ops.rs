@@ -126,6 +126,12 @@ impl<'b> BlockOp<'b> {
         src: DeviceRange<'b>,
         dst: DeviceRange<'b>,
     ) -> Result<Self, EngError> {
+        if !(1..=65_536).contains(&n) || !(1..=16).contains(&streams) || !(1..=16_384).contains(&h)
+        {
+            return Err(EngError::BadRequest(format!(
+                "hc_broadcast: invalid shape n={n}, streams={streams}, h={h}"
+            )));
+        }
         Ok(Self::new(17, &[n, streams, h], &[])?
             .read(0, src, bytes(&[n, h, 4])?)
             .write(1, dst, bytes(&[n, streams, h, 4])?))
@@ -195,6 +201,79 @@ impl<'b> BlockOp<'b> {
             .read(0, kv, bytes(&[n, rank + rope, 4])?)
             .read(1, norm_w, bytes(&[rank, 4])?)
             .write(2, cache, bytes(&[cells, rank + rope, 2])?))
+    }
+
+    /// Normalizes the latent of one row and appends latent plus rope part to the f16 cache at the
+    /// position stored in the device `pos` word (for graph-captured decode steps).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mla_kv_prep_step(
+        rank: usize,
+        rope: usize,
+        cells: usize,
+        eps: f32,
+        kv: DeviceRange<'b>,
+        norm_w: DeviceRange<'b>,
+        cache: DeviceRange<'b>,
+        pos: DeviceRange<'b>,
+    ) -> Result<Self, EngError> {
+        if cells == 0 {
+            return Err(EngError::BadRequest(
+                "mla_kv_prep_step: cells must be positive".into(),
+            ));
+        }
+        Ok(Self::new(19, &[rank, rope, cells], &[eps])?
+            .read(0, kv, bytes(&[rank + rope, 4])?)
+            .read(1, norm_w, bytes(&[rank, 4])?)
+            .write(2, cache, bytes(&[cells, rank + rope, 2])?)
+            .read(3, pos, 4))
+    }
+
+    /// Single-row shared-KV partial softmax attention across all heads in one pass per key split.
+    /// Reads the current position from `pos_word` when given (for graph-captured decode steps),
+    /// else from `pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mla_attn_decode(
+        shape: MlaShape,
+        splits: usize,
+        pos: usize,
+        cells: usize,
+        scale: f32,
+        qeff: DeviceRange<'b>,
+        cache: DeviceRange<'b>,
+        part: DeviceRange<'b>,
+        pos_word: Option<DeviceRange<'b>>,
+    ) -> Result<Self, EngError> {
+        let MlaShape {
+            heads, rank, rope, ..
+        } = shape;
+        if !(MLA_GROUP..=64).contains(&heads)
+            || !heads.is_multiple_of(MLA_GROUP)
+            || !(1..=64).contains(&splits)
+            || cells == 0
+            || (pos_word.is_none() && pos >= cells)
+        {
+            return Err(EngError::BadRequest(format!(
+                "mla_attn_decode: invalid shape heads={heads}, splits={splits}, pos={pos}, cells={cells}"
+            )));
+        }
+        if !qeff.offset().is_multiple_of(8)
+            || !cache.offset().is_multiple_of(16)
+            || !part.offset().is_multiple_of(8)
+        {
+            return Err(EngError::BadRequest(
+                "mla_attn_decode: qeff/part require 8-byte alignment and cache requires 16-byte"
+                    .into(),
+            ));
+        }
+        let part_bytes = bytes(&[heads / MLA_GROUP, splits, MLA_GROUP, rank + 4, 4])?;
+        let mut op = Self::new(18, &[heads, rank, rope, splits, pos, cells], &[scale])?
+            .read(0, qeff, bytes(&[heads, rank + rope, 4])?)
+            .read(1, cache, bytes(&[cells, rank + rope, 2])?)
+            .write(2, part, part_bytes);
+        if let Some(pos_word) = pos_word {
+            op = op.read(3, pos_word, 4);
+        }
+        Ok(op)
     }
 
     /// Partial softmax attention of `n` query rows over the cache, one partial per

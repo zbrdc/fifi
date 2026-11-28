@@ -65,6 +65,15 @@ extern "C" {
  *             16-byte. A device or an image without the kernel runs MLA_ATTN.
  * 17 HC_BROADCAST copies each row into every residual stream, bit for bit. p0 src f32
  *             [n][h]; p1 dst f32 [n][streams][h] (W). i0 n; i1 streams; i2 h.
+ * 18 MLA_ATTN_DECODE single-row shared-KV partial softmax attention across all heads in one
+ *             pass per key split. p0 qeff f32 [heads][576] (8B aligned); p1 cache f16
+ *             [cells][576] (16B aligned); p2 part f32 [heads/8][splits][8][516] (W, 8B aligned);
+ *             p3 optional pos_ptr i32 [1] (when non-null, reads pos from device memory).
+ *             i0 heads (8..=64, multiple of 8); i1 rank (512); i2 rope (64); i3 splits (1..=64);
+ *             i4 pos (used when p3 is null); i5 cells; f0 scale.
+ * 19 MLA_KV_PREP_STEP single-row MLA_KV_PREP reading pos from device i32 word p3 (for graph
+ *             capture). p0 kv f32 [576]; p1 w f32 [512]; p2 cache f16 [cells][576] (W);
+ *             p3 pos_ptr i32 [1]. i0 rank (512); i1 rope (64); i2 cells; f0 eps.
  */
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,
@@ -79,7 +88,9 @@ enum {
     INFERENCE_CUDA_BLOCK_OP_GATED_QUANT = 13,
     INFERENCE_CUDA_BLOCK_OP_FILL = 15,
     INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_CHUNK = 16,
-    INFERENCE_CUDA_BLOCK_OP_HC_BROADCAST = 17
+    INFERENCE_CUDA_BLOCK_OP_HC_BROADCAST = 17,
+    INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_DECODE = 18,
+    INFERENCE_CUDA_BLOCK_OP_MLA_KV_PREP_STEP = 19
 };
 
 typedef struct inference_cuda_block_ops_args {

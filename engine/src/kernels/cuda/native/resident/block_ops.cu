@@ -83,6 +83,48 @@ __device__ void zero_q8_tail(unsigned char *row, long long k) {
 
 /* ---- mixed residual ---------------------------------------------------------------- */
 
+__device__ void hc_read_solve(const float *tot, const float *base, const float *scale, int width,
+                              float eps, float magnitude, float *s_pre, float *post_row,
+                              float *comb_row) {
+    const float rms = sqrtf(tot[kHcMixes] / (float)width + eps);
+    float mixes[kHcMixes];
+    for (int m = 0; m < kHcMixes; ++m) mixes[m] = tot[m] / rms;
+    for (int s = 0; s < kHcStreams; ++s) {
+        s_pre[s] = sigmoid_f(mixes[s] * scale[0] + base[s]);
+        post_row[s] = magnitude * sigmoid_f(mixes[kHcStreams + s] * scale[1] + base[kHcStreams + s]);
+    }
+    /* z[j][q] of the 3x3 block, then e = H^T z H with the Helmert basis rows. */
+    float z[3][3];
+    for (int j = 0; j < 3; ++j)
+        for (int q = 0; q < 3; ++q)
+            z[j][q] = mixes[2 * kHcStreams + j * 3 + q] * scale[2] + base[2 * kHcStreams + j * 3 + q];
+    float helmert[kHcStreams][3];
+    for (int i = 0; i < kHcStreams; ++i)
+        for (int j = 0; j < 3; ++j) {
+            const float v = i <= j ? 1.0f : (i == j + 1 ? -(float)(j + 1) : 0.0f);
+            helmert[i][j] = v / sqrtf((float)((j + 1) * (j + 2)));
+        }
+    float e[kHcStreams][kHcStreams];
+    float rho = 0.0f;
+    for (int i = 0; i < kHcStreams; ++i)
+        for (int x = 0; x < kHcStreams; ++x) {
+            float acc = 0.0f;
+            for (int j = 0; j < 3; ++j)
+                for (int q = 0; q < 3; ++q) acc += helmert[x][q] * z[j][q] * helmert[i][j];
+            e[i][x] = acc;
+            const float chart = 0.5f * (i == x ? 1.0f : 0.0f) + 0.5f / (float)kHcStreams;
+            rho = fmaxf(rho, -acc / chart);
+        }
+    rho = 1.0f + fmaxf(rho, 0.0f);
+    const float gamma = sigmoid_f(scale[3]);
+    for (int i = 0; i < kHcStreams; ++i)
+        for (int x = 0; x < kHcStreams; ++x) {
+            const float ident = i == x ? 1.0f : 0.0f;
+            const float phi = e[i][x] / rho + 0.5f * ident + 0.5f / (float)kHcStreams;
+            comb_row[i + x * kHcStreams] = ident + gamma * (phi - ident);
+        }
+}
+
 __global__ void __launch_bounds__(256) hc_read_kernel(
     const float *resid, const __half *fn, const float *base, const float *scale, float *branch,
     float *post_out, float *comb_out, int h, float eps, float magnitude) {
@@ -122,45 +164,69 @@ __global__ void __launch_bounds__(256) hc_read_kernel(
             for (int w = 0; w < 8; ++w) s += red[m][w];
             tot[m] = s;
         }
-        const float rms = sqrtf(tot[kHcMixes] / (float)width + eps);
-        float mixes[kHcMixes];
-        for (int m = 0; m < kHcMixes; ++m) mixes[m] = tot[m] / rms;
-        float post[kHcStreams];
-        for (int s = 0; s < kHcStreams; ++s) {
-            s_pre[s] = sigmoid_f(mixes[s] * scale[0] + base[s]);
-            post[s] = magnitude * sigmoid_f(mixes[kHcStreams + s] * scale[1] + base[kHcStreams + s]);
-            post_out[(size_t)t * kHcStreams + s] = post[s];
+        hc_read_solve(tot, base, scale, width, eps, magnitude, s_pre,
+                      post_out + (size_t)t * kHcStreams, comb_out + (size_t)t * 16);
+    }
+    __syncthreads();
+    for (int k = threadIdx.x; k < h; k += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < kHcStreams; ++s) acc += inp[s * h + k] * s_pre[s];
+        branch[(size_t)t * h + k] = acc;
+    }
+}
+
+/* Split pass 1 for small n (1..4): one block per (mix row or norm, token), exact same
+ * reduction order as hc_read_kernel. Stages the 18 totals into comb_out[0..16] and
+ * post_out[0..2] before hc_read_finish_kernel overwrites them. */
+__global__ void __launch_bounds__(256) hc_read_dots_kernel(
+    const float *resid, const __half *fn, float *post_out, float *comb_out, int h) {
+    __shared__ float red[8];
+    const int m = blockIdx.x, t = blockIdx.y;
+    const int width = kHcStreams * h;
+    const float *inp = resid + (size_t)t * width;
+    float acc = 0.0f;
+    if (m < kHcMixes) {
+        const __half *row = fn + (size_t)m * width;
+        for (int r = threadIdx.x * 2; r < width; r += blockDim.x * 2) {
+            const float2 v = *reinterpret_cast<const float2 *>(inp + r);
+            const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(row + r));
+            acc += f.x * v.x + f.y * v.y;
         }
-        /* z[j][q] of the 3x3 block, then e = H^T z H with the Helmert basis rows. */
-        float z[3][3];
-        for (int j = 0; j < 3; ++j)
-            for (int q = 0; q < 3; ++q)
-                z[j][q] = mixes[2 * kHcStreams + j * 3 + q] * scale[2] + base[2 * kHcStreams + j * 3 + q];
-        float helmert[kHcStreams][3];
-        for (int i = 0; i < kHcStreams; ++i)
-            for (int j = 0; j < 3; ++j) {
-                const float v = i <= j ? 1.0f : (i == j + 1 ? -(float)(j + 1) : 0.0f);
-                helmert[i][j] = v / sqrtf((float)((j + 1) * (j + 2)));
-            }
-        float e[kHcStreams][kHcStreams];
-        float rho = 0.0f;
-        for (int i = 0; i < kHcStreams; ++i)
-            for (int x = 0; x < kHcStreams; ++x) {
-                float acc = 0.0f;
-                for (int j = 0; j < 3; ++j)
-                    for (int q = 0; q < 3; ++q) acc += helmert[x][q] * z[j][q] * helmert[i][j];
-                e[i][x] = acc;
-                const float chart = 0.5f * (i == x ? 1.0f : 0.0f) + 0.5f / (float)kHcStreams;
-                rho = fmaxf(rho, -acc / chart);
-            }
-        rho = 1.0f + fmaxf(rho, 0.0f);
-        const float gamma = sigmoid_f(scale[3]);
-        for (int i = 0; i < kHcStreams; ++i)
-            for (int x = 0; x < kHcStreams; ++x) {
-                const float ident = i == x ? 1.0f : 0.0f;
-                const float phi = e[i][x] / rho + 0.5f * ident + 0.5f / (float)kHcStreams;
-                comb_out[(size_t)t * 16 + i + x * kHcStreams] = ident + gamma * (phi - ident);
-            }
+    } else {
+        for (int r = threadIdx.x * 2; r < width; r += blockDim.x * 2) {
+            const float2 v = *reinterpret_cast<const float2 *>(inp + r);
+            acc += v.x * v.x + v.y * v.y;
+        }
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    acc = warp_sum(acc);
+    if (lane == 0) red[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < 8; ++w) s += red[w];
+        if (m < 16)
+            comb_out[(size_t)t * 16 + m] = s;
+        else
+            post_out[(size_t)t * kHcStreams + (m - 16)] = s;
+    }
+}
+
+__global__ void __launch_bounds__(256) hc_read_finish_kernel(
+    const float *resid, const float *base, const float *scale, float *branch, float *post_out,
+    float *comb_out, int h, float eps, float magnitude) {
+    __shared__ float s_pre[kHcStreams];
+    const int t = blockIdx.x;
+    const int width = kHcStreams * h;
+    const float *inp = resid + (size_t)t * width;
+    if (threadIdx.x == 0) {
+        float tot[kHcMixes + 1];
+        float *comb_row = comb_out + (size_t)t * 16;
+        float *post_row = post_out + (size_t)t * kHcStreams;
+        for (int m = 0; m < 16; ++m) tot[m] = comb_row[m];
+        tot[16] = post_row[0];
+        tot[17] = post_row[1];
+        hc_read_solve(tot, base, scale, width, eps, magnitude, s_pre, post_row, comb_row);
     }
     __syncthreads();
     for (int k = threadIdx.x; k < h; k += blockDim.x) {
@@ -299,6 +365,186 @@ __global__ void __launch_bounds__(256) mla_kv_prep_kernel(const float *kv, const
     __half *dst = cache + (size_t)(pos0 + t) * (rank + rope);
     for (int i = threadIdx.x; i < rank; i += blockDim.x) dst[i] = __float2half(row[i] * scale * w[i]);
     for (int i = threadIdx.x; i < rope; i += blockDim.x) dst[rank + i] = __float2half(row[rank + i]);
+}
+
+/* Single-row MLA KV prep reading pos from device memory for graph-captured decode steps. */
+__global__ void __launch_bounds__(256) mla_kv_prep_step_kernel(const float *kv, const float *w,
+                                                               __half *cache, const int *pos_ptr,
+                                                               int rank, int rope, int cells,
+                                                               float eps) {
+    __shared__ float scratch[32];
+    const int pos = *pos_ptr;
+    if (pos < 0 || pos >= cells) return;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) ss += kv[i] * kv[i];
+    ss = block_sum(ss, scratch);
+    const float scale = 1.0f / sqrtf(ss / (float)rank + eps);
+    __half *dst = cache + (size_t)pos * (rank + rope);
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) dst[i] = __float2half(kv[i] * scale * w[i]);
+    for (int i = threadIdx.x; i < rope; i += blockDim.x) dst[rank + i] = __float2half(kv[rank + i]);
+}
+
+/* Single-row shared-KV latent attention: one block per key split covers ALL heads together
+ * (two heads per warp, pure f32 queries and accumulators in registers, double-buffered 16-key
+ * KV tile in shared memory), so the KV cache is read once from DRAM across all heads. */
+constexpr int kMlaDecodeTile = 16;
+constexpr int kMlaDecodeStride = kMlaWidth + 8; /* 584 halfs = 1168 B (16B aligned, bank-free) */
+
+__device__ __forceinline__ void mla_decode_load_tile(__half *dst_stage, const __half *cache,
+                                                     int base, int cnt, int tid, int nthreads) {
+    constexpr int kVecsPerKey = kMlaWidth / 8; /* 576 / 8 = 72 uint4s (16 B each) */
+    const int total = cnt * kVecsPerKey;
+    for (int idx = tid; idx < total; idx += nthreads) {
+        const int p = idx / kVecsPerKey;
+        const int v = idx % kVecsPerKey;
+        const void *src = cache + (size_t)(base + p) * kMlaWidth + v * 8;
+        __half *dst = dst_stage + p * kMlaDecodeStride + v * 8;
+#if __CUDA_ARCH__ >= 800
+        inference::mma::cp_async16(inference::mma::smem_addr(dst), src, 16);
+#else
+        *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(src);
+#endif
+    }
+}
+
+__device__ __forceinline__ void mla_decode_cp_wait_one() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+#endif
+}
+
+__global__ void mla_attn_decode_kernel(const float *__restrict__ qeff,
+                                       const __half *__restrict__ cache, float *__restrict__ part,
+                                       const int *__restrict__ pos_ptr, int heads, int splits,
+                                       int pos_host, int cells, float scale) {
+    __shared__ __align__(16) __half kv_smem[2][kMlaDecodeTile * kMlaDecodeStride];
+    const int sp = blockIdx.x;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int nthreads = blockDim.x;
+    const int h0 = warp * 2;
+    const int h1 = h0 + 1;
+    const int pos = pos_ptr != NULL ? *pos_ptr : pos_host;
+    const int visible = (pos >= 0 && pos < cells) ? (pos + 1) : 0;
+    const int per_split =
+        visible > 0 ? (((visible + splits - 1) / splits + kMlaDecodeTile - 1) / kMlaDecodeTile *
+                       kMlaDecodeTile)
+                    : 0;
+    const int lo = sp * per_split;
+    const int hi = min(lo + per_split, visible);
+
+    float2 acc0[8], acc1[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        acc0[i] = make_float2(0.0f, 0.0f);
+        acc1[i] = make_float2(0.0f, 0.0f);
+    }
+    float m0 = -INFINITY, l0 = 0.0f;
+    float m1 = -INFINITY, l1 = 0.0f;
+
+    if (lo < hi) {
+        float2 q0[9], q1[9];
+        const float2 *q0p = reinterpret_cast<const float2 *>(qeff + (size_t)h0 * kMlaWidth);
+        const float2 *q1p = reinterpret_cast<const float2 *>(qeff + (size_t)h1 * kMlaWidth);
+#pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            q0[i] = q0p[lane + 32 * i];
+            q1[i] = q1p[lane + 32 * i];
+        }
+
+        mla_decode_load_tile(kv_smem[0], cache, lo, min(kMlaDecodeTile, hi - lo), tid, nthreads);
+#if __CUDA_ARCH__ >= 800
+        inference::mma::cp_async_commit();
+#endif
+        int step = 0;
+        for (int base = lo; base < hi; base += kMlaDecodeTile, ++step) {
+            const int cur = step & 1;
+            const int cnt = min(kMlaDecodeTile, hi - base);
+            const int next_base = base + kMlaDecodeTile;
+            if (next_base < hi) {
+                mla_decode_load_tile(kv_smem[cur ^ 1], cache, next_base,
+                                     min(kMlaDecodeTile, hi - next_base), tid, nthreads);
+#if __CUDA_ARCH__ >= 800
+                inference::mma::cp_async_commit();
+#endif
+                mla_decode_cp_wait_one();
+            } else {
+#if __CUDA_ARCH__ >= 800
+                inference::mma::cp_async_wait_all();
+#endif
+            }
+            __syncthreads();
+
+            for (int p = 0; p < cnt; ++p) {
+                const __half2 *kr =
+                    reinterpret_cast<const __half2 *>(kv_smem[cur] + p * kMlaDecodeStride);
+                float2 kv[9];
+#pragma unroll
+                for (int i = 0; i < 9; ++i) kv[i] = __half22float2(kr[lane + 32 * i]);
+                float d0 = 0.0f, d1 = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 9; ++i) {
+                    d0 = fmaf(q0[i].x, kv[i].x, fmaf(q0[i].y, kv[i].y, d0));
+                    d1 = fmaf(q1[i].x, kv[i].x, fmaf(q1[i].y, kv[i].y, d1));
+                }
+                const float s0 = warp_sum(d0) * scale;
+                const float s1 = warp_sum(d1) * scale;
+                if (s0 > m0) {
+                    const float corr = m0 == -INFINITY ? 0.0f : expf(m0 - s0);
+                    l0 = l0 * corr + 1.0f;
+                    m0 = s0;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        acc0[i].x = fmaf(acc0[i].x, corr, kv[i].x);
+                        acc0[i].y = fmaf(acc0[i].y, corr, kv[i].y);
+                    }
+                } else if (m0 != -INFINITY) {
+                    const float p0 = expf(s0 - m0);
+                    l0 += p0;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        acc0[i].x = fmaf(p0, kv[i].x, acc0[i].x);
+                        acc0[i].y = fmaf(p0, kv[i].y, acc0[i].y);
+                    }
+                }
+                if (s1 > m1) {
+                    const float corr = m1 == -INFINITY ? 0.0f : expf(m1 - s1);
+                    l1 = l1 * corr + 1.0f;
+                    m1 = s1;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        acc1[i].x = fmaf(acc1[i].x, corr, kv[i].x);
+                        acc1[i].y = fmaf(acc1[i].y, corr, kv[i].y);
+                    }
+                } else if (m1 != -INFINITY) {
+                    const float p1 = expf(s1 - m1);
+                    l1 += p1;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        acc1[i].x = fmaf(p1, kv[i].x, acc1[i].x);
+                        acc1[i].y = fmaf(p1, kv[i].y, acc1[i].y);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const int g = h0 / kMlaGroup, hh0 = h0 % kMlaGroup, hh1 = h1 % kMlaGroup;
+    float *dst0 = part + (((size_t)g * splits + sp) * kMlaGroup + hh0) * kMlaPartStride;
+    float *dst1 = part + (((size_t)g * splits + sp) * kMlaGroup + hh1) * kMlaPartStride;
+    float2 *dst0_2 = reinterpret_cast<float2 *>(dst0);
+    float2 *dst1_2 = reinterpret_cast<float2 *>(dst1);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        dst0_2[lane + 32 * i] = acc0[i];
+        dst1_2[lane + 32 * i] = acc1[i];
+    }
+    if (lane == 0) {
+        dst0[kMlaRank] = m0;
+        dst0[kMlaRank + 1] = l0;
+        dst1[kMlaRank] = m1;
+        dst1[kMlaRank + 1] = l1;
+    }
 }
 
 /* Partial softmax attention of one (token, head group, key split). Writes the unnormalized
@@ -503,10 +749,19 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(6, n * 16 * 4, true);
             if (!slots.valid() || !aligned(p[0], 8) || !aligned(p[1], 4))
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
-            hc_read_kernel<<<(unsigned)n, 256, 0, s>>>((const float *)p[0], (const __half *)p[1],
-                                                       (const float *)p[2], (const float *)p[3],
-                                                       (float *)p[4], (float *)p[5], (float *)p[6],
-                                                       (int)h, f[0], f[1]);
+            if (n <= 4) {
+                hc_read_dots_kernel<<<dim3(kHcMixes + 1, (unsigned)n), 256, 0, s>>>(
+                    (const float *)p[0], (const __half *)p[1], (float *)p[5], (float *)p[6],
+                    (int)h);
+                hc_read_finish_kernel<<<(unsigned)n, 256, 0, s>>>(
+                    (const float *)p[0], (const float *)p[2], (const float *)p[3], (float *)p[4],
+                    (float *)p[5], (float *)p[6], (int)h, f[0], f[1]);
+            } else {
+                hc_read_kernel<<<(unsigned)n, 256, 0, s>>>(
+                    (const float *)p[0], (const __half *)p[1], (const float *)p[2],
+                    (const float *)p[3], (float *)p[4], (float *)p[5], (float *)p[6], (int)h, f[0],
+                    f[1]);
+            }
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_HC_MEAN: {
@@ -577,6 +832,39 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             mla_kv_prep_kernel<<<(unsigned)n, 256, 0, s>>>((const float *)p[0], (const float *)p[1],
                                                            (__half *)p[2], (int)rank, (int)rope,
                                                            (int)pos0, f[0]);
+            return launch_status(out_stage);
+        }
+        case INFERENCE_CUDA_BLOCK_OP_MLA_KV_PREP_STEP: {
+            const long long rank = i[0], rope = i[1], cells = i[2];
+            if (rank != kMlaRank || rope != kMlaRope || cells < 1)
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.use(0, (rank + rope) * 4, false);
+            slots.use(1, rank * 4, false);
+            slots.use(2, cells * (rank + rope) * 2, true);
+            slots.use(3, 4, false);
+            if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            mla_kv_prep_step_kernel<<<1, 256, 0, s>>>((const float *)p[0], (const float *)p[1],
+                                                      (__half *)p[2], (const int *)p[3], (int)rank,
+                                                      (int)rope, (int)cells, f[0]);
+            return launch_status(out_stage);
+        }
+        case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN_DECODE: {
+            const long long heads = i[0], rank = i[1], rope = i[2], splits = i[3];
+            const long long pos = i[4], cells = i[5];
+            if (heads < kMlaGroup || heads > 64 || heads % kMlaGroup != 0 || rank != kMlaRank ||
+                rope != kMlaRope || splits < 1 || splits > 64 || cells < 1 ||
+                (p[3] == NULL && (pos < 0 || pos >= cells)))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.use(0, heads * (rank + rope) * 4, false);
+            slots.use(1, cells * (rank + rope) * 2, false);
+            slots.use(2, (heads / kMlaGroup) * splits * kMlaGroup * kMlaPartStride * 4, true);
+            slots.maybe(3, 4, false);
+            if (!slots.valid() || !aligned(p[0], 8) || !aligned(p[1], 16) || !aligned(p[2], 8))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            const unsigned threads = (unsigned)((heads / 2) * 32);
+            mla_attn_decode_kernel<<<(unsigned)splits, threads, 0, s>>>(
+                (const float *)p[0], (const __half *)p[1], (float *)p[2], (const int *)p[3],
+                (int)heads, (int)splits, (int)pos, (int)cells, f[0]);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_MLA_ATTN:

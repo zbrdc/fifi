@@ -934,3 +934,128 @@ fn the_stream_broadcast_copies_each_row_into_every_stream_bit_for_bit() {
         }
     }
 }
+
+/// The single-row shared-KV decode score (with both host and device positions, including empty
+/// splits at small depth and multi-tile splits at depth) against the row score, plus device-pos
+/// KV prep against host-pos KV prep.
+#[test]
+fn the_decode_latent_score_and_step_kv_prep_match_the_row_path() {
+    let Some(r) = rig("block_ops mla decode score") else {
+        return;
+    };
+    let (rope, rank) = (64usize, 512usize);
+    let scale = 1.0 / 192f32.sqrt();
+    // Device-pos KV prep equals host-pos KV prep bit for bit.
+    let kv = r.up(&data(90, rank + rope, 1.0));
+    let nw = r.up(&data(91, rank, 1.0));
+    let cells = 64usize;
+    let cache_host = r.zero_bytes(cells * (rank + rope) * 2);
+    let cache_step = r.zero_bytes(cells * (rank + rope) * 2);
+    let pos_val = 19i32;
+    let pos_buf = r.up_bytes(&pos_val.to_le_bytes());
+    r.run(
+        BlockOp::mla_kv_prep(
+            1,
+            rank,
+            rope,
+            pos_val as usize,
+            cells,
+            1e-6,
+            whole(&kv),
+            whole(&nw),
+            whole(&cache_host),
+        )
+        .expect("prep host"),
+    );
+    r.run(
+        BlockOp::mla_kv_prep_step(
+            rank,
+            rope,
+            cells,
+            1e-6,
+            whole(&kv),
+            whole(&nw),
+            whole(&cache_step),
+            whole(&pos_buf),
+        )
+        .expect("prep step"),
+    );
+    assert_eq!(
+        testkit::read_bytes(&r.ctx, &cache_host, cache_host.bytes()),
+        testkit::read_bytes(&r.ctx, &cache_step, cache_step.bytes()),
+        "step kv prep differs from host kv prep"
+    );
+    for (heads, pos, splits, use_dev_pos) in [
+        (8usize, 7usize, 16usize, true),
+        (16, 300, 32, false),
+        (40, 1500, 64, true),
+    ] {
+        let shape = MlaShape {
+            n: 1,
+            heads,
+            nope: 128,
+            rope,
+            rank,
+        };
+        let keys = pos + 1;
+        let qeff = r.up(&data(92 + heads as u64, heads * (rank + rope), 1.0));
+        let cache = r.up_bytes(&f16_bytes(&data(
+            93 + pos as u64,
+            (keys + 16) * (rank + rope),
+            1.0,
+        )));
+        let ref_splits = keys.div_ceil(128).clamp(1, 32);
+        let ref_kps = keys.div_ceil(ref_splits).div_ceil(32) * 32;
+        let part_ref = r.up(&vec![f32::NAN; (heads / 8) * ref_splits * 8 * (rank + 4)]);
+        r.run(
+            BlockOp::mla_attn(
+                shape,
+                pos,
+                ref_splits,
+                ref_kps,
+                scale,
+                whole(&qeff),
+                cache.range(0, keys * (rank + rope) * 2).expect("cache"),
+                whole(&part_ref),
+            )
+            .expect("ref"),
+        );
+        let mix_ref = r.zeros(heads * rank);
+        r.run(
+            BlockOp::mla_reduce(
+                1,
+                heads,
+                rank,
+                ref_splits,
+                whole(&part_ref),
+                whole(&mix_ref),
+            )
+            .expect("reduce ref"),
+        );
+        let part_dec = r.up(&vec![f32::NAN; (heads / 8) * splits * 8 * (rank + 4)]);
+        let dev_pos = r.up_bytes(&(pos as i32).to_le_bytes());
+        r.run(
+            BlockOp::mla_attn_decode(
+                shape,
+                splits,
+                pos,
+                keys + 16,
+                scale,
+                whole(&qeff),
+                whole(&cache),
+                whole(&part_dec),
+                use_dev_pos.then(|| whole(&dev_pos)),
+            )
+            .expect("decode"),
+        );
+        let mix_dec = r.zeros(heads * rank);
+        r.run(
+            BlockOp::mla_reduce(1, heads, rank, splits, whole(&part_dec), whole(&mix_dec))
+                .expect("reduce dec"),
+        );
+        let got = r.read(&mix_dec, heads * rank);
+        let want = r.read(&mix_ref, heads * rank);
+        assert!(got.iter().all(|v| v.is_finite()), "decode mix is finite");
+        assert_close("decode mix", &got, &want, 1e-4);
+    }
+}
