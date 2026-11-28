@@ -55,17 +55,14 @@ fn reference_block(values: &[f32]) -> (u16, u16, [i8; 32]) {
     let mut qs = [0i8; 32];
     if crate::kernels::cuda::native::resident::rounded_q8_1() {
         let d = testkit::f16_to_f32(d_bits);
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
         let mut qsum = 0i32;
         for (i, value) in values.iter().enumerate() {
-            qs[i] = if d == 0.0 {
+            let r = (value * id).round_ties_even();
+            qs[i] = if r.is_nan() {
                 0
             } else {
-                let r = (value / d).round_ties_even();
-                if r.is_nan() {
-                    0
-                } else {
-                    r.clamp(-127.0, 127.0) as i8
-                }
+                r.clamp(-127.0, 127.0) as i8
             };
             qsum += i32::from(qs[i]);
         }

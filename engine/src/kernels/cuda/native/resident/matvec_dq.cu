@@ -250,53 +250,101 @@ struct Q6kSide {
     __device__ __forceinline__ float result() const { return sum; }
 };
 
-/* Q8_0 decode dq matvec: one warp per weight row (8 warps / 256 threads per CTA, zero shared
- * memory, zero barriers). Lane l walks blocks b = l, l + 32, ... of 34-byte Q8_0 blocks (f16
- * scale d at +0, 32 signed int8 codes at +2..+34). Flipping the sign bit of each byte maps
- * [-128..127] to [0..255] so code_at + (-8388736.0f) converts on the FMA pipe; two
- * independent accumulators break the FMA latency chain within each block. */
+/* Q8_0 decode dq matvec: one warp serves two weight rows (8 warps / 256 threads per CTA -> 16
+ * rows per CTA, zero shared memory, zero barriers). Sharing each float4 activation load across
+ * two rows halves x traffic, and exploiting the loop-invariant parity of b = lane + 32*t lets
+ * every 34-byte Q8_0 block load in 8 aligned 32-bit loads + 1 16-bit load instead of 17
+ * 16-bit loads (w and every 272-byte 8-block row stride are 16-byte aligned). */
 const int kQ80Warps = 8;
 const int kQ80BlockBytes = 34;
+
+__device__ __forceinline__ void load_q80_block(const unsigned char *wb, bool odd, float *d_out,
+                                               unsigned (&v)[8]) {
+    if (odd) {
+        *d_out = __half2float(__ushort_as_half(load_half(wb)));
+        const unsigned *qp = reinterpret_cast<const unsigned *>(wb + 2);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[i] = qp[i] ^ 0x80808080u;
+        }
+    } else {
+        const unsigned *wp = reinterpret_cast<const unsigned *>(wb);
+        unsigned u[9];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            u[i] = wp[i];
+        }
+        u[8] = (unsigned)load_half(wb + 32);
+        *d_out = __half2float(__ushort_as_half((unsigned short)u[0]));
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[i] = __byte_perm(u[i], u[i + 1], 0x5432u) ^ 0x80808080u;
+        }
+    }
+}
 
 __global__ void __launch_bounds__(kQ80Warps * 32, 2) matvec_dq_q80_kernel(
     const unsigned char *w, const float *x, float *y, int rows, int w_blocks) {
     const int warp = (int)(threadIdx.x >> 5);
     const int lane = (int)(threadIdx.x & 31u);
-    const int row = (int)blockIdx.x * kQ80Warps + warp;
-    if (row >= rows) {
+    const int row0 = ((int)blockIdx.x * kQ80Warps + warp) * 2;
+    if (row0 >= rows) {
         return;
     }
-    const unsigned char *wrow = w + (size_t)row * (size_t)w_blocks * kQ80BlockBytes;
-    float sum = 0.0f;
+    const bool has1 = (row0 + 1) < rows;
+    const size_t row_bytes = (size_t)w_blocks * kQ80BlockBytes;
+    const unsigned char *wrow0 = w + (size_t)row0 * row_bytes;
+    const unsigned char *wrow1 = has1 ? wrow0 + row_bytes : wrow0;
+    const bool odd = (lane & 1) != 0;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
     for (int b = lane; b < w_blocks; b += 32) {
-        const unsigned char *wb = wrow + (size_t)b * kQ80BlockBytes;
-        unsigned v[8];
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const uint16_t *p = reinterpret_cast<const uint16_t *>(wb + 2 + i * 4);
-            v[i] = ((unsigned)p[0] | ((unsigned)p[1] << 16)) ^ 0x80808080u;
+        const size_t off = (size_t)b * kQ80BlockBytes;
+        float d0;
+        unsigned v0[8];
+        load_q80_block(wrow0 + off, odd, &d0, v0);
+        float d1 = 0.0f;
+        unsigned v1[8];
+        if (has1) {
+            load_q80_block(wrow1 + off, odd, &d1, v1);
         }
-        const float d = __half2float(__ushort_as_half(load_half(wb)));
         const float4 *xp = reinterpret_cast<const float4 *>(x + (size_t)b * 32);
-        float sd0 = 0.0f;
-        float sd1 = 0.0f;
+        float sd0_a = 0.0f;
+        float sd0_b = 0.0f;
+        float sd1_a = 0.0f;
+        float sd1_b = 0.0f;
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const float4 xv = xp[i];
-            const unsigned packed = v[i];
-            sd0 = fmaf(code_at(packed, 0) - 8388736.0f, xv.x, sd0);
-            sd1 = fmaf(code_at(packed, 1) - 8388736.0f, xv.y, sd1);
-            sd0 = fmaf(code_at(packed, 2) - 8388736.0f, xv.z, sd0);
-            sd1 = fmaf(code_at(packed, 3) - 8388736.0f, xv.w, sd1);
+            const unsigned p0 = v0[i];
+            sd0_a = fmaf(code_at(p0, 0) - 8388736.0f, xv.x, sd0_a);
+            sd0_b = fmaf(code_at(p0, 1) - 8388736.0f, xv.y, sd0_b);
+            sd0_a = fmaf(code_at(p0, 2) - 8388736.0f, xv.z, sd0_a);
+            sd0_b = fmaf(code_at(p0, 3) - 8388736.0f, xv.w, sd0_b);
+            if (has1) {
+                const unsigned p1 = v1[i];
+                sd1_a = fmaf(code_at(p1, 0) - 8388736.0f, xv.x, sd1_a);
+                sd1_b = fmaf(code_at(p1, 1) - 8388736.0f, xv.y, sd1_b);
+                sd1_a = fmaf(code_at(p1, 2) - 8388736.0f, xv.z, sd1_a);
+                sd1_b = fmaf(code_at(p1, 3) - 8388736.0f, xv.w, sd1_b);
+            }
         }
-        sum = fmaf(d, sd0 + sd1, sum);
+        sum0 = fmaf(d0, sd0_a + sd0_b, sum0);
+        if (has1) {
+            sum1 = fmaf(d1, sd1_a + sd1_b, sum1);
+        }
     }
     #pragma unroll
     for (int bit = 16; bit > 0; bit >>= 1) {
-        sum += __shfl_xor_sync(0xffffffffu, sum, bit);
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, bit);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, bit);
     }
     if (lane == 0) {
-        y[row] = sum;
+        y[row0] = sum0;
+        if (has1) {
+            y[row0 + 1] = sum1;
+        }
     }
 }
 
@@ -367,7 +415,8 @@ extern "C" int inference_cuda_matvec_dq_launch(const inference_cuda_matvec_dq_ar
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         if (q80) {
-            const unsigned int q80_grid = (unsigned int)(((size_t)rows + kQ80Warps - 1) / kQ80Warps);
+            const unsigned int q80_grid =
+                (unsigned int)(((size_t)rows + 2 * kQ80Warps - 1) / (2 * kQ80Warps));
             const int w_blocks = k / 32;
             matvec_dq_q80_kernel<<<q80_grid, kQ80Warps * 32, 0, (cudaStream_t)stream>>>(
                 (const unsigned char *)args->w, (const float *)args->x, args->y, rows, w_blocks);

@@ -48,17 +48,14 @@ pub(in crate::kernels::cuda) mod q8_ref {
         bytes[0..2].copy_from_slice(&d_bits.to_le_bytes());
         if crate::kernels::cuda::native::resident::rounded_q8_1() {
             let d = testkit::f16_to_f32(d_bits);
+            let id = if d == 0.0 { 0.0 } else { 1.0 / d };
             let mut qsum = 0i32;
             for (i, value) in values.iter().enumerate() {
-                let q = if d == 0.0 {
+                let r = (value * id).round_ties_even();
+                let q = if r.is_nan() {
                     0i8
                 } else {
-                    let r = (value / d).round_ties_even();
-                    if r.is_nan() {
-                        0i8
-                    } else {
-                        r.clamp(-127.0, 127.0) as i8
-                    }
+                    r.clamp(-127.0, 127.0) as i8
                 };
                 qsum += i32::from(q);
                 bytes[4 + i] = q as u8;

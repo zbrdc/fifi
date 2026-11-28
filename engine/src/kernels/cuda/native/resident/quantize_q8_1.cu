@@ -27,17 +27,19 @@ const int64_t kMatrixRowPadding = 512;
 const int kThreads = 256;
 
 __global__ void quantize_q8_1_rounded_k(const float *x, block_q8_1 *y, int k, int64_t blocks) {
-    const int64_t r = blockIdx.x;
+    const int64_t r = blockIdx.y;
+    const int nwarps = (int)blockDim.x / 32;
+    const int warp = (int)threadIdx.x / 32;
+    const int lane = (int)threadIdx.x % 32;
+    const int64_t b = (int64_t)blockIdx.x * nwarps + warp;
+    if (b >= blocks) {
+        return;
+    }
     const float *xrow = x + r * (int64_t)k;
     block_q8_1 *yrow = y + r * blocks;
-    const int nwarps = (int)blockDim.x / 32;
-    const int warp = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-    for (int64_t b = warp; b < blocks; b += nwarps) {
-        const int i = (int)(b * QK8_1) + lane;
-        const float xi = i < k ? xrow[i] : 0.0f;
-        store_q8_1_block_rounded(&yrow[b], xi);
-    }
+    const int i = (int)(b * QK8_1) + lane;
+    const float xi = i < k ? xrow[i] : 0.0f;
+    store_q8_1_block_rounded(&yrow[b], xi);
 }
 
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
@@ -74,7 +76,9 @@ int launch_quantize_q8_1(const inference_cuda_quantize_q8_1_args *args, void *st
         // One launch over the padded width; the kernel writes the zero tail itself.
         Failure failure;
         if constexpr (RoundedQ8) {
-            quantize_q8_1_rounded_k<<<(unsigned)ncols, kThreads, 0, (cudaStream_t)stream>>>(
+            const int nwarps = kThreads / 32;
+            const dim3 grid((unsigned)((blocks + nwarps - 1) / nwarps), (unsigned)ncols);
+            quantize_q8_1_rounded_k<<<grid, kThreads, 0, (cudaStream_t)stream>>>(
                 (const float *)args->x, (block_q8_1 *)args->y, k, blocks);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         } else {
