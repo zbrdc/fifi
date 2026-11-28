@@ -739,10 +739,94 @@ fn the_device_reports_prefill_and_decode_rates() {
                 .expect("decode");
         }
         let decode = start.elapsed().as_secs_f64();
+        let pick_rate = if device.takes_tokens() {
+            let vocab = device.vocab();
+            let start = std::time::Instant::now();
+            let mut tok = 1234u32;
+            for step in 0..steps {
+                tok = device
+                    .decode_token(tok, length + steps + step, vocab)
+                    .expect("decode_token");
+            }
+            Some(steps as f64 / start.elapsed().as_secs_f64())
+        } else {
+            None
+        };
         eprintln!(
-            "prompt {length}: prefill {:.1} tok/s ({prefill:.2} s) | decode {:.1} tok/s",
+            "prompt {length}: prefill {:.1} tok/s ({prefill:.2} s) | decode {:.1} tok/s (replay={}) | pick {:?} tok/s (replay={})",
             length as f64 / prefill,
-            steps as f64 / decode
+            steps as f64 / decode,
+            device.decode_replayed(),
+            pick_rate.map(|r| format!("{r:.1}")),
+            device.token_step_replayed()
+        );
+    }
+}
+
+/// Captured decode logits and device greedy picks match across repeated prompts and resets.
+#[test]
+#[ignore = "needs RAON_Q4_KM and a device; run with --ignored"]
+fn the_replayed_decode_and_token_pick_match_across_reset() {
+    let path = model_path();
+    require_device("the_replayed_decode_and_token_pick_match_across_reset");
+    let mut device = Raon1Device::load(&path, Some(4096), &mut |_| {}).expect("device load");
+    assert!(device.takes_tokens(), "expected device embedding table");
+    let vocab = device.vocab();
+    let argmax = |row: &[f32]| -> u32 {
+        row.iter()
+            .enumerate()
+            .max_by(|(ia, a), (ib, b)| a.total_cmp(b).then(ib.cmp(ia)))
+            .map(|(i, _)| i as u32)
+            .expect("non-empty logits")
+    };
+    let prompts: [&[u32]; 2] = [
+        &[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000],
+        &[9000, 8000, 7000, 6000, 5000, 4000, 3000, 2000, 1000, 1500],
+    ];
+    for (run, prompt) in prompts.iter().enumerate() {
+        device.reset().expect("reset logits");
+        let last = device
+            .feed(prompt, 0, HeadRows::Last)
+            .expect("prefill")
+            .pop()
+            .expect("row");
+        let mut tok = argmax(&last);
+        let mut want = Vec::new();
+        for step in 0..6 {
+            let row = device
+                .feed(&[tok], prompt.len() + step, HeadRows::Last)
+                .expect("decode")
+                .pop()
+                .expect("row");
+            tok = argmax(&row);
+            want.push(tok);
+        }
+        assert!(
+            device.decode_replayed(),
+            "run {run}: decode graph not replayed"
+        );
+
+        device.reset().expect("reset pick");
+        let last = device
+            .feed(prompt, 0, HeadRows::Last)
+            .expect("prefill 2")
+            .pop()
+            .expect("row");
+        let mut tok = argmax(&last);
+        let mut got = Vec::new();
+        for step in 0..6 {
+            tok = device
+                .decode_token(tok, prompt.len() + step, vocab)
+                .expect("decode_token");
+            got.push(tok);
+        }
+        assert!(
+            device.token_step_replayed(),
+            "run {run}: token graph not replayed"
+        );
+        assert_eq!(
+            got, want,
+            "run {run}: device greedy picks differ from logits argmax"
         );
     }
 }

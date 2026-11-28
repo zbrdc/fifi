@@ -42,11 +42,12 @@ pub(crate) fn device_table(
     EmbedTable::upload(ctx, name, (kind, rows, k), &bytes).map(Some)
 }
 
-/// The table and the scratch of the pick.
+/// The table and the scratch of the pick (and optional chunk-gather scratch).
 pub(crate) struct Tail {
     table: EmbedTable,
     part: DeviceBuffer,
     result: DeviceBuffer,
+    chunk: Option<(DeviceBuffer, DeviceBuffer, usize)>,
 }
 
 impl Tail {
@@ -55,7 +56,25 @@ impl Tail {
             table,
             part: ctx.allocate(ARGMAX_PART_BYTES)?,
             result: ctx.allocate(RESULT_PAIR_BYTES)?,
+            chunk: None,
         })
+    }
+
+    /// Opens the embedding table `name` of `file` on the device when free memory admits it, with
+    /// scratch for both single-token decode picks and prompt chunks up to `max_rows` tokens.
+    pub(crate) fn open_chunks(
+        ctx: &CudaContext,
+        file: &GgufWeights,
+        name: &str,
+        (rows, k): (usize, usize),
+        max_rows: usize,
+    ) -> Result<Option<Self>, EngError> {
+        let Some(table) = device_table(ctx, file, name, (rows, k))? else {
+            return Ok(None);
+        };
+        let mut tail = Self::new(ctx, table)?;
+        tail.chunk = Some((ctx.allocate(max_rows * 4)?, ctx.upload(&[0u8; 4])?, rows));
+        Ok(Some(tail))
     }
 
     /// Queues the gather of the row of the token id in `params` into `row`. The caller has
@@ -74,6 +93,96 @@ impl Tail {
             params.range(OFFSET_STATUS, 4)?,
         ];
         self.table.gather(ctx, stream, words, 1)
+    }
+
+    /// Queues a single-token gather from `params` and broadcasts it across `streams` residual
+    /// streams into `resid` (`[streams][hidden]`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gather_step_streams(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        params: &DeviceBuffer,
+        (streams, hidden): (usize, usize),
+        scratch_rows: &DeviceBuffer,
+        resid: &DeviceBuffer,
+    ) -> Result<(), EngError> {
+        if !(1..=16).contains(&streams) {
+            return Err(EngError::BadRequest(format!(
+                "tail gather_step_streams: invalid streams {streams}"
+            )));
+        }
+        let dst = if streams == 1 { resid } else { scratch_rows };
+        self.gather(ctx, stream, params, dst.range(0, hidden * 4)?)?;
+        if streams > 1 {
+            ctx.block_op(
+                stream,
+                BlockOp::hc_broadcast(
+                    1,
+                    streams,
+                    hidden,
+                    scratch_rows.range(0, hidden * 4)?,
+                    resid.range(0, streams * hidden * 4)?,
+                )?,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Gathers a chunk of `tokens` on the device and broadcasts each row bit-for-bit across
+    /// `streams` residual streams into `resid` (`[n][streams][hidden]`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gather_chunk(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        tokens: &[u32],
+        (streams, hidden): (usize, usize),
+        scratch_rows: &DeviceBuffer,
+        resid: &DeviceBuffer,
+    ) -> Result<(), EngError> {
+        if !(1..=16).contains(&streams) {
+            return Err(EngError::BadRequest(format!(
+                "tail gather_chunk: invalid streams {streams}"
+            )));
+        }
+        let Some((ids_buf, status_buf, vocab)) = &self.chunk else {
+            return Err(EngError::BadRequest(
+                "tail gather_chunk: chunk scratch was not allocated".into(),
+            ));
+        };
+        let n = tokens.len();
+        let ids: Vec<i32> = tokens
+            .iter()
+            .map(|&t| i32::try_from(t).unwrap_or(-1))
+            .collect();
+        check_host_ids(&ids, *vocab)?;
+        let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        ids_buf.write_at(stream, 0, &bytes)?;
+        let dst = if streams == 1 { resid } else { scratch_rows };
+        self.table.gather(
+            ctx,
+            stream,
+            [
+                ids_buf.range(0, n * 4)?,
+                dst.range(0, n * hidden * 4)?,
+                status_buf.range(0, 4)?,
+            ],
+            n,
+        )?;
+        if streams > 1 {
+            ctx.block_op(
+                stream,
+                BlockOp::hc_broadcast(
+                    n,
+                    streams,
+                    hidden,
+                    scratch_rows.range(0, n * hidden * 4)?,
+                    resid.range(0, n * streams * hidden * 4)?,
+                )?,
+            )?;
+        }
+        Ok(())
     }
 
     /// Queues the pick over the first `vocab` values of `logits`: the id goes into `params` and
@@ -108,81 +217,5 @@ impl Tail {
             operation: "token_pick",
             message: format!("the device picked the id {picked}"),
         })
-    }
-}
-
-/// Device embedding gather for prompt chunks: holds the resident table and its id/status scratch.
-pub(crate) struct ChunkEmbed {
-    table: EmbedTable,
-    ids: DeviceBuffer,
-    status: DeviceBuffer,
-}
-
-impl ChunkEmbed {
-    /// Opens the embedding table `name` of `file` on the device when its type has a device gather
-    /// and free memory admits it, with id scratch for up to `max_rows` tokens.
-    pub(crate) fn open(
-        ctx: &CudaContext,
-        file: &GgufWeights,
-        name: &str,
-        (rows, k): (usize, usize),
-        max_rows: usize,
-    ) -> Result<Option<Self>, EngError> {
-        let Some(table) = device_table(ctx, file, name, (rows, k))? else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            table,
-            ids: ctx.allocate(max_rows * 4)?,
-            status: ctx.upload(&[0u8; 4])?,
-        }))
-    }
-
-    /// Gathers `tokens` on the device and broadcasts each row bit-for-bit across `streams`
-    /// residual streams into `resid` (`[n][streams][hidden]`). For one stream, `resid` is written
-    /// directly and `scratch_rows` is not touched.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn gather(
-        &self,
-        ctx: &CudaContext,
-        stream: &DeviceStream,
-        tokens: &[u32],
-        vocab: usize,
-        (streams, hidden): (usize, usize),
-        scratch_rows: &DeviceBuffer,
-        resid: &DeviceBuffer,
-    ) -> Result<(), EngError> {
-        let n = tokens.len();
-        let ids: Vec<i32> = tokens
-            .iter()
-            .map(|&t| i32::try_from(t).unwrap_or(-1))
-            .collect();
-        check_host_ids(&ids, vocab)?;
-        let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
-        self.ids.write_at(stream, 0, &bytes)?;
-        let dst = if streams == 1 { resid } else { scratch_rows };
-        self.table.gather(
-            ctx,
-            stream,
-            [
-                self.ids.range(0, n * 4)?,
-                dst.range(0, n * hidden * 4)?,
-                self.status.range(0, 4)?,
-            ],
-            n,
-        )?;
-        if streams > 1 {
-            ctx.block_op(
-                stream,
-                BlockOp::hc_broadcast(
-                    n,
-                    streams,
-                    hidden,
-                    scratch_rows.range(0, n * hidden * 4)?,
-                    resid.range(0, n * streams * hidden * 4)?,
-                )?,
-            )?;
-        }
-        Ok(())
     }
 }

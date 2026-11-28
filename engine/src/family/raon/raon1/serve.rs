@@ -39,7 +39,10 @@ mod device {
     use super::*;
     use crate::family::executor::{ExecutorOps, GenerationState};
     use crate::family::raon::raon1::cuda::{CHUNK, HeadRows, Raon1Device};
-    use crate::family::session::{DecodeSession, Limits, TokenStepper, check_prompt};
+    use crate::family::sampler::Sampler;
+    use crate::family::session::{
+        DecodeSession, Limits, TokenStepper, check_prompt, sample_logits,
+    };
     use crate::sched::worker::spawn_engine_noted;
     use crate::tokenizer::DecodeBatch;
 
@@ -80,6 +83,26 @@ mod device {
                 operation: "raon1",
                 message: "the head returned no logits row".into(),
             })
+        }
+
+        fn next_token(
+            &mut self,
+            token: u32,
+            sampler: &mut Sampler,
+            sampler_vocab: usize,
+        ) -> Result<u32, EngError> {
+            let on_device = self.model.takes_tokens()
+                && sampler.is_greedy()
+                && !sampler.capture_armed()
+                && sampler.first_top2_margin().is_some();
+            if !on_device {
+                let logits = self.logits(token)?;
+                return sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab);
+            }
+            let picked = self.model.decode_token(token, *self.pos, sampler_vocab)?;
+            *self.pos += 1;
+            sampler.record_device_greedy(picked);
+            Ok(picked)
         }
 
         fn fed(&self) -> usize {

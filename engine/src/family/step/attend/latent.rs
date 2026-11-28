@@ -119,6 +119,8 @@ pub(crate) struct LatentRows<'a> {
     /// The layer's cache and the positions it holds.
     pub(crate) cache: DeviceRange<'a>,
     pub(crate) cells: usize,
+    /// Optional device `i32` position word (`StepParams.pos`) for graph-captured 1-row decode.
+    pub(crate) step_pos: Option<DeviceRange<'a>>,
 }
 
 /// One low-rank attention visit over `n` rows whose first row sits at `p0`.
@@ -152,17 +154,30 @@ pub(crate) fn mix(
         n,
     )?;
     io.mv(&names.latent, rows.input, rows.latent, n)?;
-    io.run(BlockOp::mla_kv_prep(
-        n,
-        d.rank,
-        d.rot_dims,
-        p0,
-        rows.cells,
-        d.eps,
-        rows.latent.range(0, n * row * 4)?,
-        io.raw(&names.latent_norm)?,
-        rows.cache,
-    )?)?;
+    if let Some(pos_word) = rows.step_pos.filter(|_| n == 1 && !io.exact) {
+        io.run(BlockOp::mla_kv_prep_step(
+            d.rank,
+            d.rot_dims,
+            rows.cells,
+            d.eps,
+            rows.latent.range(0, row * 4)?,
+            io.raw(&names.latent_norm)?,
+            rows.cache,
+            pos_word,
+        )?)?;
+    } else {
+        io.run(BlockOp::mla_kv_prep(
+            n,
+            d.rank,
+            d.rot_dims,
+            p0,
+            rows.cells,
+            d.eps,
+            rows.latent.range(0, n * row * 4)?,
+            io.raw(&names.latent_norm)?,
+            rows.cache,
+        )?)?;
+    }
     let shape = MlaShape {
         n,
         heads: d.heads,
@@ -223,6 +238,30 @@ pub(crate) fn score(
     };
     let keys = p0 + n;
     let groups = d.heads / MLA_GROUP;
+    // A single non-exact row uses the shared-KV decode kernel (all heads share one KV load per
+    // split; fixed split count when reading pos from StepParams for graph capture).
+    if n == 1 && !io.exact && (MLA_GROUP..=64).contains(&d.heads) {
+        let cap = MAX_SPLITS
+            .min(rows.part.bytes() / part_bytes(d, 1, 1))
+            .max(1);
+        let splits = if rows.step_pos.is_some() {
+            cap
+        } else {
+            keys.div_ceil(16).clamp(1, cap)
+        };
+        io.run(BlockOp::mla_attn_decode(
+            shape,
+            splits,
+            p0,
+            rows.cells,
+            d.scale,
+            rows.absorbed.range(0, d.heads * row * 4)?,
+            rows.cache,
+            rows.part.range(0, part_bytes(d, 1, splits))?,
+            rows.step_pos,
+        )?)?;
+        return Ok(splits);
+    }
     // A few rows keep the bits of a one-row step, and the exact route keeps its queries in f32:
     // both score a row at a time. A larger chunk scores in tiles on tensor cores.
     let tiled = !io.exact && n > FEW_ROWS;
