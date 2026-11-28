@@ -207,7 +207,7 @@ impl CardStep {
         {
             step.set_embedding(table)?;
         }
-        Ok(DeviceStepper::new(CardDevice {
+        Ok(DeviceStepper::over(CardDevice {
             step,
             embd: GgufMatrix::new(file.header(), "token_embd.weight", vocab, hidden)?,
             projector: GgufProjector::new(Arc::clone(file)),

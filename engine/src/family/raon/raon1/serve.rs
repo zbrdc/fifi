@@ -145,7 +145,7 @@ mod device {
             let _ = announce.send(Ok(u32::try_from(cells).unwrap_or(u32::MAX)));
             let budget =
                 crate::family::mem::host_store_budget(crate::family::mem::process_resident_bytes());
-            let executor = SerialDecode::new(RaonStep::new(model), eos, vocab, cells).with_reuse(
+            let executor = SerialDecode::new(RaonStep::over(model), eos, vocab, cells).with_reuse(
                 CHUNK,
                 budget,
                 crate::family::step::keep::admit,

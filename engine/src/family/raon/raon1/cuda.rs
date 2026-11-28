@@ -491,6 +491,9 @@ impl Raon1Device {
     /// that shows a step reads no cache row at or above its position.
     #[cfg(test)]
     pub(crate) fn fill_cache(&self, from: usize, word: [u8; 2]) -> Result<(), EngError> {
+        if from >= self.cells {
+            return Ok(());
+        }
         let row_bytes = MLA_ROW * 2;
         let layer_bytes = self.cells * row_bytes;
         let fill: Vec<u8> = word.repeat((self.cells - from) * MLA_ROW);

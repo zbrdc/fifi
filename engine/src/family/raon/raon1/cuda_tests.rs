@@ -1286,7 +1286,7 @@ fn a_reused_turn_has_the_bits_of_its_cold_start_with_the_same_boundary_mark() {
     let engine = spawn_engine(CHUNK, move |_| {
         let device = Raon1Device::load(&load_path, Some(cache), &mut |_| {})?;
         let tap = Tap {
-            step: RaonStep::new(device),
+            step: RaonStep::over(device),
             ran: thread_ran,
         };
         let executor = SerialDecode::new(tap, Vec::new(), vocab, cache).with_reuse(

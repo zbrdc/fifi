@@ -60,7 +60,7 @@ pub(crate) struct DeviceStepper<D> {
 }
 
 impl<D> DeviceStepper<D> {
-    pub(crate) fn new(device: D) -> Self {
+    pub(crate) fn over(device: D) -> Self {
         Self {
             device,
             pos: 0,
@@ -153,7 +153,8 @@ impl<D: DeviceStep> TokenStepper for DeviceStepper<D> {
             self.generation += 1;
             self.failed = false;
         } else {
-            self.device.reset_running()?;
+            let cleared = self.device.reset_running();
+            self.checked(cleared)?;
         }
         self.pos = 0;
         Ok(())
@@ -190,6 +191,8 @@ impl<D: DeviceStep> TokenStepper for DeviceStepper<D> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::family::sampler::{Sampler, SamplingParams};
 
@@ -200,9 +203,10 @@ mod tests {
         running_resets: usize,
         device_picks: usize,
         host_logits: usize,
-        fail_keep: Option<EngError>,
+        fail_keep: Cell<Option<EngError>>,
         fail_put_back: Option<EngError>,
         fail_feed: bool,
+        fail_reset_running: bool,
     }
 
     impl DeviceStep for FakeDevice {
@@ -243,6 +247,13 @@ mod tests {
         }
 
         fn reset_running(&mut self) -> Result<(), EngError> {
+            if self.fail_reset_running {
+                self.fail_reset_running = false;
+                return Err(EngError::Backend {
+                    operation: Self::OPERATION,
+                    message: "injected reset_running error".into(),
+                });
+            }
             self.running_resets += 1;
             Ok(())
         }
@@ -271,12 +282,14 @@ mod tests {
 
     #[test]
     fn memory_plan_on_keep_or_put_back_does_not_latch_failure() {
-        let mut step = DeviceStepper::new(FakeDevice::default());
+        let mut step = DeviceStepper::over(FakeDevice::default());
         step.feed_rows(&[1, 2, 3]).unwrap();
         assert_eq!(step.kept_generation(), 1);
         assert_eq!(step.fed(), 3);
 
-        step.device.fail_keep = Some(EngError::MemoryPlan("oom".into()));
+        step.device
+            .fail_keep
+            .set(Some(EngError::MemoryPlan("oom".into())));
         assert!(matches!(step.keep(), Err(EngError::MemoryPlan(_))));
         step.reset().unwrap();
         assert_eq!(step.device().full_resets, 0);
@@ -299,8 +312,44 @@ mod tests {
     }
 
     #[test]
+    fn backend_errors_on_keep_put_back_and_reset_running_latch_full_reset() {
+        let mut step = DeviceStepper::over(FakeDevice::default());
+        step.feed_rows(&[1, 2]).unwrap();
+        let gen0 = step.kept_generation();
+
+        step.device.fail_keep.set(Some(EngError::Backend {
+            operation: "fake_device",
+            message: "d2h failed".into(),
+        }));
+        assert!(step.keep().is_err());
+        step.reset().unwrap();
+        assert_eq!(step.device().full_resets, 1);
+        assert_eq!(step.kept_generation(), gen0 + 1);
+
+        let kept = Kept {
+            rows: 2,
+            parts: vec![vec![0u8; 16]],
+        };
+        step.device.fail_put_back = Some(EngError::Backend {
+            operation: "fake_device",
+            message: "h2d failed".into(),
+        });
+        assert!(step.put_back(&kept).is_err());
+        assert_eq!(step.fed(), 0);
+        step.reset().unwrap();
+        assert_eq!(step.device().full_resets, 2);
+        assert_eq!(step.kept_generation(), gen0 + 2);
+
+        step.device.fail_reset_running = true;
+        assert!(step.reset().is_err());
+        step.reset().unwrap();
+        assert_eq!(step.device().full_resets, 3);
+        assert_eq!(step.kept_generation(), gen0 + 3);
+    }
+
+    #[test]
     fn backend_failure_latches_full_reset_and_bumps_generation() {
-        let mut step = DeviceStepper::new(FakeDevice {
+        let mut step = DeviceStepper::over(FakeDevice {
             fail_feed: true,
             ..FakeDevice::default()
         });
@@ -315,8 +364,8 @@ mod tests {
     }
 
     #[test]
-    fn next_token_uses_device_pick_only_after_first_margin_on_greedy() {
-        let mut step = DeviceStepper::new(FakeDevice {
+    fn next_token_uses_device_pick_only_after_first_margin_on_greedy_without_capture() {
+        let mut step = DeviceStepper::over(FakeDevice {
             takes_tokens: true,
             ..FakeDevice::default()
         });
@@ -329,10 +378,15 @@ mod tests {
         assert_eq!(step.device().host_logits, 1);
         assert_eq!(step.device().device_picks, 1);
 
+        let _cap = greedy.arm_capture(4);
+        assert_eq!(step.next_token(1, &mut greedy, 3).unwrap(), 1);
+        assert_eq!(step.device().host_logits, 2);
+        assert_eq!(step.device().device_picks, 1);
+
         let mut sampled = Sampler::new(SamplingParams::new(0.8, 1.0, 0).unwrap(), 7);
         step.next_token(1, &mut sampled, 3).unwrap();
         step.next_token(1, &mut sampled, 3).unwrap();
         assert_eq!(step.device().device_picks, 1);
-        assert_eq!(step.device().host_logits, 3);
+        assert_eq!(step.device().host_logits, 4);
     }
 }
