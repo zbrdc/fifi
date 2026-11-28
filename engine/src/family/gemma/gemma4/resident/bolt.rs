@@ -1188,7 +1188,7 @@ impl Bolt {
                     1,
                     KV_HEADS,
                     head,
-                    Kv8CodeScale::UnroundedF32,
+                    Kv8CodeScale::StoredHalf,
                 );
                 let plane_cells = shape.cells;
                 Some(Kv {
@@ -3016,7 +3016,7 @@ mod tests {
                 2,
                 head,
                 32768,
-                crate::kernels::cuda::resident::kv8_append::Kv8CodeScale::UnroundedF32,
+                crate::kernels::cuda::resident::kv8_append::Kv8CodeScale::StoredHalf,
             );
             let codes = 2 * 32768 * head;
             let scales = 2 * 32768 * (head / 32);

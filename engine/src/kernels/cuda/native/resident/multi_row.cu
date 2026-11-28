@@ -37,9 +37,17 @@ bool aligned(const void *p, size_t a) { return (uintptr_t)p % a == 0; }
 
 bool rows_ok(int n) { return n >= 1 && n <= INFERENCE_CUDA_MULTI_ROW_MAX; }
 
-__device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
+template <bool ExactExp>
+__device__ __forceinline__ float silu_f(float x) {
+    if constexpr (ExactExp) {
+        return x / (1.f + expf(-x));
+    } else {
+        return x / (1.f + __expf(-x));
+    }
+}
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.f / (1.f + __expf(-x)); }
 __device__ __forceinline__ float softplus_f(float x) { return x > 20.f ? x : log1pf(__expf(x)); }
+__device__ __forceinline__ float softplus_ieee_f(float x) { return x > 20.f ? x : log1pf(expf(x)); }
 
 __device__ float warp_sum_f(float v) {
 #pragma unroll
@@ -61,6 +69,7 @@ __device__ float block_sum_f(float v) {
 
 // conv_silu of one token per row: the expression of conv_silu_rows_k (a rounded first product, then
 // three fused multiply-adds in tap order), which the prefill tests pin to conv_silu_k bit for bit.
+template <bool ExactExp>
 __global__ void __launch_bounds__(kConvBlock)
 conv_silu_multi_k(const float *__restrict__ proj, int ld, int n, const float4 *__restrict__ w,
                   float *const *states, float *__restrict__ out) {
@@ -72,7 +81,7 @@ conv_silu_multi_k(const float *__restrict__ proj, int ld, int n, const float4 *_
     const float4 wc = w[c];
     const float x = proj[(size_t)r * ld + c];
     const float v = __fmaf_rn(x, wc.w, __fmaf_rn(s2, wc.z, __fmaf_rn(s1, wc.y, __fmul_rn(s0, wc.x))));
-    out[(size_t)r * n + c] = silu_f(v);
+    out[(size_t)r * n + c] = silu_f<ExactExp>(v);
     state[c] = s1;
     state[n + c] = s2;
     state[2 * n + c] = x;
@@ -129,9 +138,58 @@ __global__ void __launch_bounds__(kStateDim) gated_delta_multi_k(DeltaMulti a) {
     }
     float rstd = rsqrtf(block_sum_f(o * o) / D + a.eps);
     float z = p[a.z_off + h * D + j];
-    a.out[(size_t)r * a.n_v_heads * D + h * D + j] = o * rstd * a.norm_w[j] * silu_f(z);
+    a.out[(size_t)r * a.n_v_heads * D + h * D + j] = o * rstd * a.norm_w[j] * silu_f<false>(z);
 #pragma unroll
     for (int i = 0; i < D; ++i) st[i * D + j] = s[i];
+}
+
+// IEEE counterpart of gated_delta_ieee_m1_k in gdn_delta.cu for n rows: hoists decay, beta and
+// silu(z) before loading s[D] so IEEE expf/log1pf temporaries never spill the state register file,
+// and matches single-row gdn_delta_ieee_launch bit for bit.
+__global__ void __launch_bounds__(kStateDim) gated_delta_multi_ieee_k(DeltaMulti a) {
+    constexpr int D = kStateDim;
+    __shared__ float qs[D], ks[D];
+    __shared__ float sh_decay, sh_beta;
+    const int h = blockIdx.x, r = blockIdx.y, j = threadIdx.x, kh = h % a.n_k_heads;
+    const float *c = a.conv + (size_t)r * a.conv_ld;
+    const float *p = a.proj + (size_t)r * a.ld;
+    const float qv = c[kh * D + j];
+    const float kv = c[(a.n_k_heads + kh) * D + j];
+    const float vv = c[2 * a.n_k_heads * D + h * D + j];
+    const float qn = rsqrtf(block_sum_f(qv * qv) + a.eps) * rsqrtf((float)D);
+    const float kn = rsqrtf(block_sum_f(kv * kv) + a.eps);
+    qs[j] = qv * qn;
+    ks[j] = kv * kn;
+    if (j == 0) {
+        sh_decay = expf(softplus_ieee_f(p[a.alpha_off + h] + a.dt_bias[h]) * a.a[h]);
+        sh_beta = 1.f / (1.f + expf(-p[a.beta_off + h]));
+    }
+    const float z = p[a.z_off + h * D + j];
+    const float silu_z = z / (1.f + expf(-z));
+    __syncthreads();
+    const float decay = sh_decay;
+    const float beta = sh_beta;
+    float *st = a.states[r] + (size_t)h * D * D;
+    float s[D];
+#pragma unroll
+    for (int i = 0; i < D; ++i) s[i] = st[i * D + j];
+    float sk = 0.f;
+#pragma unroll
+    for (int i = 0; i < D; ++i) {
+        s[i] *= decay;
+        sk += s[i] * ks[i];
+    }
+    const float d = (vv - sk) * beta;
+    float o = 0.f;
+#pragma unroll
+    for (int i = 0; i < D; ++i) {
+        s[i] += ks[i] * d;
+        o += s[i] * qs[i];
+    }
+#pragma unroll
+    for (int i = 0; i < D; ++i) st[i * D + j] = s[i];
+    const float rstd = rsqrtf(block_sum_f(o * o) / (float)D + a.eps);
+    a.out[(size_t)r * a.n_v_heads * D + h * D + j] = o * rstd * a.norm_w[j] * silu_z;
 }
 
 struct PrepMulti {
@@ -185,10 +243,9 @@ __global__ void attn_prep_multi_k(PrepMulti a) {
         a.k_rows[((size_t)t * a.n_kv_head + head - a.n_head) * D + d] = out;
 }
 
-}  // namespace
-
-extern "C" int inference_cuda_gdn_conv_multi_launch(const inference_cuda_gdn_conv_multi_args *a,
-                                                    void *stream, int *out_stage) {
+template <bool ExactExp>
+int conv_multi_launch_impl(const inference_cuda_gdn_conv_multi_args *a, void *stream,
+                           int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (a == NULL || stream == NULL || a->proj == NULL || a->w == NULL || a->states == NULL ||
@@ -198,7 +255,7 @@ extern "C" int inference_cuda_gdn_conv_multi_launch(const inference_cuda_gdn_con
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const dim3 grid((a->channels + kConvBlock - 1) / kConvBlock, a->n);
-        conv_silu_multi_k<<<grid, kConvBlock, 0, (cudaStream_t)stream>>>(
+        conv_silu_multi_k<ExactExp><<<grid, kConvBlock, 0, (cudaStream_t)stream>>>(
             (const float *)a->proj, a->ld, a->channels, (const float4 *)a->w,
             (float *const *)a->states, (float *)a->out);
         Failure failure;
@@ -210,8 +267,9 @@ extern "C" int inference_cuda_gdn_conv_multi_launch(const inference_cuda_gdn_con
     }
 }
 
-extern "C" int inference_cuda_gdn_delta_multi_launch(const inference_cuda_gdn_delta_multi_args *a,
-                                                     void *stream, int *out_stage) {
+template <bool ExactExp>
+int delta_multi_launch_impl(const inference_cuda_gdn_delta_multi_args *a, void *stream,
+                            int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (a == NULL || stream == NULL || a->conv == NULL || a->proj == NULL || a->a == NULL ||
@@ -234,7 +292,11 @@ extern "C" int inference_cuda_gdn_delta_multi_launch(const inference_cuda_gdn_de
                         a->beta_off, a->alpha_off, (const float *)a->a, (const float *)a->dt_bias,
                         (const float *)a->norm_w, (float *const *)a->states, (float *)a->out,
                         a->n_k_heads, a->n_v_heads, a->eps};
-        gated_delta_multi_k<<<dim3(a->n_v_heads, a->n), kStateDim, 0, (cudaStream_t)stream>>>(k);
+        if constexpr (ExactExp) {
+            gated_delta_multi_ieee_k<<<dim3(a->n_v_heads, a->n), kStateDim, 0, (cudaStream_t)stream>>>(k);
+        } else {
+            gated_delta_multi_k<<<dim3(a->n_v_heads, a->n), kStateDim, 0, (cudaStream_t)stream>>>(k);
+        }
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
@@ -242,6 +304,28 @@ extern "C" int inference_cuda_gdn_delta_multi_launch(const inference_cuda_gdn_de
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+}  // namespace
+
+extern "C" int inference_cuda_gdn_conv_multi_launch(const inference_cuda_gdn_conv_multi_args *a,
+                                                    void *stream, int *out_stage) {
+    return conv_multi_launch_impl<false>(a, stream, out_stage);
+}
+
+extern "C" int inference_cuda_gdn_conv_multi_ieee_launch(const inference_cuda_gdn_conv_multi_args *a,
+                                                         void *stream, int *out_stage) {
+    return conv_multi_launch_impl<true>(a, stream, out_stage);
+}
+
+extern "C" int inference_cuda_gdn_delta_multi_launch(const inference_cuda_gdn_delta_multi_args *a,
+                                                     void *stream, int *out_stage) {
+    return delta_multi_launch_impl<false>(a, stream, out_stage);
+}
+
+extern "C" int inference_cuda_gdn_delta_multi_ieee_launch(const inference_cuda_gdn_delta_multi_args *a,
+                                                          void *stream, int *out_stage) {
+    return delta_multi_launch_impl<true>(a, stream, out_stage);
 }
 
 extern "C" int inference_cuda_attn_prep_multi_launch(const inference_cuda_attn_prep_multi_args *a,

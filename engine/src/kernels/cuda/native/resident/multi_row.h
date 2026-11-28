@@ -68,6 +68,8 @@ typedef struct inference_cuda_gdn_conv_multi_args {
 } inference_cuda_gdn_conv_multi_args;
 int inference_cuda_gdn_conv_multi_launch(const inference_cuda_gdn_conv_multi_args *args,
                                          void *stream, int *out_stage);
+int inference_cuda_gdn_conv_multi_ieee_launch(const inference_cuda_gdn_conv_multi_args *args,
+                                              void *stream, int *out_stage);
 
 typedef struct inference_cuda_gdn_delta_multi_args {
     const void *conv;     /* f32 [n][conv_ld] */
@@ -89,6 +91,8 @@ typedef struct inference_cuda_gdn_delta_multi_args {
 } inference_cuda_gdn_delta_multi_args;
 int inference_cuda_gdn_delta_multi_launch(const inference_cuda_gdn_delta_multi_args *args,
                                           void *stream, int *out_stage);
+int inference_cuda_gdn_delta_multi_ieee_launch(const inference_cuda_gdn_delta_multi_args *args,
+                                               void *stream, int *out_stage);
 
 /* attn_prep_rows for n rows of n sequences: row r takes the position word of rows[r].step. */
 typedef struct inference_cuda_attn_prep_multi_args {

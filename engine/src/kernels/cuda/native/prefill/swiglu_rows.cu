@@ -1,8 +1,7 @@
 /* Argument validation and the one launch of swiglu_rows (contract: prefill/swiglu_rows.h).
  * The entry follows attn_prep_chunk.cu (validate everything before any CUDA call, try/catch,
- * C types only), and the element is llama.cpp's silu, x / (1 + expf(-x)) (MIT), inlined below
- * with the tokens the shim unary.cuh carried. In the MMQ glue group with -use_fast_math,
- * because it is the silu half of the composed llama.cpp reference. */
+ * C types only), and the element is x / (1 + expf(-x)) * u. Built in CUDA_SOURCES without
+ * -use_fast_math so prefill SwiGLU uses the same IEEE expf and division as decode swiglu_q8. */
 #include "prefill/swiglu_rows.h"
 
 #include <cuda_runtime.h>

@@ -192,8 +192,17 @@ const _: () = assert!(
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_conv_multi_launch"]
     fn conv_raw(args: *const ConvArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_gdn_conv_multi_ieee_launch"]
+    fn conv_ieee_raw(args: *const ConvArgsRaw, stream: *mut c_void, out_stage: *mut c_int)
+    -> c_int;
     #[link_name = "inference_cuda_gdn_delta_multi_launch"]
     fn delta_raw(args: *const DeltaArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_gdn_delta_multi_ieee_launch"]
+    fn delta_ieee_raw(
+        args: *const DeltaArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_attn_prep_multi_launch"]
     fn prep_raw(args: *const PrepArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_kv8_append_multi_launch"]
@@ -290,7 +299,13 @@ pub(in crate::kernels::cuda) fn gdn_conv_multi_launch(
     // by the safe layer. The allocations outlive the queued work (`inference_cuda_free`
     // synchronizes first). `args` is a live local the entry reads only during the call; `stream`
     // is a live handle and `stage` a live, writable c_int.
-    let status = unsafe { conv_raw(&args, stream.as_ptr(), &mut stage) };
+    let status = unsafe {
+        if super::exact_transcendentals() {
+            conv_ieee_raw(&args, stream.as_ptr(), &mut stage)
+        } else {
+            conv_raw(&args, stream.as_ptr(), &mut stage)
+        }
+    };
     checked(status, stage)
 }
 
@@ -372,7 +387,13 @@ pub(in crate::kernels::cuda) fn gdn_delta_multi_launch(
     // SAFETY: as `gdn_conv_multi_launch`: every range proved live, sized and aligned above, `out`
     // apart from every other range, the entry repeating the shape checks (including `eps`), the
     // state addresses proved by the safe layer, `args` and `stage` live for the call.
-    let status = unsafe { delta_raw(&args, stream.as_ptr(), &mut stage) };
+    let status = unsafe {
+        if super::exact_transcendentals() {
+            delta_ieee_raw(&args, stream.as_ptr(), &mut stage)
+        } else {
+            delta_raw(&args, stream.as_ptr(), &mut stage)
+        }
+    };
     checked(status, stage)
 }
 

@@ -50,7 +50,7 @@ impl DenseChunkGemm {
         ctx.mmq_dense_input(
             stream,
             MmqDenseInputCall {
-                packing: MmqPacking::CpuReference,
+                packing: MmqPacking::Rounded,
                 weight,
                 m,
                 row_stride: weight.k(),

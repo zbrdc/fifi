@@ -148,6 +148,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/nvfp4_grouped_gemm.cu",
     "src/kernels/cuda/native/prefill/row_ops.cu",
     "src/kernels/cuda/native/prefill/flint_qk.cu",
+    "src/kernels/cuda/native/prefill/swiglu_rows.cu",
     "src/kernels/cuda/native/peer_probe.cu",
     "src/kernels/cuda/native/peer_ring.cu",
     "src/kernels/cuda/native/resident/hyper.cu",
@@ -201,15 +202,13 @@ const MMQ_VENDOR_SOURCES: &[&str] = &[
 ];
 /// Our glue of the vendored MMQ (`mmq-glue`): the vendor group's flags
 /// (`-use_fast_math --extended-lambda`, the same generated `__CUDA_ARCH_LIST__`), with warnings as
-/// errors. Only the MMQ glue and `swiglu_quant`-class kernels go here (`swiglu_rows`, the silu half
-/// of the composed SwiGLU reference); `router_tiled` and `moe_combine_rows` stay in `CUDA_SOURCES`
-/// without fast math.
+/// errors. Only the MMQ glue and sparse decode kernels go here; `swiglu_rows`, `router_tiled` and
+/// `moe_combine_rows` stay in `CUDA_SOURCES` without fast math.
 const MMQ_GLUE_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/prefill/mmq_dense.cu",
     "src/kernels/cuda/native/prefill/mmq_facts.cu",
     "src/kernels/cuda/native/prefill/mmq_mmid.cu",
     "src/kernels/cuda/native/prefill/mmq_quant.cu",
-    "src/kernels/cuda/native/prefill/swiglu_rows.cu",
     "src/kernels/cuda/native/resident/sparse_sketch.cu",
     "src/kernels/cuda/native/resident/sparse_score.cu",
     "src/kernels/cuda/native/resident/sparse_topk.cu",

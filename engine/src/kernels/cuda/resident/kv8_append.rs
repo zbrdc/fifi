@@ -52,6 +52,10 @@ pub(crate) const MAX_CELLS: usize = (1 << 30) - 1;
 #[repr(i32)]
 pub(crate) enum Kv8CodeScale {
     StoredHalf = 1,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "retained for kv8_append policy tests")
+    )]
     UnroundedF32 = 2,
 }
 

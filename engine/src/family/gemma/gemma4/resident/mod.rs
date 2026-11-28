@@ -164,7 +164,7 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
         // A local layer reaches the last `window` positions, so it keeps a ring of that many
         // cells plus one prefill batch; a global layer keeps every position.
         let geometry = KvRing::sliding(if global { 0 } else { window }, Gemma::PREFILL_BATCH);
-        let shape = Kv8Shape::of_layer(geometry, CELLS, 1, n_kv, head, Kv8CodeScale::UnroundedF32);
+        let shape = Kv8Shape::of_layer(geometry, CELLS, 1, n_kv, head, Kv8CodeScale::StoredHalf);
         // The planes take the shape's cells: there is one derivation of a ring's cell count.
         let cells = shape.cells;
         let kv = Kv {

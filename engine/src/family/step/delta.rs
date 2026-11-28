@@ -509,5 +509,11 @@ pub(crate) fn mix(
             }
         }
     }
-    io.project_into(layer.out, rows.read, n, Out::packed(rows.out, n, hidden)?)
+    io.project_role_into(
+        "ssm_out",
+        layer.out,
+        rows.read,
+        n,
+        Out::packed(rows.out, n, hidden)?,
+    )
 }

@@ -1,12 +1,10 @@
 /* Launch entry of swiglu_rows, the M-row SwiGLU with f32 output of the chunked-prefill MoE
  * path, one header per kernel file; abi_resident.h stays closed.
  *
- * act[r][c] = silu(gu[r][c]) * gu[r][up_off + c] for r < rows, c < n_ff: llama.cpp's silu,
- * x / (1 + expf(-x)) (MIT; inlined in swiglu_rows.cu, the tokens the shim unary.cuh carried),
- * under the MMQ glue group's -use_fast_math, as the llama.cpp oracle builds it (__expf,
- * approximate division, subnormals flushed to zero; the tests' tolerance `SW0`). The routed experts run it on 8M
- * token-slot rows, the shared expert on M rows; act feeds the MMQ q8_1 quantizer. No device
- * index, no status word, deterministic.
+ * act[r][c] = silu(gu[r][c]) * gu[r][up_off + c] for r < rows, c < n_ff: silu(x) =
+ * x / (1 + expf(-x)) compiled in CUDA_SOURCES with IEEE expf and division (no -use_fast_math),
+ * matching decode swiglu_q8. The routed experts run it on 8M token-slot rows, the shared expert
+ * on M rows; act feeds the MMQ q8_1 quantizer. No device index, no status word, deterministic.
  *
  * gu  f32 [rows][ld_in], read only: gate at columns 0..n_ff, up at up_off..up_off + n_ff.
  * act f32 [rows][ld_out]: columns 0..n_ff written, no other byte.

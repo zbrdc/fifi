@@ -110,8 +110,11 @@ fn the_gemm_matches_the_invariant_matvec_at_the_bolt_shapes() {
                 "rows {rows} k {k} m {m} {packing:?}: max |dy| {worst:.3e} of max |y| {scale:.3e}"
             );
             if packing == MmqPacking::CpuReference {
+                // `quantize_q8_1` (rounded default) quantizes against the stored fp16 `d` of
+                // `block_q8_1`, while MMQ Q8_0 (`DS_LAYOUT_D4`) keeps an f32 scale; boundary ties
+                // shift individual codes by ±1 (~1.5e-3 relative across k = 2560..10240).
                 assert!(
-                    worst <= scale * 1e-3,
+                    worst <= scale * 2.5e-3,
                     "rows {rows} k {k} m {m}: {worst} over {scale}"
                 );
             }
