@@ -592,7 +592,8 @@ fn relative_attention_is_timed() {
 }
 
 /// Checks one shape against the reference, then prints its time: the median of 21 single steps
-/// and the mean of 16 steps back to back, with the rate of the K and V rows read.
+/// and the mean of 16 steps back to back, with the rate of the K and V rows read, and the 21 single
+/// steps in their order.
 fn time_step(rig: &Rig, rng: &mut Rng, shape: RelativeAttentionShape, position: i32) {
     let c = Case::new(rng, shape, position);
     check(rig, &c, 0);
@@ -601,7 +602,8 @@ fn time_step(rig: &Rig, rng: &mut Rng, shape: RelativeAttentionShape, position: 
 }
 
 /// The time of one step over the uploaded buffers `b`: the median of 21 single steps and the
-/// mean of 16 back to back, with the rate of the bytes of K and V the step reads.
+/// mean of 16 back to back, with the rate of the bytes of K and V the step reads. The 21 single
+/// steps also print in their order: a single step's time moves between runs at the long ring.
 fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position: i32) {
     let one = || {
         rig.ctx
@@ -611,9 +613,10 @@ fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position:
     for _ in 0..3 {
         one();
     }
-    let mut singles: Vec<u64> = (0..21).map(|_| one()).collect();
-    singles.sort_unstable();
-    let single = singles[singles.len() / 2];
+    let singles: Vec<u64> = (0..21).map(|_| one()).collect();
+    let mut sorted = singles.clone();
+    sorted.sort_unstable();
+    let single = sorted[sorted.len() / 2];
     let chain = rig
         .ctx
         .relative_attention_timed(call(b, shape, None), 16)
@@ -633,6 +636,12 @@ fn time_buffers(rig: &Rig, b: &Buffers, shape: RelativeAttentionShape, position:
         rate(single),
         chain as f64 / 1e3,
         rate(chain),
+    );
+    println!(
+        "relative attention, ring format {:?}, ring {} at position {position}, the 21 single steps in us, in their order: {:?}",
+        shape.format,
+        shape.capacity,
+        singles.iter().map(|ns| ns / 1000).collect::<Vec<u64>>(),
     );
 }
 
