@@ -37,12 +37,13 @@ pub(crate) fn serves(ty: QuantType) -> bool {
     matches!(ty, QuantType::Q4K | QuantType::Q6K | QuantType::Q80)
 }
 
-/// Comma-separated role list (`FIFI_CUDA_DECODE_DQ_ROLES`, default `attn_q,attn_v`; set `0`,
-/// `off`, or `none` to disable) selecting 1-row decode projections that bypass `q8_1` activation
-/// quantization via [`CudaContext::matvec_dq_native`] (`Q4_K`, `Q6_K`, or `Q8_0`, `k % 256 == 0`).
-/// Supported tags include `all`, `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv`,
-/// `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_out`, `delta_inputs` (`attn_qkv` + `attn_gate`),
-/// and `delta_logits` (`ssm_alpha` + `ssm_beta`).
+/// Comma-separated role list (`FIFI_CUDA_DECODE_DQ_ROLES`, default
+/// `attn_q,attn_k,attn_v,attn_qkv,attn_gate,ssm_alpha,ssm_beta`; set `0`, `off`, or `none` to
+/// disable) selecting 1-row decode projections that bypass `q8_1` activation quantization via
+/// [`CudaContext::matvec_dq_native`] (`Q4_K`, `Q6_K`, or `Q8_0`, `k % 256 == 0`). Supported tags
+/// include `all`, `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_qkv`, `attn_gate`,
+/// `ssm_alpha`, `ssm_beta`, `ssm_out`, `delta_inputs` (`attn_qkv` + `attn_gate`), and
+/// `delta_logits` (`ssm_alpha` + `ssm_beta`).
 pub(crate) fn decode_dq_role_enabled(role: &str) -> bool {
     if role.is_empty() {
         return false;
@@ -61,7 +62,15 @@ pub(crate) fn decode_dq_role_enabled(role: &str) -> bool {
                     .collect()
             }
         }
-        Err(_) => vec!["attn_q".to_owned(), "attn_v".to_owned()],
+        Err(_) => vec![
+            "attn_q".to_owned(),
+            "attn_k".to_owned(),
+            "attn_v".to_owned(),
+            "attn_qkv".to_owned(),
+            "attn_gate".to_owned(),
+            "ssm_alpha".to_owned(),
+            "ssm_beta".to_owned(),
+        ],
     });
     if list.is_empty() {
         return false;
