@@ -38,7 +38,7 @@ use crate::weights::GgufType;
 use crate::weights::dequantize;
 
 /// Token rows per chunk: the scratch is sized for this many.
-pub(crate) const CHUNK: usize = 256;
+pub(crate) const CHUNK: usize = 512;
 
 // The geometry of the checkpoint this device path serves, read from its spec (the opener pins
 // the same fields against the GGUF header). The kernels of `block_ops` fix the head width, the
