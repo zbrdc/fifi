@@ -38,29 +38,7 @@ Per-phase, at 526 / 4,022 / 32,028 prompt tokens:
 
 Caveats: the MLX-LM figure is in-process (no HTTP, no server), while the fifi figure comes from the server's counters. Both use greedy sampling on the same file. The comparison states its layers honestly, though it is not a like-for-like server pair.
 
-## Flint, MLX int4 21 GB fixture, on the same Apple Silicon host
+## Single-engine measurements
 
-No reference pair exists because MLX-LM cannot load this model type ("Model type flint not supported"). This table gives single-engine figures for admission and ceiling. Default arm (equals the tuned arm, with nothing qualified to turn on for Flint on MLX):
-
-| Prompt tokens | Prefill ms (median of 3) | Decode tok/s | Conditions |
-| ---: | ---: | --- | --- |
-| 526 | 424 | 52.34 / 52.73 / 52.75 | greedy, 256 tokens |
-| 4,022 | 2,944 | 48.41 / 48.52 / 48.54 | same |
-| 32,028 | 46,986 | 26.04 / 26.07 / 26.11 | fits under 32,768 ceiling. 128K prompt refuses |
-
-Peak server RSS is 14.1 GiB. For the model-on-model comparison against Qwen3.6-MLX on the same host (32K prefill 36% slower, decode 61% slower), see [Current status](status.md).
-
-## Qwen3.6-35B-A3B, GGUF Q4_K_M, on an AGX Xavier board
-
-No reference engine runs on this board (its frozen software set lacks one), so these single-engine figures guide admission and thermal planning. Weights match the 3090 tables.
-
-| Arm | Prompt tokens | Prefill | Decode tok/s | Conditions |
-| --- | ---: | --- | --- | --- |
-| Default | 486 | 2,911.8–4,296.4 ms | 20.57–20.69 | two runs, peak 54.5 °C |
-| Default | 3,993 | 35,755–37,128 ms | 19.92–19.96 | three runs, peaks 60.5–67.0 °C |
-| Default | 31,650 | 28.0 and 29.5 min | 14.48 / 15.38 | two runs before thermal guard (91 °C). Three later runs hit 88 °C guard |
-| Tuned (KV q8, context 16,384, capture and prefix reuse) | 486 | 2,788.3–3,242.0 ms | 20.65–20.75 | three runs, temperature unrecorded |
-| Tuned | 3,993 | 36,864.9–43,020.3 ms | 19.94–20.04 | three runs, temperature unrecorded |
-| Tuned | 15,283 (max admitted) | 401,369.9 ms (~6.7 min) | 18.29 | one run (87.0 °C). Two later runs hit guard |
-
-The board holds ~20 tok/s decode at every admitted size. Its limits are prefill time and the 88 °C thermal guard. For the same weights on an RTX 3090, see the first table on this page.
+Flint on Apple Silicon and Qwen3.6 on AGX Xavier have no same-window reference engine pair.
+See [Current status](status.md) for their prefill, decode, memory-cap, and thermal-guard measurements.
