@@ -31,18 +31,9 @@ All arms read the same file (`Qwen3.6-35B-A3B-Q4_K_M.gguf`, SHA-256 in the recor
 - llama.cpp: `acecd5603`, the CUDA backend.
 - Card: one RTX 3090.
 
-Each row is narrowed to the sampler vocabulary (248,077 ids) and normalized in f64. For a pair of arms, `KL(a || b)` is summed over the 256 most probable ids of a and `KL(b || a)` over those of b. The terms outside those rows, where about 1.4% of the probability mass lies, are left out and are signed, so neither figure is a bound on the KL over the whole vocabulary. For llama.cpp's two cache forms, the pair where both arms keep every logit, the KL over all 248,077 ids is 0.0240 and 0.0236 against the top-row sums 0.0233 and 0.0232: 2% to 3% higher. Bounds are 95% intervals from a bootstrap over the twelve windows.
+Each row narrows to the sampler vocabulary (248,077 ids) and normalizes in f64. For a pair of arms, `KL(a || b)` sums over the 256 most probable ids of a, and `KL(b || a)` over those of b. Leaving out the remaining terms (~1.4% of probability mass) means neither figure bounds the full-vocabulary KL. For llama.cpp's two cache forms, full-vocabulary KL is 0.0240 and 0.0236 against top-row sums 0.0233 and 0.0232 (2% to 3% higher). Bounds are 95% intervals from a bootstrap over the twelve windows.
 
-Each arm was run at least twice: `llama-ub512`, `llama-ub1` and `engine-f16` directly and then through
-`scripts/kld_vs_llamacpp/run.sh`, `llama-ub1` and `llama-q8` three times each through `run.sh`, with
-every sidecar byte for byte the same. A first run under the `llama-q8` arm name had kept the f16 cache,
-because the arm passed no cache type at the time: its twelve sidecars were byte for byte those of
-`llama-ub1`, and were discarded. The int8 arm ran once against each of its three references, with every
-field but the two reference terms the same. On 2026-11-26 `llama-ub1` and `llama-q8` ran once more with
-the driver built from the committed source (a rebuild from it gives the same binary), and the committed
-`score_all.sh` on that run directory produced the thirteen outputs this record gathers. On it the ten
-score and concentration files of 2026-11-25 are byte for byte the same, `shape.txt` but for its five
-path lines, and against the first scoring of the same arms every number is the same.
+Each arm ran at least twice: `llama-ub512`, `llama-ub1`, and `engine-f16` directly and through `scripts/kld_vs_llamacpp/run.sh`. `llama-ub1` and `llama-q8` ran three times each through `run.sh`, producing identical sidecars. We discarded an early `llama-q8` run that omitted the cache type flag and matched `llama-ub1` byte for byte. The int8 arm ran once against each of its three references with identical parameters. On 2026-11-26, `llama-ub1` and `llama-q8` ran again from the committed source, and `score_all.sh` generated the thirteen outputs in this record. Ten score and concentration files from 2026-11-25 match byte for byte (`shape.txt` differs only in five path lines), and all scored numbers match.
 
 ## Results
 
@@ -67,51 +58,41 @@ Each engine against itself under a second path:
 | engine int8 cache, engine fp16 cache | | 0.0377 | 96.69% | −0.0019 | 66.96% against 67.12% |
 | llama.cpp q8_0 cache, llama.cpp f16 cache | 0.0232 | 0.0233 | 96.70% | −0.0003 | 67.08% against 67.24% |
 
-KL in nats per position, means over the 9,216 positions. A blank cell is a direction the harness does not
-give for that pair: `KL(x || y)` over the top rows of x needs every logit of y, which only `llama-ub1`
-and `llama-q8` write, unless an engine leg computed the term against its reference.
+KL in nats per position, means over 9,216 positions. A blank cell marks a direction the harness omits: `KL(x || y)` over top rows of x needs every logit of y, which only `llama-ub1` and `llama-q8` write unless an engine leg computed it against its reference.
 
 Means of the NLL over all positions: engine 1.5105 with the int8 cache and 1.5124 with the fp16 cache, llama.cpp 1.5016 with the f16 cache and 1.5012 with the q8_0 cache.
 
 ## Where the divergence sits
 
-- **Few positions carry the mean.** The median KL is 0.0006 to 0.001 nats in every pair. Between 0.41%
-  and 0.55% of the positions lie above one nat, and they hold 73% to 83% of the sum. Without them the
-  means are 0.006 to 0.007.
-- **They are the same positions.** Of the 69 positions where the engine with the int8 cache and llama.cpp
-  disagree on the true token's log-probability by more than one nat, 35 are also such positions between
-  llama.cpp's q8_0 and f16 caches, and 39 between llama.cpp's two batching paths. With both caches at 8
-  bits it is 43 of 81 against llama.cpp's two cache forms; with both at 16 bits, 46 of 78 against its two
-  batching paths. Chance would give 0.5 to 0.6.
-- **Two documents hold most of it.** The window at 6,774 tokens has 0.151 to 0.214 nats in every pair,
-  and the second of the seven windows at 32,768 tokens 0.059 to 0.145. Together they hold 71% to 81%
-  of each pair's sum. The other ten lie between 0.002 and 0.067.
-- **No arm is flatter.** The entropy over the top 256 rows is 1.082 to 1.087 nats in all five arms, the mean probability of the true token 0.604 to 0.605.
+- **Few positions carry the mean.** The median KL is 0.0006 to 0.001 nats in every pair. Only 0.41% to 0.55% of positions exceed one nat, yet they hold 73% to 83% of the sum. Without them, means are 0.006 to 0.007.
+- **They are the same positions.** Of the 69 positions where the int8 engine and llama.cpp differ by > 1 nat on true-token log-probability, 35 also exceed 1 nat between llama.cpp's q8_0 and f16 caches, and 39 between its two batching paths. At 8 bits, 43 of 81 overlap llama.cpp's cache forms. At 16 bits, 46 of 78 overlap its batching paths. Chance gives 0.5 to 0.6.
+- **Two documents hold most of it.** The 6,774-token window has 0.151 to 0.214 nats in every pair. The second 32,768-token window has 0.059 to 0.145. Together they hold 71% to 81% of each pair's sum. The other ten lie between 0.002 and 0.067.
+- **No arm is flatter.** Entropy over the top 256 rows is 1.082 to 1.087 nats in all five arms. Mean probability of the true token is 0.604 to 0.605.
 
 ## What the outlier positions are
 
-The positions that hold most of the KL between the int8 and the fp16 cache were traced layer by layer in three windows (6K, 32K and 80K tokens of prefix): 45 outlier positions against 2,259 others.
+We traced the outlier positions between the int8 and fp16 caches layer by layer in three windows (6K, 32K, and 80K tokens): 45 outlier positions against 2,259 others.
 
-- **No defect of the int8 cache shows.** Layers 0 to 2 keep no K/V cache and are identical in both arms. The first difference is at layer 3, the first attention layer, and it is the same size everywhere: 0.2% of the norm of the residual, at outlier and other positions and at all three context lengths.
-- **The difference grows through expert choices that are nearly tied.** The router's eighth selected expert leads the best unselected one by 0.02 to 0.05 logits at the median. A small difference in the residual swaps one expert for another of almost the same weight, and the next layers see a larger difference. Each swap multiplies the divergence by about 2.6 in layers 3 to 9, at outlier and other positions alike.
-- **The outliers are the positions with more swaps, not with closer ties.** The expert set differs in 27% of layers 3 to 9 at the outliers against 23% elsewhere, in 62% against 34% of layers 10 to 19, and in 95% against 46% of layers 20 to 38. From layer 3 to the last layer the divergence grows 354 times at the outliers and 36 times elsewhere. Their smallest router gaps are not smaller than the others'.
-- **A different expert set alone is harmless.** 734 of the 739 other positions of one window have one in some layer, with a median KL of 0.0002 to 0.0009 nats.
+- **No defect of the int8 cache shows.** Layers 0 to 2 keep no K/V cache and match in both arms. The first difference appears at layer 3 (the first attention layer) at 0.2% of residual norm across all positions and context lengths.
+- **The difference grows through expert choices that are nearly tied.** The eighth selected expert leads the best unselected one by 0.02 to 0.05 logits at the median. A tiny residual difference swaps an expert of similar weight, amplifying differences downstream. Each swap multiplies divergence by ~2.6 in layers 3 to 9 across all positions.
+- **The outliers are the positions with more swaps, not with closer ties.** The expert set differs in 27% of layers 3 to 9 at outliers vs 23% elsewhere, 62% vs 34% in layers 10 to 19, and 95% vs 46% in layers 20 to 38. From layer 3 to the last layer, divergence grows 354x at outliers vs 36x elsewhere. Their smallest router gaps are not smaller than others.
+- **A different expert set alone is harmless.** 734 of 739 other positions in one window differ in some layer with a median KL of 0.0002 to 0.0009 nats.
 
-The host recomputation of the eight selected experts agrees with the device's picks at all 184,320 pairs of position and layer, and two passes gave identical traces. A smaller error at the first attention layers should shorten this tail, because fewer layers would fall within reach of a swap; that follows from the figures above and was not measured.
+Host recomputation of the eight selected experts agrees with device picks at all 184,320 pairs of position and layer, and two passes gave identical traces. A smaller error at the first attention layers should shorten this tail by keeping more layers away from a swap. That follows from the figures above, though we did not measure it.
 
 ## Reading
 
-1. **Like against like, the engines are as far from each other as each engine is from itself under a numerical change.** The int8 cache against llama.cpp's q8_0 cache: 0.0345 and 0.0337 nats in the two directions, 96.8% agreement. The fp16 cache against its f16 cache: 0.0366 and 0.0351, 96.8%. llama.cpp against itself between two batching paths: 0.033 and 96.9%. The cache form does not move the distance: against llama.cpp's f16 cache the engine gives 0.0363 and 0.0364 with the int8 cache and 0.0366 and 0.0351 with the fp16 cache, differences far inside the intervals. A KL of this size does not say which of the two distributions is nearer to the model.
-2. **The true token's NLL is the one measure with a reference outside the two arms.** Against llama.cpp with both caches at 8 bits it is 0.009 nats higher for the engine, 0.009 with the engine's int8 cache against the f16 cache, and 0.011 with the fp16 cache against the f16 cache: 0.9% to 1.1% in perplexity. Without the 81, 69 and 78 outlier positions the difference is 0.0025, 0.0015 and 0.0009. The bootstrap intervals are +0.0004 to +0.0221, +0.0024 to +0.0162 and +0.0009 to +0.0240.
-3. **The int8 cache costs about what llama.cpp's q8_0 cache costs, in this harness.** Against its own fp16 cache the engine's int8 cache gives 0.038, llama.cpp's q8_0 cache 0.023 against its f16 cache. The medians (0.0008 and 0.0009) and the agreement rates (96.69% and 96.70%) are the same; the mean is 1.6 times larger because 0.50% of the positions lie above one nat against 0.41%. Neither cache form moves the NLL: −0.0019 for the engine, −0.0003 for llama.cpp, both intervals across zero.
-4. **Figures of this kind compare only inside one harness.** An independent measurement of llama.cpp's q8_0 cache on this model (top-40 log-probabilities, BF16 weights, about 250,000 tokens in six categories) gives 0.039, and 0.024 for the dense Qwen3.6 27B ([localbench, 2026-04-24](https://localbench.substack.com/p/kv-cache-quantization-benchmark)). The 0.023 here is of that size; a figure of one order lower would need a corpus without its outlier positions.
-5. **The two 8-bit caches are one quantization scheme.** The engine's `Int8G32` cache and llama.cpp's q8_0 cache both store 32 signed 8-bit codes with one fp16 scale, both take the scale as the largest absolute value of the 32 divided by 127, and both take each code as the nearest integer to the value over the scale (`engine/src/kernels/cuda/native/resident/kv8_append.cu`, `quant_scale` and `quant_code`; llama.cpp `acecd5603`, `ggml/src/ggml-cuda/cpy-utils.cuh`, `quantize_f32_q8_0_block`). Three details differ. llama.cpp multiplies by the reciprocal of the fp32 scale and stores the fp16 one; the engine divides by the fp16 scale it stores. llama.cpp rounds ties away from zero; the engine rounds them to even and clamps to ±127. The scale error that the first difference leaves in a reconstructed value is about one sixteenth of the code step. The 0.038 against 0.023 in point 3 is therefore not a difference between two 8-bit formats, and a q8_0 writer would give the engine the cache it has. The proposal to add one is closed.
+1. **Like against like, the engines are as far from each other as each engine is from itself under a numerical change.** Int8 vs llama.cpp q8_0: 0.0345 and 0.0337 nats, 96.8% agreement. Fp16 vs f16: 0.0366 and 0.0351, 96.8%. llama.cpp across batching paths: 0.033, 96.9%. Against llama.cpp's f16 cache, the engine gives 0.0363 and 0.0364 (int8) and 0.0366 and 0.0351 (fp16), within noise intervals. A KL of this size does not show which distribution is nearer to the model.
+2. **The true token's NLL is the one measure with an external reference.** Against llama.cpp, engine NLL is 0.009 nats higher (8-bit vs 8-bit and 8-bit vs f16) and 0.011 nats higher (fp16 vs f16), or 0.9% to 1.1% in perplexity. Without outliers, differences drop to 0.0025, 0.0015, and 0.0009. Bootstrap intervals are +0.0004 to +0.0221, +0.0024 to +0.0162, and +0.0009 to +0.0240.
+3. **The int8 cache costs about what llama.cpp's q8_0 cache costs, in this harness.** Against its fp16 cache, engine int8 gives 0.038, and llama.cpp q8_0 gives 0.023. Medians (0.0008 and 0.0009) and agreement rates (96.69% and 96.70%) match. The mean is 1.6x larger because 0.50% of positions exceed one nat vs 0.41%. Neither cache moves NLL (−0.0019 engine, −0.0003 llama.cpp, both crossing zero).
+4. **Figures of this kind compare only inside one harness.** An independent measurement of llama.cpp's q8_0 cache (top-40 log-probabilities, BF16 weights, ~250,000 tokens in six categories) gives 0.039, and 0.024 for dense Qwen3.6 27B ([localbench, 2026-04-24](https://localbench.substack.com/p/kv-cache-quantization-benchmark)). Our 0.023 matches that scale. A figure one order lower would need a corpus without outliers.
+5. **The two 8-bit caches are one quantization scheme.** Engine `Int8G32` and llama.cpp `q8_0` both store 32 signed 8-bit codes with one fp16 scale (`max(abs) / 127`) and round values to nearest integer (`kv8_append.cu` vs `cpy-utils.cuh`). Three details differ: llama.cpp multiplies by reciprocal fp32 scale and rounds ties away from zero, while the engine divides by fp16 scale and rounds ties to even (clamping to ±127). The scale difference leaves ~1/16 code step. Thus the 0.038 vs 0.023 difference in point 3 is not a format difference, and a q8_0 writer would match the existing cache. The proposal to add one is closed.
 
 ## Limits
 
-- Neither engine was scored against full-precision weights: only the Q4_K_M file was on the host. Every figure is a difference between two runs of the same quantized weights.
-- The engine arms run the leg's plain step: the prefix through the chunked prefill path, then one decode step per position. Graph capture, prefix reuse, the pooled start's on-demand KV, and contexts beyond 32,768 of the profile's 180,224 were not exercised.
-- Twelve documents and 9,216 positions: the KL intervals are about twice their means wide, and three of the six NLL intervals cross zero.
-- Throughput was not measured.
-- The two 8-bit cache formats were compared by reading the two quantizers, not by running them on the same tensors.
-- The outlier positions were traced in three of the twelve windows, without a 32-bit reference: how the fp16 cache itself departs from exact arithmetic at those positions is not known.
+- We did not score either engine against full-precision weights because only the Q4_K_M file was on the host. Every figure compares two runs of the same quantized weights.
+- The engine arms run the leg's plain step: prefix through chunked prefill, then one decode step per position. We did not exercise graph capture, prefix reuse, on-demand KV, or contexts beyond 32,768.
+- Twelve documents and 9,216 positions: KL intervals are about twice their means wide, and three of six NLL intervals cross zero.
+- We did not measure throughput.
+- We compared the two 8-bit cache formats by reading the two quantizers, not by running them on the same tensors.
+- We traced outlier positions in three of twelve windows without a 32-bit reference, so we do not know how the fp16 cache departs from exact arithmetic there.

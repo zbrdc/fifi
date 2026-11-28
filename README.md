@@ -14,7 +14,7 @@ calls.
 
 Read the [getting-started guide](doc/getting-started.md) to build fifi and run
 the server. With a build in hand, `enginesrv serve --model <path or name>`
-starts a model without a config file; see
+starts a model without a config file. See
 [Serve a model without a config file](doc/how-to/serve-a-model.md). To connect
 an application, see [Connect a client](doc/how-to/clients.md).
 
@@ -24,8 +24,8 @@ fifi runs supported checkpoints downloaded from Hugging Face: GGUF files on
 CUDA, MLX packs on Apple Silicon, and NVFP4 safetensors for Nemotron and
 Inkling. Download the files to local storage before loading them.
 
-Support depends on the model architecture, checkpoint, tokenizer, and backend;
-not every model or quantization in these formats is supported. See the
+Support depends on the model architecture, checkpoint, tokenizer, and backend.
+Not every model or quantization in these formats works. See the
 [model reference](doc/reference/models.md) for checkpoint sources and context
 limits, and the [current status](doc/explanation/status.md) for qualification
 and known limitations.
@@ -83,7 +83,7 @@ revision, and steps to reproduce it. A reviewed
 git clone https://github.com/zbrdc/fifi.git
 ```
 
-The server executable is named `enginesrv`. The Rust crate is named
+The server executable name is `enginesrv`. The Rust crate name is
 `inference-engine`.
 
 ## Thanks to
@@ -101,5 +101,5 @@ The server executable is named `enginesrv`. The Rust crate is named
 
 ## License
 
-fifi is distributed under the [Apache License 2.0](LICENSE). See
+fifi uses the [Apache License 2.0](LICENSE). See
 [third-party notices](THIRD_PARTY_NOTICES.md) for third-party code and licenses.

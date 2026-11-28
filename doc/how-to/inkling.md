@@ -10,7 +10,7 @@ hf download thinkingmachines/Inkling-2-Mini \
   --local-dir ~/models/inkling2-mini
 ```
 
-From the engine directory, build the native MLX server and start it with a short context. Set `ENGINESRV_API_KEY` to your local server credential before launch.
+From the engine directory, build the native MLX server and start it with a short context. Set `ENGINESRV_API_KEY` to your local server key before you start it.
 
 ```sh
 cargo build --release --locked --features native-mlx --bin enginesrv
@@ -24,7 +24,7 @@ With a Metal recommendation of at most 16 GiB, Inkling defaults to a 5 GiB worki
 
 For chat requests, disabling thinking sets the publisher's reasoning effort to 0.0. Inkling can still emit reasoning, so a short output limit can be reached before the first answer token. The server returns reasoning and answer text in their respective fields. [Publisher guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md#thinking-effort-set-it-everywhere)
 
-The GGUF inspector and both experimental text backends read the mainline `inkling2_loop` layout, which the Unsloth repository root and fine-tunes in that layout use, and the older `inkling2` layout from the Unsloth `Old_Support/` folder. Both experimental text adapters need the pinned publisher tokenizer. Use a directory containing one text GGUF or pass the selected model file, including files with a `.gguf_file` suffix.
+The GGUF inspector and both experimental text backends read the mainline `inkling2_loop` layout and the older `inkling2` layout. Unsloth uses `inkling2_loop` at the repository root and `inkling2` in `Old_Support/`. Both experimental text adapters need the pinned publisher tokenizer. Use a directory containing one text GGUF or pass the selected model file, including files with a `.gguf_file` suffix.
 
 The GGUF adapters advance prompt tokens serially and can group expert projections within each visit. The safetensors worker can group multiple prompt tokens per visit.
 
@@ -33,7 +33,7 @@ target/release/enginesrv serve --model /path/to/Inkling-2-Mini-IQ2_XXS.gguf \
   --tokenizer-dir ~/models/inkling2-mini --context 192 --listen 127.0.0.1:18795
 ```
 
-Native MLX builds on Apple Silicon use up to four attention projection workers for both formats. GGUF also uses mapped dense weights, direct packed Metal kernels where supported, grouped expert projections, and single-copy expert retention where all projections support direct packed kernels. Set `FIFI_INKLING_ATTN_CPU_WORKERS=1` to use one worker, or set the corresponding `FIFI_INKLING_GGUF_*` setting to `0` for a comparison. `FIFI_INKLING2_MINI_MLX=0` disables the native family. `FIFI_INKLING2_MINI_GGUF_MLX=0` disables GGUF serving.
+Native MLX builds on Apple Silicon use up to four attention projection workers for both formats. GGUF also uses mapped dense weights, direct packed Metal kernels where supported, and grouped expert projections. Where all projections support direct packed kernels, it retains one copy of each expert. Set `FIFI_INKLING_ATTN_CPU_WORKERS=1` to use one worker, or set the corresponding `FIFI_INKLING_GGUF_*` setting to `0` for a comparison. `FIFI_INKLING2_MINI_MLX=0` disables the native family. `FIFI_INKLING2_MINI_GGUF_MLX=0` disables GGUF serving.
 
 | Artifact | Inspect | Load and generate | HTTP |
 | --- | --- | --- | --- |
@@ -41,7 +41,7 @@ Native MLX builds on Apple Silicon use up to four attention projection workers f
 | Mainline `inkling2_loop` GGUF | Yes | Real IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat |
 | Repository-root `inkling2` GGUF | Yes | Real IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat |
 
-`enginesrv check` and `serve --print-config` select the native Inkling family for both GGUF layouts and for the publisher safetensors under the 6 GiB ceiling. The vision projector (`clip` metadata) and the DSpark drafter (`dflash` metadata) are inspected only; neither runs on this path.
+`enginesrv check` and `serve --print-config` select the native Inkling family for both GGUF layouts and for the publisher safetensors under the 6 GiB ceiling. They inspect the vision projector (`clip` metadata) and the DSpark drafter (`dflash` metadata) only. Neither runs on this path.
 
 ## Check the serving contract
 
@@ -64,7 +64,7 @@ Use a dedicated server on loopback with the original checkpoint and the verified
 }
 ```
 
-Launch it with `enginesrv --config /path/to/config.json`. To exercise the WebGUI, set `web_dir` at the top level to the built WebGUI directory. Open the loopback address in a browser, select Inkling in the model picker, and send “Name the capital of France. Answer in one word.” For a follow-up, send “Which country is that city in? Answer in one word.” The measured browser run displayed “Paris” and “France” using a 192-token context and a 144-token output limit. Run the suite from the repository root once the model is ready. Python 3.9 or later is sufficient.
+Start it with `enginesrv --config /path/to/config.json`. To exercise the WebGUI, set `web_dir` at the top level to the built WebGUI directory. Open the loopback address in a browser, select Inkling in the model picker, and send “Name the capital of France. Answer in one word.” For a follow-up, send “Which country is that city in? Answer in one word.” The measured browser run printed “Paris” and “France” using a 192-token context and a 144-token output limit. Run the suite from the repository root once the model is ready. Python 3.9 or later is sufficient.
 
 ```sh
 python3 -B engine/tests/tools/check_inkling_serving.py \
@@ -72,7 +72,7 @@ python3 -B engine/tests/tools/check_inkling_serving.py \
   --report /path/to/scratch/inkling-serving-evidence.json
 ```
 
-To verify raw text generation on the running server, send the same greedy three-token request used by the suite.
+To check raw text generation on the running server, send the same greedy three-token request used by the suite.
 
 ```sh
 curl --fail-with-body --silent --show-error http://127.0.0.1:18795/v1/completions \
@@ -83,7 +83,7 @@ curl --fail-with-body --silent --show-error http://127.0.0.1:18795/v1/completion
 
 The verified response has a `choices[0].text` value of `" Paris.\n\n"`, a `length` finish reason, five prompt tokens, and three completion tokens.
 
-The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID and its inclusion in completion usage, explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
+The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID, and its inclusion in completion usage. It also checks explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
 
 ## Reproduce a first and repeat benchmark
 
@@ -96,9 +96,9 @@ FIFI_INKLING_PREFILL_ROWS=1 FIFI_INKLING_ATTN_CPU_WORKERS=1 \
   --output-dir /path/to/scratch/inkling-5g --ceiling-mib 5120 --max-tokens 12
 ```
 
-The driver starts one server on an OS-assigned loopback port, sends two identical greedy requests, and checks that both reach the requested output limit. It writes the server config, startup and phase log, and a JSON receipt with wall time, request timings, process-attributed disk bytes, and system swap-page deltas on macOS. Existing Inkling environment settings carry through to the server. Use `--ceiling-mib auto` to remove a configured ceiling, `--tokenizer-dir` for a separate pinned bundle, and `--commit`, `--build`, and `--checkpoint-id` to record artifact provenance. The OS page cache is uncontrolled across runs.
+The driver starts one server on an OS-assigned loopback port, sends two identical greedy requests, and checks that both reach the requested output limit. It writes the server config, startup and phase log, and a JSON receipt. The receipt records wall time, request timings, process-attributed disk bytes, and system swap-page deltas on macOS. Existing Inkling environment settings carry through to the server. Use `--ceiling-mib auto` to remove a configured ceiling, `--tokenizer-dir` for a separate pinned bundle, and `--commit`, `--build`, and `--checkpoint-id` to record artifact provenance. Runs do not control the OS page cache.
 
-Use these prompt values with `--prompt` and keep the context at 128 for the reported safetensors comparisons. The driver validates the prompt length and both output counts. Run each arm in a fresh process and use a new output directory.
+Use these prompt values with `--prompt` and keep the context at 128 for the reported safetensors comparisons. The driver checks the prompt length and both output counts. Run each arm in a fresh process and use a new output directory.
 
 | Workload | Prompt as a Python string expression | Prompt tokens | `--max-tokens` |
 | --- | --- | ---: | ---: |
@@ -122,7 +122,7 @@ same checkpoint and working-set budget.
 
 For GGUF, the same timing output reports `gguf_file_read_bytes`,
 `gguf_unique_file_read_bytes`, and `gguf_metal_staged_bytes`. The first two
-show total file demand and one copy per distinct expert tensor plane in each
+report total file demand and one copy per distinct expert tensor plane in each
 phase. The last counts the packed or expanded weights staged for Metal,
 including weights served from the retained RAM tier. Use the benchmark's
 process-attributed disk counter to check physical SSD reads.
@@ -139,14 +139,7 @@ projections in 32-value groups using the shared CPU quantizer. This
 experiment requires AArch64 dot-product support. Both settings are
 default-off.
 
-On a 16 GiB M4 Mac mini, the server answered a five-token prompt with four output
-tokens using the mainline IQ2_XXS GGUF, a 192-token context, and the
-6 GiB working-set cap. With packed rows selected in both arms, the warm
-repeat reached a first token in 3.61 s with FP32 activations and 2.09 s
-with Q8 activations. Decode rose from 0.98 to 1.37 tok/s. The two runs
-returned identical text and recorded zero logical expert bytes, physical
-SSD bytes, and swap-outs on the repeats. Both arms passed the idle-host
-audit.
+On a 16 GiB M4 Mac mini, the server answered a five-token prompt with four output tokens. It used the mainline IQ2_XXS GGUF, a 192-token context, and a 6 GiB cap. With packed rows in both arms, the warm repeat hit its first token in 3.61 s (FP32 activations) and 2.09 s (Q8 activations). Decode rose from 0.98 to 1.37 tok/s. The two runs returned identical text and recorded zero logical expert bytes, physical SSD bytes, and swap-outs on the repeats. Both arms passed the idle-host audit.
 
 A separate comparison at five matched token positions measured mean
 KLD of 0.00107 nats against FP32 activations on the same GGUF. Four of the

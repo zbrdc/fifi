@@ -11,12 +11,12 @@ enginesrv config effective <path> [--json]
 ```
 
 - `doctor` — what this build can serve on this machine: compiled backends,
-  CUDA device and free VRAM, host RAM and threads. With `--config`, also
-  validates that file.
+  CUDA device and free VRAM, host RAM and threads. With `--config`, it also
+  checks that file.
 - `check` — a model directory or one `.gguf` file: compatibility verdict,
   the checks behind it, and a memory estimate where supported. An explicit
-  file excludes other weight files in the directory and takes its tokenizer
-  and geometry from its own header; a directory is read for side files only
+  file excludes other weight files in the directory. It takes its tokenizer
+  and geometry from its own header. A directory reads side files only
   when `--tokenizer-dir` names it. For Qwen3.6 CUDA, the weight check names the
   selected GGUF and the estimate uses its byte count. Exit 0 when servable.
 - `config effective` — the resolved configuration with the origin of every
@@ -29,30 +29,29 @@ enginesrv doctor --bundle fifi-bundle.json --config engine/config/qwen36-cuda-30
 ```
 
 This writes one JSON document you can attach to an issue. It works with no GPU,
-no model, and no running server — those facts are recorded as unavailable,
-never guessed. An existing file is never overwritten; the write is atomic
-(a `.part` sibling, then one rename).
+no model, and no running server. The bundle records those facts as unavailable
+and never guesses. The writer never overwrites an existing file. It writes a
+`.part` sibling, then renames it atomically.
 
 What is inside:
 
-- `fifi` — version and platform; `os` — the distribution's `PRETTY_NAME`.
+- `fifi` — version and platform. `os` — the distribution's `PRETTY_NAME`.
 - `hardware` — the same probe `doctor` runs, every value labeled
   `measured` or `unavailable`.
 - `engines` — for each configured engine: the preflight report `check`
   prints, and the effective settings rows `config effective` prints,
   each with its origin. A broken config or an unreadable model directory
-  degrades to an `unavailable` note for that engine; the rest of the
-  bundle is still written.
-- `manifest` — which sections were collected, unavailable, or not
-  requested.
+  degrades to an `unavailable` note for that engine. The writer still outputs
+  the rest of the bundle.
+- `manifest` — which sections the tool collected, marked unavailable, or did not
+  request.
 - `summary` — the same text the CLI prints.
 
-What is deliberately not inside: API keys or any environment values
-beyond the allowlisted `Q36_CACHE_LIMIT` the settings rows read, prompts
-or completions (no request data is an input), logs (no log source is
-read — attach yours separately), and model or tokenizer contents. Home
-directory paths become `~` everywhere, including paths quoted inside
-refusal messages. Loading stages exist only in a running server, so the
+The bundle omits API keys and all environment values except the allowlisted
+`Q36_CACHE_LIMIT` that the settings rows read. It omits prompts and completions
+(no request data enters), logs (attach yours separately), and model or tokenizer
+contents. Home directory paths become `~` everywhere, including paths quoted
+inside refusal messages. Loading stages exist only in a running server, so the
 bundle records that section as unavailable rather than inventing it.
 
 Inspect the file before sharing it:

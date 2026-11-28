@@ -6,19 +6,19 @@ Once this works, the same steps run a real model.
 ## What you need
 
 - Linux or macOS with a terminal.
-- `git`, `curl` and a C compiler. On macOS, run `xcode-select --install`; on Debian or Ubuntu, `sudo apt install build-essential`.
+- `git`, `curl` and a C compiler. On macOS, run `xcode-select --install`. On Debian or Ubuntu, run `sudo apt install build-essential`.
 - A few GB of free disk space for the build.
 
 ## 1. Install Rust
 
-fifi is written in Rust. Install the Rust toolchain with `rustup`:
+fifi uses Rust. Install the Rust toolchain with `rustup`:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 Accept the defaults, then open a new terminal so that `cargo` is on your `PATH`.
-The repository pins the exact Rust version it needs; `cargo` downloads it on first use.
+The repository pins the exact Rust version it needs. `cargo` downloads it on first use.
 
 ## 2. Get the source and build
 
@@ -53,7 +53,7 @@ Create `fifi.json` in the `engine` directory:
 
 - `listen` is the address of the server. It must be on this machine (`127.0.0.1` or `::1`).
 - `api_key_env` names the environment variable that holds the API key clients must send.
-- `engines` lists the models to serve. `fake` needs only a tokenizer; the repository ships a small one for tests.
+- `engines` lists the models to serve. `fake` needs only a tokenizer. The repository ships a small one for tests.
 
 ## 4. Start the server
 
@@ -85,7 +85,7 @@ curl http://127.0.0.1:18791/ready
 {"status":"ready"}
 ```
 
-`/ready` answers once at least one engine has loaded. It is one of the two routes that need no API key; the other is `/health`.
+`/ready` answers once at least one engine loads. It is one of the two routes that need no API key. The other route is `/health`.
 If every engine fails to load, the server exits with a non-zero code and prints the cause on standard error instead of waiting.
 
 ## 6. Send a chat request
@@ -111,12 +111,12 @@ The reply follows the OpenAI chat completions format:
 }
 ```
 
-`model` is the name clients use to pick an engine; it defaults to the family name.
+`model` is the name clients use to pick an engine. It defaults to the family name.
 Without the `Authorization` header, the server answers `401`.
 
 ## 7. Stream the reply
 
-Add `"stream": true` to receive the reply as it is generated:
+Add `"stream": true` to receive the reply as the server generates it:
 
 ```sh
 curl -N http://127.0.0.1:18791/v1/chat/completions \
@@ -159,8 +159,8 @@ Press `Ctrl+C` in the terminal where the server runs.
 
 ## What you did
 
-You built `enginesrv`, described an engine in a config file, protected the server with an API key, and talked to it through both the OpenAI-style and the Anthropic-style APIs.
-Every real model works the same way; only the engine entry and the build change.
+You built `enginesrv` and configured an engine. You protected the server with an API key. You sent requests through the OpenAI-style and Anthropic-style APIs.
+Every real model works the same way. Only the engine entry and the build change.
 
 ## Next steps
 

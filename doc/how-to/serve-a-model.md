@@ -11,13 +11,13 @@ The server listens on `127.0.0.1:18791` and reads the API key from `ENGINESRV_AP
 
 ## What `--model` accepts
 
-| Argument | What is served |
+| Argument | What the server loads |
 | --- | --- |
-| A directory | The checkpoint in it. The family comes from `config.json`, or from the GGUF file's `general.architecture` when there is no `config.json`. |
-| A `.gguf` file | That file. The tokenizer and the chat template are read from the file's header. |
-| A plain name, such as `qwen3.6` | The local model of that name. The stores are searched in this order: the models directory (`~/models`, or `FIFI_MODELS_DIR`), the Ollama store (`~/.ollama/models`, or `OLLAMA_MODELS`; a tag is written `name:tag`) and the Hugging Face hub cache. Several matches in one store are refused with their paths. |
-| `org/repo` or `org/repo:QUANT` | A GGUF repository of the Hugging Face hub. The files of one quantization are fetched into the hub cache and then served. Without `:QUANT` the start chooses the largest quantization that fits the card whole at the default context, otherwise the smallest. It prints the choice and the reason. |
-| Nothing | The most recently written local model that this build can serve. The start prints which one it took and which newer ones it passed over. |
+| A directory | The checkpoint in it. The family comes from `config.json`, or from the GGUF file's `general.architecture` when `config.json` is absent. |
+| A `.gguf` file | That file. The server reads the tokenizer and the chat template from the file's header. |
+| A plain name, such as `qwen3.6` | The local model of that name. Search order: the models directory (`~/models`, or `FIFI_MODELS_DIR`), the Ollama store (`~/.ollama/models`, or `OLLAMA_MODELS`, where a tag uses `name:tag`), and the Hugging Face hub cache. The server refuses multiple matches in one store and prints their paths. |
+| `org/repo` or `org/repo:QUANT` | A GGUF repository of the Hugging Face hub. The server downloads one quantization into the hub cache and serves it. Without `:QUANT`, it picks the largest quantization that fits the card at the default context, otherwise the smallest. It prints the choice and the reason. |
+| Nothing | The most recent local model that this build can serve. The command prints which model it picked and which newer ones it skipped. |
 
 A bare GGUF file selects its family from its architecture: `qwen35moe` is Qwen3.6, `gemma4` is Bolt E4B and `raon1` is Raon-1-mini. SenseNova-Loop needs `--family sensenova`. See [Models](../reference/models.md) for what each family serves on.
 
@@ -36,7 +36,7 @@ To change anything else, print the configuration with `--print-config`, edit it,
 
 ## Downloads
 
-A fetch by `org/repo` uses the Hugging Face hub cache, so other tools that read that cache find the files too.
+A download by `org/repo` uses the Hugging Face hub cache, so other tools that read that cache find the files too.
 
 | Variable | Meaning |
 | --- | --- |

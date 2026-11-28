@@ -5,7 +5,7 @@ If you have not built fifi before, do the [tutorial](../getting-started.md) firs
 
 ## On a Mac
 
-The resident profile below uses Apple Silicon with at least 36 GB of memory. The experimental disk-backed profile served the same checkpoint on a 16 GB M4 mini with a 4,096-token context. [Streamed profile and measurements](../explanation/mlx-device-scaling.md#full-qwen36-checkpoint-on-the-m4-mini)
+The resident profile below uses Apple Silicon with at least 36 GB of memory. The experimental disk-backed profile served the same checkpoint on a 16 GB M4 mini with a 4,096-token context.
 
 The Mac build also needs the following.
 
@@ -53,7 +53,7 @@ You need Linux with an NVIDIA driver, and:
    hf download ggml-org/Qwen3.6-35B-A3B-GGUF Qwen3.6-35B-A3B-Q4_K_M.gguf --local-dir ~/models/qwen3.6
    ```
 
-2. Download the tokenizer files. fifi checks them against fixed hashes; these copies match:
+2. Download the tokenizer files. fifi checks them against fixed hashes. These copies match:
 
    ```sh
    hf download mlx-community/Qwen3.6-35B-A3B-4bit \
@@ -76,10 +76,10 @@ You need Linux with an NVIDIA driver, and:
    | --- | ---: | --- |
    | `qwen36-cuda-3090-kv8-prefix.json` | 180,224 | Default. Other programs use up to 1.5 GiB of GPU memory. |
    | `qwen36-cuda-3090-kv8-prefix-131k.json` | 131,072 | You want the fastest first reply on long prompts. |
-   | `qwen36-cuda-3090-kv8-prefix-262k.json` | 262,144 | You need the longest context and other programs use under 744 MiB of GPU memory. That means a headless card: a desktop session alone usually uses more, so use the 180,224 default there. |
+   | `qwen36-cuda-3090-kv8-prefix-262k.json` | 262,144 | You need the longest context and other programs use under 744 MiB of GPU memory. Use a headless card, because a desktop session alone usually uses more. |
    | `qwen36-rtx3090-24gb-fp16kv.json` | 98,304 | You want a 16-bit KV cache. |
 
-   The int8 cache of the kv8 profiles and the 16-bit cache of the fp16 profile were scored against each other and against llama.cpp, like against like, on 2026-11-25 and 2026-11-26: [the measured difference](../explanation/kld-vs-llamacpp.md).
+   On 2026-11-25 and 2026-11-26, we compared the int8 cache of the kv8 profiles against the 16-bit cache and llama.cpp: [the measured difference](../explanation/kld-vs-llamacpp.md).
 
    Check current GPU use with `nvidia-smi`. A desktop session alone often uses several hundred MiB.
 
@@ -98,8 +98,8 @@ A server process runs one Qwen3.6 CUDA engine.
 
 ## Keep long conversations fast
 
-All shipped CUDA profiles set `"prefix_reuse": true`: when a conversation continues, only the new messages are processed.
-The Mac profile sets `"prefix_reuse": false` explicitly: the Qwen3.6 MLX arm is not qualified for reuse (an omitted key already defaults to off for it, and the explicit value pins that). To turn it on there, set `"prefix_reuse": true` at the top level and raise `session_cap_bytes` in the `qwen36` object to at least `5770117120`; startup refuses a smaller cap.
+All shipped CUDA profiles set `"prefix_reuse": true`. When a conversation continues, the server processes only the new messages.
+The Mac profile sets `"prefix_reuse": false`. The Qwen3.6 MLX arm is not qualified for reuse. An omitted key already defaults to off for it, and the explicit value pins that. To turn it on there, set `"prefix_reuse": true` at the top level and raise `session_cap_bytes` in `qwen36` to at least `5770117120`. Startup refuses a smaller cap.
 [How conversation reuse works](../explanation/prefix-reuse.md) explains the memory this takes.
 
 ## If the engine does not load
@@ -108,8 +108,8 @@ The server starts listening before the model loads.
 If every engine fails to load, the server stops by itself within a second or so.
 The process exits with a non-zero code and prints the cause on standard error.
 Standard error carries two lines: `engine q36 failed: ...` from the engine thread when the load fails, and `enginesrv: engine q36 ended in state error: ...` from the main program as it exits.
-Scripts that wait for `/ready` should also watch the process: it is gone when loading failed.
-With more than one engine, the server keeps running while at least one engine is ready or busy; `/ready` stays `200`, and `/v1/models` shows the failed engine with its error.
+Scripts that wait for `/ready` should also watch the process: it exits when loading fails.
+With more than one engine, the server keeps running while at least one engine is ready or busy. `/ready` stays `200`, and `/v1/models` shows the failed engine with its error.
 
 | Log message mentions | Cause | Fix |
 | --- | --- | --- |

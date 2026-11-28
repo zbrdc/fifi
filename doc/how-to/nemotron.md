@@ -10,7 +10,7 @@ If you have not built fifi before, follow the [tutorial](../getting-started.md) 
 
 You need Linux with the CUDA 12 toolkit and about 76 GB of free disk space.
 
-1. Download the checkpoint at the revision fifi is tested with:
+1. Download the checkpoint at the tested revision:
 
    ```sh
    hf download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 \
@@ -48,8 +48,8 @@ You need Linux with the CUDA 12 toolkit and about 76 GB of free disk space.
    }
    ```
 
-   The three `nemotron` keys besides `cache_entries` are required; the values are an example, not a tuned profile.
-   `cache_entries` is the number of expert weight tensors kept decoded in host memory; admission charges each entry as the largest entry's payload bytes plus the loader's per-entry index, 96 bytes per entry on 64-bit targets. Omit the key and the loader fits the count from 850 permille of the measured host budget (the cgroup-aware figure on Linux) minus the fixed serving charges; a remainder below one entry refuses the load rather than starting with an empty cache, and one log line states the chosen count. An explicit number is honoured verbatim: a card too small for it refuses the load - omit the key, because only the fit trims the 12 GiB device request down to what the card holds.
+   The three `nemotron` keys besides `cache_entries` are required. The values are an example, not a tuned profile.
+   `cache_entries` sets how many expert weight tensors stay decoded in host memory. Admission charges each entry as the largest entry's payload bytes plus the loader's per-entry index (96 bytes on 64-bit targets). If you omit the key, the loader fits the count from 850 permille of the measured host budget minus fixed serving charges. On Linux, this budget is cgroup-aware. A remainder below one entry refuses the load instead of starting with an empty cache. One log line states the chosen count. The loader uses an explicit number verbatim, and a small card refuses the load. Omit the key when you want the fit to trim the 12 GiB device request to what the card holds.
 
 4. Start the server and wait for `/ready`:
 
@@ -58,7 +58,7 @@ You need Linux with the CUDA 12 toolkit and about 76 GB of free disk space.
    target/release/enginesrv --config nemotron.json
    ```
 
-   Startup checks host and GPU memory and refuses the load if either is short; the log names the part that does not fit. On CUDA the optional device weight cache requests 12 GiB; when the cache count is fitted rather than explicit, the admission trims that request to what the measured card holds free after the required device charge.
+   Startup checks host and GPU memory and refuses the load if either is short. The log names the part that does not fit. On CUDA, the optional device weight cache requests 12 GiB. When the loader fits the cache count, admission trims that request to what the card holds free.
 
 5. Send requests with `"temperature": 0`:
 
@@ -91,9 +91,9 @@ The 16 GB M4 mini has four performance cores and six efficiency cores. The pool 
 | 8 | 27.46 ms | 37.26 ms |
 | 10 | 25.93 ms | 38.79 ms |
 
-The fresh six-thread trial took 169.78 ms for its first call and 127.59 ms at p50 over 11 subsequent calls. The trial attributed 710.5 MB of SSD reads and 45,090 page-ins to its process. Four threads gave the lowest warm median in this single-layer scalar study. These measurements cover one routed layer and the tested mix of selected experts. [Sample times and I/O measurements](../../scripts/benchmarks/mac-m4-nemotron35-cpu-layer.csv)
+The fresh six-thread trial took 169.78 ms for its first call and 127.59 ms at p50 over 11 subsequent calls. The trial attributed 710.5 MB of SSD reads and 45,090 page-ins to its process. Four threads gave the lowest warm median in this single-layer scalar study. These measurements cover one routed layer and the tested mix of selected experts.
 
-Build the ignored test on Apple Silicon, then run its separate processes with the driver below. Use the process I/O counter from the [Mac staging study](../explanation/mac-flint-expert-pipeline.md#reproduce). The test prints the runner path after compilation.
+Build the ignored test on Apple Silicon, then run its separate processes with the driver below. The test prints the runner path after compilation.
 
 ```sh
 cd engine
@@ -107,7 +107,7 @@ python3 scripts/mac_cache_study/nemotron35_cpu_profile.py \
 
 `FIFI_NEM35_CPU_NEON=1` selects a vector dot product for the mapped CPU expert pool on Apple Silicon. It decodes the E2M1 nibbles with a NEON table lookup and accumulates F32 products in four lanes. The existing scalar path remains the default. The numerical suite checks short and production-width matrices, multi-row batches, refusal cases, and reproducibility across thread counts.
 
-The paired run on the same layer 1 shard alternated scalar and NEON with each thread count, using 31 timed calls in each of 12 arms. The Flash-Next transfer was paused for this measurement. The table compares paired medians within this run.
+The paired run on the same layer 1 shard alternated scalar and NEON with each thread count. Each of the 12 arms ran 31 timed calls. We paused the Flash-Next transfer for this measurement. The table compares paired medians within this run.
 
 | Threads | Scalar p50 | NEON p50 | Scalar p90 | NEON p90 |
 | ---: | ---: | ---: | ---: | ---: |

@@ -25,7 +25,7 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-Add `stream=True` to receive the reply as it is generated.
+Add `stream=True` to receive the reply as the server generates it.
 
 Tools that use the OpenAI SDK usually read `OPENAI_BASE_URL` and `OPENAI_API_KEY`:
 
@@ -71,9 +71,9 @@ Send tools in the usual format of each API. The model decides when to call them.
 When several engines serve the same model name, the server uses the first one in the config.
 To pick one by its `id`, add `"x-engine": "q36"` to the request body (in `extra_body` with the OpenAI SDK).
 
-## What is not supported
+## What the server does not support
 
-- `response_format` of `json_object` or `json_schema` returns `400`; the server has no constrained decoding.
-- `x-session` returns `404`; the server keeps no named sessions.
+- `response_format` of `json_object` or `json_schema` returns `400`. The server has no constrained decoding.
+- `x-session` returns `404`. The server keeps no named sessions.
 
 See the [HTTP API reference](../reference/http-api.md) for every field.

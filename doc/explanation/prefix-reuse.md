@@ -3,36 +3,36 @@
 Chat clients send the whole conversation with every request.
 Without reuse, the engine processes every token of that history again on each turn, so replies take longer to start as the conversation grows.
 
-With `"prefix_reuse": true` in the configuration file, the engine saves its state at the end of each finished turn. An omitted key resolves per family at startup: on for the qualified reuse paths (Flash-Next CUDA, Qwen3.6 CUDA and the Gemma 4 family on its CUDA serve, Bolt, on the CUDA build), off for every other family - the boundary marking alone would only split their prefill and change their outputs. On Bolt the engine also checks the host at start and at every save; see [Bolt](memory.md#bolt).
+With `"prefix_reuse": true` in the configuration file, the engine saves its state after each finished turn. An omitted key resolves per family at startup: on for qualified reuse paths (Flash-Next CUDA, Qwen3.6 CUDA, and Bolt on CUDA), off for others. Marking boundaries alone would only split prefill and change outputs. On Bolt, the engine also checks host memory at startup and before every save. See [Bolt](memory.md#bolt).
 When the next request starts with the same tokens, the engine restores that state and processes only the new part.
-On a long conversation this turns tens of seconds of prompt processing into a few seconds.
+On a long conversation, this cuts prompt processing from tens of seconds to a few seconds.
 
 ## Matching the prompt
 
-Reuse needs the new prompt to start with exactly the tokens the engine saw.
+Reuse needs the new prompt to start with the exact tokens the engine saw.
 Three settings help with that:
 
-- **Warm turns** (`ENGINESRV_WARM_TURNS`, on by default). The server remembers the token sequence of the last conversation, so the next turn only tokenizes its new messages. A request from another conversation replaces that memory; the seeded slot is kept for an identical retry (`ENGINESRV_SEED_RESENDS`, on by default; any set value other than `1`, `true` or `on` disables it), and only with that switch also on, a per-engine `ENGINESRV_RESEND_EXTRA_BYTES` budget above zero additionally retains one displaced conversation's completed result — the budget alone retains nothing.
-- **Block saves** (`ENGINESRV_PREFIX_BLOCK_MATCH`, on by default). Besides the end of each turn, the engine saves one block checkpoint, cut at a 4,096-token boundary just before the end of the prompt. On Qwen3.6 with CUDA each conversation keeps its own block checkpoint: a later cut of the same conversation replaces its earlier one, and the checkpoints of other conversations stay until the store's entry limit evicts the least recently used. Other engines keep one block checkpoint per numeric path. The checkpoint lands up to 4,096 tokens before the turn's own checkpoint, and block saves need a store that keeps at least two saved prefixes. When a client rewrites the end of the conversation, the engine restores the block checkpoint before the change instead of starting over. In one measurement, a 174,829-token prompt whose last 23 tokens changed reached its first token in 11.8 s with block saves and 40.7 s without.
-- **Reasoning replay** (`ENGINESRV_THINK_REPLAY`, on by default for Qwen3.6). Clients resend the model's earlier reasoning. fifi passes it to the chat template, which keeps the reasoning of turns in the current tool-calling loop. A system message inside that loop is rendered as a tool response (`ENGINESRV_NOTICE_TOOLWRAP`), so the template does not treat it as a new user turn and drop the loop's reasoning.
+- **Warm turns** (`ENGINESRV_WARM_TURNS`, on by default). The server remembers the last conversation's token sequence, so the next turn tokenizes only new messages. A request from another conversation replaces that memory. The seeded slot stays for an identical retry (`ENGINESRV_SEED_RESENDS`, on by default). Any value other than `1`, `true`, or `on` disables it. With that switch on, `ENGINESRV_RESEND_EXTRA_BYTES` above zero retains one displaced conversation's result. The budget alone retains nothing.
+- **Block saves** (`ENGINESRV_PREFIX_BLOCK_MATCH`, on by default). Beside the turn end, the engine saves one block checkpoint at a 4,096-token boundary just before the prompt end. On Qwen3.6 CUDA, each conversation keeps its own block checkpoint, and later cuts replace earlier ones until the store evicts the least recently used. Other engines keep one block checkpoint per numeric path. Block saves require a store that holds at least two saved prefixes. When a client edits the end of a conversation, the engine restores the block checkpoint before the edit. On a 174,829-token prompt whose last 23 tokens changed, first-token time dropped from 40.7 s to 11.8 s.
+- **Reasoning replay** (`ENGINESRV_THINK_REPLAY`, on by default for Qwen3.6). Clients resend earlier model reasoning. fifi passes it to the chat template, keeping reasoning in the current tool-calling loop. `ENGINESRV_NOTICE_TOOLWRAP` renders a system message inside that loop as a tool response so the template preserves earlier reasoning.
 
 ## Where saved prefixes live
 
 On Apple Silicon, saved prefixes share `session_cap_bytes` with the live session. The store keeps the 6 most recently used prefixes (`prefix_store_entries`).
 
-On NVIDIA CUDA, the newest saved prefix stays on the GPU until a later request overwrites it, so restoring it needs no copy from host memory.
-Up to eight saved prefixes are also kept in pinned host memory; see [How fifi plans memory](memory.md#on-nvidia-cuda).
-With the disk cache (see the [configuration reference](../reference/configuration.md#prefix-cache-on-disk-cuda)), Qwen3.6 on CUDA also keeps saved prefixes in a directory, but only when pinned memory is not enough: entries about to be evicted are written in the background, and a graceful stop writes the tips that exist only in memory. A prompt that pinned memory cannot serve is looked up there before it is processed again, so a restart or an eviction from pinned memory costs one verified read of the saved state instead of the whole prompt. The files hold the conversations' exact tokens and model state, so the cache is a privacy decision: it can be turned off, and it serves GGUF loads only.
+On NVIDIA CUDA, the newest saved prefix stays on the GPU until a later request overwrites it, so restoring it needs no host copy.
+The engine keeps up to eight saved prefixes in pinned host memory. See [How fifi plans memory](memory.md#on-nvidia-cuda).
+With the disk cache ([configuration reference](../reference/configuration.md#prefix-cache-on-disk-cuda)), Qwen3.6 CUDA also writes prefixes to a directory when pinned memory fills. Background threads write evicting entries, and graceful stops flush memory-only tips. On a pinned-memory miss, the engine checks disk before reprocessing the prompt, trading full prefill for one verified disk read. Because files hold exact tokens and model state, the disk cache is a privacy choice, supports disablement, and serves GGUF loads only.
 
 ## Which engines support it
 
 | Model and backend | Prefix reuse |
 | --- | --- |
-| Qwen3.6, Apple Silicon | yes; off in the shipped Mac file |
-| Qwen3.6, CUDA | yes; on in all shipped CUDA files |
-| Bolt (Gemma 4 family), CUDA | yes; on by default, saved prefixes are host copies, funded from the free host memory |
+| Qwen3.6, Apple Silicon | yes. Off in the shipped Mac file |
+| Qwen3.6, CUDA | yes. On in all shipped CUDA files |
+| Bolt (Gemma 4 family), CUDA | yes. On by default. Saved prefixes are host copies funded from free host memory |
 | Flint, Apple Silicon | experimental: also set `FIFI_FLINT_PREFIX_REUSE=1` |
-| Flint, CUDA | experimental: also set `FIFI_FLINT_PREFIX_REUSE=1`; `kv_profile` `f16` only |
+| Flint, CUDA | experimental: also set `FIFI_FLINT_PREFIX_REUSE=1`. `kv_profile` `f16` only |
 
 ## Seeing it work
 
