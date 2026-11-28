@@ -810,6 +810,7 @@ fn ring_head(format: RelativeKvFormat, head: &[f32]) -> Vec<u8> {
 fn ring_bytes(format: RelativeKvFormat, rows: &[f32]) -> Vec<u8> {
     rows.as_chunks::<HEAD_DIM>()
         .0
+        .iter()
         .flat_map(|head| ring_head(format, head))
         .collect()
 }
