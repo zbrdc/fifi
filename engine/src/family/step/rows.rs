@@ -453,7 +453,13 @@ impl<'a> StepIo<'a> {
         rows: usize,
         cols: usize,
     ) -> Result<(), EngError> {
-        if !self.exact && n > FEW_ROWS {
+        if !self.exact
+            && n > FEW_ROWS
+            && n <= 65536
+            && rows <= 1_048_576
+            && cols <= 65536
+            && w.offset().is_multiple_of(4)
+        {
             return self.run(BlockOp::f16_gemm(
                 n,
                 rows,

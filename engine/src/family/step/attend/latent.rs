@@ -9,12 +9,13 @@
 //! before the output projection.
 //!
 //! The score has three forms over the same cache and the same partials. A chunk of 2..=[`FEW_ROWS`]
-//! rows and every call under the exact switch score a row at a time with f32 queries, so those
-//! rows keep the bits of a pure-f32 step. A single non-exact row scores up to 64 heads together
-//! per block on tensor cores (sharing every KV tile load across heads and reading the position
-//! from `StepParams` when graph-captured). A larger chunk scores all heads of 8 rows against a
-//! key tile as one matrix product on tensor cores, its queries rounded to f16 like the cached
-//! rows; a prompt at depth then costs a fraction of the row form.
+//! rows and every call under the exact switch score a row at a time with f32 queries (and run
+//! scalar f32 absorb/project), so those rows keep the bits of a pure-f32 step. A single non-exact
+//! row scores up to 64 heads together per block on tensor cores (sharing every KV tile load across
+//! heads and reading the position from `StepParams` when graph-captured). A larger non-exact chunk
+//! runs absorb and project on tf32 tensor cores and scores all heads of 8 rows against a key tile
+//! as one matrix product on f16 tensor cores; a prompt at depth then costs a fraction of the row
+//! form.
 
 use super::super::rows::{FEW_ROWS, Rows, StepIo};
 use crate::EngError;

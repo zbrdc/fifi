@@ -140,14 +140,15 @@ __global__ void __launch_bounds__(256) f16_gemm_fallback_kernel(const float *__r
                                                                 int rows, int cols) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int r = (int)blockIdx.x * 8 + warp;
-    const int t = (int)blockIdx.y;
-    if (r >= rows || t >= n) return;
-    const float *xr = x + (size_t)t * cols;
+    if (r >= rows) return;
     const __half *wr = w + (size_t)r * cols;
-    float acc = 0.f;
-    for (int c = lane; c < cols; c += 32) acc = fmaf(__half2float(wr[c]), xr[c], acc);
-    acc = warp_sum(acc);
-    if (lane == 0) y[(size_t)t * rows + r] = acc;
+    for (int t = (int)blockIdx.y; t < n; t += (int)gridDim.y) {
+        const float *xr = x + (size_t)t * cols;
+        float acc = 0.f;
+        for (int c = lane; c < cols; c += 32) acc = fmaf(__half2float(wr[c]), xr[c], acc);
+        acc = warp_sum(acc);
+        if (lane == 0) y[(size_t)t * rows + r] = acc;
+    }
 }
 
 /* ---- Batched TF32 GEMM for MLA_Q_ABSORB_CHUNK and MLA_PROJECT_CHUNK ------------------- */

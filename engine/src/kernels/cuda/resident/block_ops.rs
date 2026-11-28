@@ -443,6 +443,14 @@ impl<'b> BlockOp<'b> {
         w: DeviceRange<'b>,
         y: DeviceRange<'b>,
     ) -> Result<Self, EngError> {
+        if !(1..=65536).contains(&n)
+            || !(1..=1_048_576).contains(&rows)
+            || !(1..=65536).contains(&cols)
+        {
+            return Err(EngError::BadRequest(format!(
+                "f16_gemm: invalid shape n={n}, rows={rows}, cols={cols}"
+            )));
+        }
         Ok(Self::new(20, &[n, rows, cols], &[])?
             .read(0, x, bytes(&[n, cols, 4])?)
             .read(1, w, bytes(&[rows, cols, 2])?)

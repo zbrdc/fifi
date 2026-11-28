@@ -641,6 +641,27 @@ int launch_status(int *out_stage) {
     return (int)failure.err;
 }
 
+/* Returns 1 when the loaded PTX of `kernel` is sm_80 or later, 2 when older, or a negative error
+ * code if cudaFuncGetAttributes fails. Cached per device inside the instantiation. */
+template <typename Kernel>
+int probe_sm80(Kernel kernel, int *out_stage, int *err_out) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
+    static int arm[16] = {};
+    if (arm[device] == 0) {
+        Failure failure;
+        cudaFuncAttributes attr = {};
+        failure.record(cudaFuncGetAttributes(&attr, kernel), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        if (!failure.ok()) {
+            *err_out = (int)failure.err;
+            return 0;
+        }
+        arm[device] = attr.ptxVersion >= 80 ? 1 : 2;
+    }
+    return arm[device];
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_args *args,
@@ -736,19 +757,10 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(2, n * heads * (rank + rope) * 4, true);
             if (!slots.valid() || !aligned(p[1], 16)) return INFERENCE_CUDA_INVALID_ARGUMENT;
             if (chunk) {
-                int device = 0;
-                if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
-                static int arm[16] = {};
-                if (arm[device] == 0) {
-                    Failure failure;
-                    cudaFuncAttributes attr = {};
-                    failure.record(cudaFuncGetAttributes(&attr, tf32_batched_gemm_kernel),
-                                   INFERENCE_CUDA_STAGE_LAUNCH);
-                    report_stage(out_stage, failure.stage);
-                    if (!failure.ok()) return (int)failure.err;
-                    arm[device] = attr.ptxVersion >= 80 ? 1 : 2;
-                }
-                if (arm[device] == 1) {
+                int err = 0;
+                const int arm = probe_sm80(tf32_batched_gemm_kernel, out_stage, &err);
+                if (arm == 0) return err;
+                if (arm == 1) {
                     const dim3 grid((unsigned)((rank + kTf32Bn - 1) / kTf32Bn),
                                     (unsigned)((n + kTf32Bm - 1) / kTf32Bm), (unsigned)heads);
                     const int a_hs = (int)(nope + rope);
@@ -955,19 +967,10 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(2, n * heads * v * 4, true);
             if (!slots.valid() || !aligned(p[1], 16)) return INFERENCE_CUDA_INVALID_ARGUMENT;
             if (chunk) {
-                int device = 0;
-                if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
-                static int arm[16] = {};
-                if (arm[device] == 0) {
-                    Failure failure;
-                    cudaFuncAttributes attr = {};
-                    failure.record(cudaFuncGetAttributes(&attr, tf32_batched_gemm_kernel),
-                                   INFERENCE_CUDA_STAGE_LAUNCH);
-                    report_stage(out_stage, failure.stage);
-                    if (!failure.ok()) return (int)failure.err;
-                    arm[device] = attr.ptxVersion >= 80 ? 1 : 2;
-                }
-                if (arm[device] == 1) {
+                int err = 0;
+                const int arm = probe_sm80(tf32_batched_gemm_kernel, out_stage, &err);
+                if (arm == 0) return err;
+                if (arm == 1) {
                     const dim3 grid((unsigned)((v + kTf32Bn - 1) / kTf32Bn),
                                     (unsigned)((n + kTf32Bm - 1) / kTf32Bm), (unsigned)heads);
                     tf32_batched_gemm_kernel<<<grid, 256, 0, s>>>(
@@ -989,26 +992,18 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(1, rows * cols * 2, false);
             slots.use(2, n * rows * 4, true);
             if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            int device = 0;
-            if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
-            static int arm[16] = {};
-            if (arm[device] == 0) {
-                Failure failure;
-                cudaFuncAttributes attr = {};
-                failure.record(cudaFuncGetAttributes(&attr, f16_gemm_tc_kernel),
-                               INFERENCE_CUDA_STAGE_LAUNCH);
-                report_stage(out_stage, failure.stage);
-                if (!failure.ok()) return (int)failure.err;
-                arm[device] = attr.ptxVersion >= 80 ? 1 : 2;
-            }
-            if (arm[device] == 1) {
+            int err = 0;
+            const int arm = probe_sm80(f16_gemm_tc_kernel, out_stage, &err);
+            if (arm == 0) return err;
+            if (arm == 1) {
                 const dim3 grid((unsigned)((rows + kF16GemmBn - 1) / kF16GemmBn),
                                 (unsigned)((n + kF16GemmBm - 1) / kF16GemmBm));
                 f16_gemm_tc_kernel<<<grid, 128, 0, s>>>((const float *)p[0], (const __half *)p[1],
                                                         (float *)p[2], (int)n, (int)rows,
                                                         (int)cols);
             } else {
-                const dim3 grid((unsigned)((rows + 7) / 8), (unsigned)n);
+                const dim3 grid((unsigned)((rows + 7) / 8),
+                                (unsigned)(n < 65535 ? n : 65535));
                 f16_gemm_fallback_kernel<<<grid, 256, 0, s>>>(
                     (const float *)p[0], (const __half *)p[1], (float *)p[2], (int)n, (int)rows,
                     (int)cols);

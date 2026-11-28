@@ -1061,33 +1061,83 @@ fn the_decode_latent_score_and_step_kv_prep_match_the_row_path() {
         assert!(got.iter().all(|v| v.is_finite()), "decode mix is finite");
         assert_close("decode mix", &got, &want, 5e-3);
     }
+    // An all-NaN trailing split must propagate NaN through mla_reduce rather than be dropped.
+    let (heads, pos, splits) = (8usize, 32usize, 2usize);
+    let shape = MlaShape {
+        n: 1,
+        heads,
+        nope: 128,
+        rope,
+        rank,
+    };
+    let keys = pos + 1;
+    let qeff = r.up(&data(99, heads * (rank + rope), 0.5));
+    let mut cache_vals = data(100, keys * (rank + rope), 0.5);
+    for v in &mut cache_vals[32 * (rank + rope)..] {
+        *v = f32::NAN;
+    }
+    let cache = r.up_bytes(&f16_bytes(&cache_vals));
+    let part = r.zeros((heads / 8) * splits * 8 * (rank + 4));
+    r.run(
+        BlockOp::mla_attn_decode(
+            shape,
+            splits,
+            pos,
+            keys,
+            scale,
+            whole(&qeff),
+            whole(&cache),
+            whole(&part),
+            None,
+        )
+        .expect("decode nan"),
+    );
+    let mix = r.zeros(heads * rank);
+    r.run(BlockOp::mla_reduce(1, heads, rank, splits, whole(&part), whole(&mix)).expect("reduce"));
+    assert!(
+        r.read(&mix, heads * rank).iter().all(|v| v.is_nan()),
+        "all-NaN split must propagate NaN through mla_reduce"
+    );
 }
 
-/// Batched f16 tensor-core GEMM against the host f32 reference across aligned, Raon-like, and
-/// ragged odd dimensions.
+/// Batched f16 tensor-core GEMM against the host f32 reference across aligned, Raon-like,
+/// cols%4==0 && cols%8!=0, ragged odd, and 4-byte-only-aligned sub-slice shapes.
 #[test]
 fn the_f16_gemm_matches_the_host_across_aligned_and_ragged_shapes() {
     let Some(r) = rig("block_ops f16 gemm") else {
         return;
     };
-    for (n, rows, cols) in [
-        (64usize, 64usize, 256usize),
-        (37, 40, 256),
-        (19, 35, 77),
-        (5, 7, 13),
+    for (n, rows, cols, offset_floats) in [
+        (64usize, 64usize, 256usize, 0usize),
+        (37, 40, 256, 0),
+        (32, 48, 36, 0),
+        (19, 35, 77, 0),
+        (5, 7, 13, 0),
+        (33, 33, 64, 1),
     ] {
-        let x_host = data(101 + n as u64, n * cols, 0.5);
-        let w_raw = data(102 + rows as u64, rows * cols, 0.5);
+        let x_host = data(101 + n as u64 + cols as u64, n * cols, 0.5);
+        let w_raw = data(102 + rows as u64 + cols as u64, rows * cols, 0.5);
         let w_f16: Vec<f32> = w_raw
             .iter()
             .map(|&v| half::f16::from_f32(v).to_f32())
             .collect();
-        let x_dev = r.up(&x_host);
-        let w_dev = r.up_bytes(&f16_bytes(&w_raw));
+        let mut x_pad = vec![0f32; offset_floats];
+        x_pad.extend_from_slice(&x_host);
+        let mut w_pad = vec![0f32; offset_floats * 2];
+        w_pad.extend_from_slice(&w_raw);
+        let x_dev = r.up(&x_pad);
+        let w_dev = r.up_bytes(&f16_bytes(&w_pad));
         let y_dev = r.up(&vec![f32::NAN; n * rows]);
         r.run(
-            BlockOp::f16_gemm(n, rows, cols, whole(&x_dev), whole(&w_dev), whole(&y_dev))
-                .expect("f16_gemm"),
+            BlockOp::f16_gemm(
+                n,
+                rows,
+                cols,
+                x_dev.range(offset_floats * 4, n * cols * 4).expect("x"),
+                w_dev.range(offset_floats * 4, rows * cols * 2).expect("w"),
+                whole(&y_dev),
+            )
+            .expect("f16_gemm"),
         );
         let got = r.read(&y_dev, n * rows);
         let mut want = Vec::with_capacity(n * rows);
@@ -1106,14 +1156,19 @@ fn the_f16_gemm_matches_the_host_across_aligned_and_ragged_shapes() {
 }
 
 /// Batched tf32 tensor-core MLA absorb and project against the scalar row ops, covering full
-/// aligned chunks, ragged token counts, and odd head value widths.
+/// aligned chunks, ragged token counts, odd multi-tile head value widths, and 4B-aligned slices.
 #[test]
 fn the_chunk_latent_absorb_and_project_match_the_row_path() {
     let Some(r) = rig("block_ops mla chunk gemm") else {
         return;
     };
     let (nope, rope, rank) = (128usize, 64usize, 512usize);
-    for (n, heads, v_dim) in [(64usize, 16usize, 128usize), (37, 8, 128), (19, 4, 13)] {
+    for (n, heads, v_dim, offset_floats) in [
+        (64usize, 16usize, 128usize, 0usize),
+        (37, 8, 128, 0),
+        (19, 4, 13, 0),
+        (19, 4, 77, 1),
+    ] {
         let shape = MlaShape {
             n,
             heads,
@@ -1121,19 +1176,33 @@ fn the_chunk_latent_absorb_and_project_match_the_row_path() {
             rope,
             rank,
         };
-        let qb = r.up(&data(111 + n as u64, n * heads * (nope + rope), 0.5));
+        let qb_vals = data(
+            111 + n as u64 + v_dim as u64,
+            n * heads * (nope + rope),
+            0.5,
+        );
+        let mut qb_pad = vec![0f32; offset_floats];
+        qb_pad.extend_from_slice(&qb_vals);
+        let qb = r.up(&qb_pad);
         let wk = r.up(&data(112 + heads as u64, heads * rank * nope, 0.25));
         let qeff_ref = r.up(&vec![f32::NAN; n * heads * (rank + rope)]);
-        let qeff_tc = r.up(&vec![f32::NAN; n * heads * (rank + rope)]);
+        let qeff_tc = r.up(&vec![f32::NAN; offset_floats + n * heads * (rank + rope)]);
+        let qb_range = qb
+            .range(offset_floats * 4, n * heads * (nope + rope) * 4)
+            .expect("qb");
+        let qeff_tc_range = qeff_tc
+            .range(offset_floats * 4, n * heads * (rank + rope) * 4)
+            .expect("qeff");
         r.run(
-            BlockOp::mla_q_absorb(shape, whole(&qb), whole(&wk), whole(&qeff_ref))
+            BlockOp::mla_q_absorb(shape, qb_range, whole(&wk), whole(&qeff_ref))
                 .expect("absorb ref"),
         );
         r.run(
-            BlockOp::mla_q_absorb_chunk(shape, whole(&qb), whole(&wk), whole(&qeff_tc))
+            BlockOp::mla_q_absorb_chunk(shape, qb_range, whole(&wk), qeff_tc_range)
                 .expect("absorb chunk"),
         );
-        let got_q = r.read(&qeff_tc, n * heads * (rank + rope));
+        let got_q =
+            r.read(&qeff_tc, offset_floats + n * heads * (rank + rope))[offset_floats..].to_vec();
         let want_q = r.read(&qeff_ref, n * heads * (rank + rope));
         assert!(got_q.iter().all(|v| v.is_finite()), "absorb chunk finite");
         assert_close("mla_q_absorb_chunk", &got_q, &want_q, 2e-2);
