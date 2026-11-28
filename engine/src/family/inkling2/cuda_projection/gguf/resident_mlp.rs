@@ -13,14 +13,14 @@ use super::{
 };
 use crate::{
     EngError,
-    family::inkling2::{cuda_projection::dense::RoutedRows, switches::Switch},
+    family::{
+        inkling2::{cuda_projection::dense::RoutedRows, switches::Switch},
+        step::moe::{self as step_moe, StackedRow},
+    },
     kernels::cuda::{
         DeviceRange, DeviceStream,
         resident::{
-            dense_gemv::{
-                DenseDtype, GgufMoeCall, GgufMoePicks, GgufMoeSchedule, GgufMoeShape,
-                GgufMoeWeights,
-            },
+            dense_gemv::{DenseDtype, GgufMoeSchedule, GgufMoeShape},
             router::RouterShape,
         },
     },
@@ -227,38 +227,30 @@ impl GgufCuda {
             .route_scratch
             .as_ref()
             .ok_or_else(|| bad("no CUDA route scratch"))?;
-        let [ids, weights] = work.enqueue(
+        let route = work.route(RouterInputs {
+            x,
+            w: routed.w,
+            bias,
+            status,
+            scale,
+        })?;
+        let schedule = step_moe::stacked_row(
             &self.context,
             stream,
-            RouterInputs {
-                x,
-                w: routed.w,
-                bias,
-                status,
-                scale,
-            },
-        )?;
-        let schedule = self.context.gguf_moe_scheduled(
-            stream,
-            GgufMoeCall {
-                shape: routed.moe,
+            StackedRow {
+                route,
+                moe: routed.moe,
                 dtypes,
                 caps,
-                picks: GgufMoePicks::Device {
-                    count: routed.shape.top_k,
-                    ids,
-                    weights,
-                    scales: routed.scales,
-                },
-                weights: GgufMoeWeights::Stacks(routed.stacks),
-                x,
+                stacks: routed.stacks,
+                scales: routed.scales,
                 scratch: routed.scratch,
-                y,
-            },
-            GgufMoeSchedule {
-                gate: gate_schedule(),
-                exact_q2_down: self.decode_exact_q2_down,
-                q8_window: Switch::DecodeQ8Experts.on(),
+                out: y,
+                schedule: GgufMoeSchedule {
+                    gate: gate_schedule(),
+                    exact_q2_down: self.decode_exact_q2_down,
+                    q8_window: Switch::DecodeQ8Experts.on(),
+                },
             },
         )?;
         static USED: Once = Once::new();

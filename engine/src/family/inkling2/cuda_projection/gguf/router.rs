@@ -8,19 +8,15 @@ use std::{
 use super::{ControlledAttentionInput, ExpertLayer, GgufCuda, bad};
 use crate::{
     EngError,
-    family::inkling2::{
-        TextSpec, cpu_forward::ROUTE_NORMALIZATION_FLOOR, gguf_weights::expert_scale,
+    family::{
+        inkling2::{TextSpec, cpu_forward::ROUTE_NORMALIZATION_FLOOR, gguf_weights::expert_scale},
+        step::moe::{self as step_moe, HostRoundedRoute, StackedRow},
     },
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
         resident::{
-            dense_gemv::{
-                DenseDtype, GgufGate, GgufMoeCall, GgufMoePicks, GgufMoeSchedule, GgufMoeWeights,
-            },
-            router::{
-                RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
-                router_packed_logits_bytes,
-            },
+            dense_gemv::{DenseDtype, GgufGate, GgufMoeSchedule},
+            router::{RouterShape, router_packed_logits_bytes},
         },
     },
 };
@@ -161,38 +157,34 @@ impl RouteScratch {
         ])
     }
 
+    pub(super) fn route<'a>(
+        &'a self,
+        input: RouterInputs<'a>,
+    ) -> Result<HostRoundedRoute<'a>, EngError> {
+        let [logits, ids, weights] = self.ranges()?;
+        Ok(HostRoundedRoute {
+            shape: self.shape,
+            x: input.x,
+            w: input.w,
+            bias: input.bias,
+            floor: ROUTE_NORMALIZATION_FLOOR,
+            scale: input.scale,
+            logits,
+            ids,
+            weights,
+            status: input.status,
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn enqueue(
         &self,
         context: &CudaContext,
         stream: &DeviceStream,
         input: RouterInputs<'_>,
     ) -> Result<[DeviceRange<'_>; 2], EngError> {
-        let [logits, ids, weights] = self.ranges()?;
-        let shape = self.shape;
-        context.router_logits_rows(
-            stream,
-            RouterLogitsCall {
-                shape,
-                x: input.x,
-                w: input.w,
-                logits,
-            },
-        )?;
-        context.router_sigmoid_select_rows(
-            stream,
-            RouterSigmoidCall {
-                shape,
-                bias: Some(RouterSigmoidBias::HostRounded {
-                    values: input.bias,
-                    floor: ROUTE_NORMALIZATION_FLOOR,
-                    scale: input.scale,
-                }),
-                logits,
-                ids,
-                weights,
-                status: input.status,
-            },
-        )?;
+        let [_, ids, weights] = self.ranges()?;
+        step_moe::route_host_rounded(context, stream, self.route(input)?)?;
         Ok([ids, weights])
     }
 }
@@ -238,38 +230,30 @@ impl GgufCuda {
         let scales = work.scale_ranges(route.layer)?;
         let scratch = moe.scratch.range(0, moe.scratch.bytes())?;
         let enqueue = |stream: &DeviceStream, [x, bias, status, y]: [DeviceRange<'_>; 4]| {
-            let [ids, weights] = work.enqueue(
+            let routed = work.route(RouterInputs {
+                x,
+                w,
+                bias,
+                status,
+                scale: route.scale,
+            })?;
+            let schedule = step_moe::stacked_row(
                 &self.context,
                 stream,
-                RouterInputs {
-                    x,
-                    w,
-                    bias,
-                    status,
-                    scale: route.scale,
-                },
-            )?;
-            let schedule = self.context.gguf_moe_scheduled(
-                stream,
-                GgufMoeCall {
-                    shape: moe.shape,
+                StackedRow {
+                    route: routed,
+                    moe: moe.shape,
                     dtypes,
                     caps: route.caps,
-                    picks: GgufMoePicks::Device {
-                        count: shape.top_k,
-                        ids,
-                        weights,
-                        scales,
-                    },
-                    weights: GgufMoeWeights::Stacks(stacks),
-                    x,
+                    stacks,
+                    scales,
                     scratch,
-                    y,
-                },
-                GgufMoeSchedule {
-                    gate: gate_schedule(),
-                    exact_q2_down: route.decode && self.decode_exact_q2_down,
-                    q8_window: route.decode && Switch::DecodeQ8Experts.on(),
+                    out: y,
+                    schedule: GgufMoeSchedule {
+                        gate: gate_schedule(),
+                        exact_q2_down: route.decode && self.decode_exact_q2_down,
+                        q8_window: route.decode && Switch::DecodeQ8Experts.on(),
+                    },
                 },
             )?;
             if schedule.q8_window {

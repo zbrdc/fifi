@@ -13,6 +13,9 @@ use super::rows::{Out, Rows, StepIo, q8};
 use super::scratch::Alloc;
 use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as product_q8_bytes;
+use crate::kernels::cuda::resident::dense_gemv::{
+    DenseDtype, GgufMoeCall, GgufMoePicks, GgufMoeSchedule, GgufMoeShape, GgufMoeWeights,
+};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_gguf_f32::ExpertF32Call;
 use crate::kernels::cuda::resident::moe_combine::{
@@ -22,7 +25,7 @@ use crate::kernels::cuda::resident::router::{
     RouterCall, RouterLogitsCall, RouterOut, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
     RouterWeights,
 };
-use crate::kernels::cuda::{DeviceBuffer, DeviceRange};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
 /// Rows from which the experts run grouped.
 const GROUPED_FROM: usize = 9;
@@ -412,5 +415,96 @@ pub(crate) fn forward(
             }),
             out: CombineOut::To(out.range(0, n * hidden * 4)?),
         },
+    )
+}
+
+/// One sigmoid router launch with a host-rounded per-expert bias, writing logits, top-k ids and
+/// weights.
+#[derive(Clone, Copy)]
+pub(crate) struct HostRoundedRoute<'a> {
+    pub(crate) shape: RouterShape,
+    pub(crate) x: DeviceRange<'a>,
+    pub(crate) w: DeviceRange<'a>,
+    pub(crate) bias: DeviceRange<'a>,
+    pub(crate) floor: f32,
+    pub(crate) scale: f32,
+    pub(crate) logits: DeviceRange<'a>,
+    pub(crate) ids: DeviceRange<'a>,
+    pub(crate) weights: DeviceRange<'a>,
+    pub(crate) status: DeviceRange<'a>,
+}
+
+/// Scores experts and picks top-k ids and weights with a host-rounded sigmoid bias.
+pub(crate) fn route_host_rounded(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    route: HostRoundedRoute<'_>,
+) -> Result<(), EngError> {
+    ctx.router_logits_rows(
+        stream,
+        RouterLogitsCall {
+            shape: route.shape,
+            x: route.x,
+            w: route.w,
+            logits: route.logits,
+        },
+    )?;
+    ctx.router_sigmoid_select_rows(
+        stream,
+        RouterSigmoidCall {
+            shape: route.shape,
+            bias: Some(RouterSigmoidBias::HostRounded {
+                values: route.bias,
+                floor: route.floor,
+                scale: route.scale,
+            }),
+            logits: route.logits,
+            ids: route.ids,
+            weights: route.weights,
+            status: route.status,
+        },
+    )
+}
+
+/// One routed feed-forward row over fused gate-up and down GGUF stacks with per-expert scales and
+/// a host-rounded sigmoid router bias.
+pub(crate) struct StackedRow<'a> {
+    pub(crate) route: HostRoundedRoute<'a>,
+    pub(crate) moe: GgufMoeShape,
+    pub(crate) dtypes: [DenseDtype; 2],
+    pub(crate) caps: [f32; 2],
+    pub(crate) stacks: [DeviceRange<'a>; 2],
+    pub(crate) scales: [DeviceRange<'a>; 2],
+    pub(crate) scratch: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+    pub(crate) schedule: GgufMoeSchedule,
+}
+
+/// Routes one row with a host-rounded sigmoid bias and runs its kept experts through fused
+/// gate-up and down GGUF stacks with per-expert scales.
+pub(crate) fn stacked_row(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    row: StackedRow<'_>,
+) -> Result<GgufMoeSchedule, EngError> {
+    route_host_rounded(ctx, stream, row.route)?;
+    ctx.gguf_moe_scheduled(
+        stream,
+        GgufMoeCall {
+            shape: row.moe,
+            dtypes: row.dtypes,
+            caps: row.caps,
+            picks: GgufMoePicks::Device {
+                count: row.route.shape.top_k,
+                ids: row.route.ids,
+                weights: row.route.weights,
+                scales: row.scales,
+            },
+            weights: GgufMoeWeights::Stacks(row.stacks),
+            x: row.route.x,
+            scratch: row.scratch,
+            y: row.out,
+        },
+        row.schedule,
     )
 }

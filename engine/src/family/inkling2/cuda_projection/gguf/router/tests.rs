@@ -6,7 +6,9 @@ use crate::{
     },
     kernels::cuda::{
         CapturePlan, device_present,
-        resident::dense_gemv::{GgufMoePick, GgufMoeShape},
+        resident::dense_gemv::{
+            GgufMoeCall, GgufMoePick, GgufMoePicks, GgufMoeShape, GgufMoeWeights,
+        },
     },
     weights::GgufType,
 };

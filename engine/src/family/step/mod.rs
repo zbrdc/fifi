@@ -22,7 +22,7 @@
 //! a decode step: the embedding gather before it and the pick after it, on the device.
 //!
 //! [`recipe`] is a model's list of layers, each naming its tensors, and the one walk over them. A
-//! model supplies that list, its widths, the rows it works in and the mixers nobody else has.
+//! model supplies that list, its widths and the rows it works in.
 
 pub(crate) mod attend;
 pub(crate) mod conv;

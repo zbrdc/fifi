@@ -1,5 +1,5 @@
 //! The model's recipe for the shared step: one layer per visit, on the depth-attention site,
-//! with shared relative attention and the model's own feed-forward (routed experts).
+//! with shared relative attention and stacked routed experts.
 
 use super::TextSpec;
 use crate::family::step::{
@@ -30,7 +30,7 @@ pub(super) fn layers(spec: &TextSpec) -> Vec<Layer> {
                     repeat: marks(visit),
                 },
                 mixer: Mixer::Relative { slot: v.state_slot },
-                forward: Forward::Own,
+                forward: Forward::StackedRouted,
             }
         })
         .collect()
@@ -129,7 +129,7 @@ mod tests {
                     repeat: marks(visit),
                 },
                 mixer: Mixer::Relative { slot: visit },
-                forward: Forward::Own,
+                forward: Forward::StackedRouted,
             })
             .collect()
     }
@@ -214,7 +214,7 @@ mod tests {
                 repeat: Repeat::Step,
             },
             mixer: Mixer::Relative { slot: 0 },
-            forward: Forward::Own,
+            forward: Forward::StackedRouted,
         };
         assert_eq!(named.tensors(), ["q"]);
     }

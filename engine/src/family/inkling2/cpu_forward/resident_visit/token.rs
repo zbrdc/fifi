@@ -1,7 +1,7 @@
 //! Whole-token transaction, driven by the shared walk over the Inkling recipe: the walk mixes,
 //! seals and adds on the depth site, whose two planes alternate per pass (the plane a rewind
 //! leaves is the bank of the next pass) and whose mark is the sealed prelude, and each visit's
-//! own attention and MLP run on the visit's arena. Sealed prelude, previous-pass bank, and each
+//! relative attention and stacked routed experts run on the visit's arena. Sealed prelude, previous-pass bank, and each
 //! visit's K/V rows and convolution state never cross PCIe during the chain. One coalesced readback
 //! holds the logits and every status word. A committed token leaves the device
 //! owning the rows; the host keeps cursors until an explicit event calls
@@ -11,7 +11,7 @@ mod shadow;
 use super::*;
 use crate::family::project::cuda::{CudaWeight, CudaWeights};
 use crate::family::step::depth::{self as step_depth, Depth, DepthSite};
-use crate::family::step::recipe::{Fuses, Layer, Model, Walk};
+use crate::family::step::recipe::{Layer, Model, Walk};
 use crate::family::step::rows::StepIo;
 use crate::family::step::scratch::{Core, OnDevice, Widths};
 use crate::family::step::state::{Slots, State};
@@ -139,8 +139,8 @@ impl Chain {
     }
 }
 
-/// One token's step for the shared walk: the depth site over the pass planes, and the visits'
-/// own halves on their arenas.
+/// One token's step for the shared walk: the depth site over the pass planes, and each visit's
+/// relative attention and stacked routed experts on its arena.
 struct ChainStep<'a> {
     f: &'a CpuForward,
     cuda: &'a GgufCuda,
@@ -257,16 +257,8 @@ impl Model for ChainStep<'_> {
         ex.attention(self.cuda, p0, ex.layout.attention_input)
     }
 
-    fn own_forward(&self, visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
-        self.execution(visit)?.forward(self.cuda)
-    }
-
-    /// The MLP's convolution adds the output into the depth current row.
-    fn own_fuses(&self, _visit: usize, half: Half) -> Fuses {
-        Fuses {
-            read: false,
-            apply: half == Half::Forward,
-        }
+    fn stacked_routed(&self, visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
+        self.execution(visit)?.forward(self.cuda, false)
     }
 
     fn depth_site(&self) -> Result<DepthSite<'_>, EngError> {

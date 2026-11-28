@@ -426,7 +426,7 @@ mod tests {
                 repeat,
             },
             mixer: Mixer::Relative { slot: 0 },
-            forward: Forward::Own,
+            forward: Forward::StackedRouted,
         }
     }
 

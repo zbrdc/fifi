@@ -614,8 +614,8 @@ struct Shared<'a> {
 }
 
 /// Where a visit driven by the shared walk reads and writes: both depth mixes land in `input`,
-/// the attention output in `mix_out` (the walk returns it to the depth states) and the
-/// convolved MLP output in `forward_out`.
+/// the attention output in `mix_out` and the convolved MLP output in `forward_out`; the walk
+/// returns both to the depth states.
 #[derive(Clone, Copy)]
 struct WalkRows<'a> {
     input: DeviceRange<'a>,
@@ -674,7 +674,7 @@ impl<'a> Execution<'a> {
             (blocks, width, MIX_EPS),
             self.row(l.glue_health)?,
         )?;
-        self.forward(cuda)
+        self.forward(cuda, true)
     }
 
     fn mixer(&self, cuda: &GgufCuda, position: usize) -> Result<(), EngError> {
@@ -827,8 +827,8 @@ impl<'a> Execution<'a> {
     }
 
     /// The forward half from its mixed input `mlp_input`: the MLP and its convolution into
-    /// `mlp_conv`, added into the depth current row in the same launch.
-    fn forward(&self, cuda: &GgufCuda) -> Result<(), EngError> {
+    /// `mlp_conv`, optionally adding into the depth current row in the same launch.
+    fn forward(&self, cuda: &GgufCuda, fuse_add: bool) -> Result<(), EngError> {
         let l = self.layout;
         let [gamma, bias, conv] = self.weights.mlp;
         let controls = &self.plan.controls;
@@ -864,9 +864,9 @@ impl<'a> Execution<'a> {
                 input: self.row(l.mlp_raw)?,
                 taps: self.weights.row(conv)?,
                 out: self.row(l.mlp_conv)?,
-                // The convolved row is added into the depth stream's current row in the same
-                // launch, the add of the visit's MLP output.
-                add: Some(self.row(l.depth.row(shape.hidden))?),
+                add: fuse_add
+                    .then(|| self.row(l.depth.row(shape.hidden)))
+                    .transpose()?,
                 health: self.row(l.glue_health)?,
             },
         )

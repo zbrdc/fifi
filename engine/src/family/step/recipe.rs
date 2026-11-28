@@ -3,8 +3,7 @@
 //!
 //! A visit has two halves, a mixer and a feed-forward. Each half reads its input at the layer's
 //! residual site, norms it, runs its branch and applies the branch at the site. A model
-//! supplies the list, its widths, the rows it works in and the mixers nobody else has;
-//! [`Walk`] is the walk every model runs.
+//! supplies the list, its widths and the rows it works in; [`Walk`] is the walk every model runs.
 
 use super::attend::{self, At, AttendRows};
 use super::delta::{self, ChannelRows, DeltaNames, DeltaRows};
@@ -95,20 +94,12 @@ pub(crate) enum Forward {
     /// The gate, up and down matrices of a gated feed-forward.
     Dense([String; 3]),
     Routed(moe::Names),
-    /// A feed-forward of the model's own.
-    Own,
+    /// Routed experts over fused gate-up and down GGUF stacks with per-expert scales and a
+    /// host-rounded sigmoid router bias.
+    StackedRouted,
 }
 
 /// Where a half stands when a model may look at its rows.
-/// The steps of a half a model's own branch does itself (see [`Model::own_fuses`]): `read`, the
-/// half's read of its site, batched with the branch's own first launch; `apply`, the add of the
-/// branch rows into the site, done in the branch's last launch.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Fuses {
-    pub(crate) read: bool,
-    pub(crate) apply: bool,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stage {
     /// The normed input of the branch is written.
@@ -119,8 +110,8 @@ pub(crate) enum Stage {
 }
 
 impl Layer {
-    /// Every tensor the layer names, in the order a load takes them. Relative attention and a
-    /// feed-forward of the model's own name none here.
+    /// Every tensor the layer names, in the order a load takes them. Relative attention and
+    /// stacked routed experts name none here.
     pub(crate) fn tensors(&self) -> Vec<String> {
         let mut names: Vec<String> = self.norms.iter().flatten().cloned().collect();
         match &self.site {
@@ -148,7 +139,7 @@ impl Layer {
                 names.push(routed.rule.side().to_owned());
                 names.extend(routed.stacks.iter().chain(&routed.shared).cloned());
             }
-            Forward::Own => {}
+            Forward::StackedRouted => {}
         }
         names
     }
@@ -210,7 +201,7 @@ impl Layer {
                 let stacks = names.stacks.iter().chain(&names.shared);
                 stacks.into_iter().try_for_each(|n| map.native(n).map(drop))
             }
-            Forward::Own => Ok(()),
+            Forward::StackedRouted => Ok(()),
         }
     }
 }
@@ -288,10 +279,10 @@ pub(crate) trait Model {
     fn depth_bank(&self, _visit: usize, _half: Half) -> Result<Option<BankRead<'_>>, EngError> {
         Ok(None)
     }
-    /// The feed-forward of visit `visit`, for a layer whose feed-forward is the model's own: it
-    /// reads the normed rows and writes the forward rows, as the shared blocks do.
-    fn own_forward(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
-        unsupported(self.family(), "a feed-forward of the model's own")
+    /// The stacked routed feed-forward of visit `visit` over `n` rows at `p0`, reading the site's
+    /// mixed input and writing `core.forward_out`.
+    fn stacked_routed(&self, _visit: usize, _n: usize, _p0: usize) -> Result<(), EngError> {
+        unsupported(self.family(), "a stacked routed feed-forward")
     }
     /// The activation and the scratch of a dense feed-forward over `n` rows.
     fn dense(&self, _n: usize) -> Result<(ffn::Join, ffn::Scratch<'_>), EngError> {
@@ -315,13 +306,6 @@ pub(crate) trait Model {
     fn depth_site(&self) -> Result<DepthSite<'_>, EngError> {
         unsupported(self.family(), "a depth-attention residual site")
     }
-    /// What the own branch of `half` at visit `visit` does itself, so the walk leaves it out.
-    /// Only an own half's steps can be fused, and only a return that adds: a seal stays the
-    /// walk's. This hook exists only for own halves, so it goes away with the last of them:
-    /// once a model's halves are shared steps, the steps themselves fuse their reads and adds.
-    fn own_fuses(&self, _visit: usize, _half: Half) -> Fuses {
-        Fuses::default()
-    }
     /// Called after every stage of every half.
     fn tap(&self, _visit: usize, _half: Half, _stage: Stage) -> Result<(), EngError> {
         Ok(())
@@ -339,19 +323,6 @@ impl<M: Model> Walk<'_, M> {
     }
 
     /// The rows the branch of `half` writes.
-    /// What the model fuses of `half`: nothing unless the half's branch is the model's own.
-    fn fuses(&self, layer: &Layer, visit: usize, half: Half) -> Fuses {
-        let own = match half {
-            Half::Mixer => false,
-            Half::Forward => matches!(layer.forward, Forward::Own),
-        };
-        if own {
-            self.0.own_fuses(visit, half)
-        } else {
-            Fuses::default()
-        }
-    }
-
     fn branch_rows(&self, half: Half) -> &DeviceBuffer {
         match half {
             Half::Mixer => &self.0.core().mix_out,
@@ -391,9 +362,6 @@ impl<M: Model> Visits for Walk<'_, M> {
     /// same launch; the other sites read the input their mix writes.
     fn read(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
         let (m, layer) = (self.0, self.layer(visit)?);
-        if self.fuses(layer, visit, half).read {
-            return m.tap(visit, half, Stage::Read);
-        }
         let (core, io, h) = (m.core(), m.io(false), m.hidden());
         let cur = &core.resid[core.cur.get()];
         let (x, delta) = match &layer.site {
@@ -505,7 +473,7 @@ impl<M: Model> Visits for Walk<'_, M> {
                     let (x, out) = (core.normed_rows(), &core.forward_out);
                     moe::forward(&io, names, dims, scratch, shared, x, n, out)?;
                 }
-                Forward::Own => m.own_forward(visit, n, p0)?,
+                Forward::StackedRouted => m.stacked_routed(visit, n, p0)?,
             },
         }
         m.tap(visit, half, Stage::Branch)
@@ -516,17 +484,6 @@ impl<M: Model> Visits for Walk<'_, M> {
     /// other plane after each branch.
     fn apply(&self, visit: usize, half: Half, n: usize) -> Result<(), EngError> {
         let (m, layer) = (self.0, self.layer(visit)?);
-        if self.fuses(layer, visit, half).apply {
-            let seals = matches!(layer.site, Site::DepthAttention { seal: true, .. })
-                && half == Half::Mixer;
-            if seals || !matches!(layer.site, Site::DepthAttention { .. }) {
-                return Err(EngError::BadRequest(format!(
-                    "{}: visit {visit} fuses a return the walk must run",
-                    m.family()
-                )));
-            }
-            return m.tap(visit, half, Stage::Apply);
-        }
         let (core, io, h) = (m.core(), m.io(false), m.hidden());
         let (cur, next) = (core.cur.get(), core.cur.get() ^ 1);
         let branch = self.branch_rows(half);
