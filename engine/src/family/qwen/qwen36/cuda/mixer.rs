@@ -552,7 +552,7 @@ impl<'a> Mixers<'a> {
                 q8,
                 norm_out,
                 ..
-            } => ctx.add_rmsnorm_q8(
+            } => ctx.add_rmsnorm_maybe_q8(
                 stream,
                 AddNormQ8Call {
                     rows: 1,
@@ -564,6 +564,7 @@ impl<'a> Mixers<'a> {
                     norm_out: self.view(norm_out)?,
                     q8: self.view(q8)?,
                 },
+                q8 == Slot::Q8Mix && run.weights.q8_mix_unused(),
             ),
             BlockOp::ProjectQ {
                 role, x_q8, y, col, ..

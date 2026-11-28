@@ -38,9 +38,8 @@
 namespace {
 
 const int kQK = 256;         /* values per K block */
-const int kRowsPerWarp = 4;  /* weight rows one warp serves */
-const int kLanesPerRow = 8;  /* lanes per weight row: 32 values of a K block each */
-const int kWarps = 4;        /* warps per CTA: 128 threads, 16 rows */
+const int kKWarps = 8;       /* warps per CTA for K-quants: 256 threads, 32 rows */
+const int kKRowsPerWarp = 4; /* weight rows one warp serves (4 contiguous K-blocks/warp) */
 
 /* The 16 bytes at a 16-byte aligned address, and the two at an even one. */
 __device__ __forceinline__ uint4 load_line(const unsigned char *p) {
@@ -121,16 +120,17 @@ struct Q4kSide {
         const uint4 u1 = unit[1];
         const unsigned codes[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
         const unsigned nib = 4u * (l & 1);
-        float sd = 0.0f;
+        float sd_a = 0.0f;
+        float sd_b = 0.0f;
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             /* Four codes, one in the low 4 bits of each byte. */
             const unsigned packed = (codes[i] >> nib) & 0x0F0F0F0Fu;
             const float4 xv = x.v[i];
-            sd = fmaf(code_at(packed, 0) - 8388608.0f, xv.x, sd);
-            sd = fmaf(code_at(packed, 1) - 8388608.0f, xv.y, sd);
-            sd = fmaf(code_at(packed, 2) - 8388608.0f, xv.z, sd);
-            sd = fmaf(code_at(packed, 3) - 8388608.0f, xv.w, sd);
+            sd_a = fmaf(code_at(packed, 0) - 8388608.0f, xv.x, sd_a);
+            sd_b = fmaf(code_at(packed, 1) - 8388608.0f, xv.y, sd_b);
+            sd_a = fmaf(code_at(packed, 2) - 8388608.0f, xv.z, sd_a);
+            sd_b = fmaf(code_at(packed, 3) - 8388608.0f, xv.w, sd_b);
         }
         const uint4 head = load_line(raw);
         float mult;
@@ -138,7 +138,63 @@ struct Q4kSide {
         k4_factors(head, l, &mult, &offs);
         const float d = __half2float(__ushort_as_half((unsigned short)head.x));
         const float dmin = __half2float(__ushort_as_half((unsigned short)(head.x >> 16)));
-        sum_d = fmaf(d * mult, sd, sum_d);
+        sum_d = fmaf(d * mult, sd_a + sd_b, sum_d);
+        sum_m = fmaf(dmin * offs, sx, sum_m);
+    }
+
+    __device__ __forceinline__ void reduce(int bit) {
+        sum_d += __shfl_xor_sync(0xffffffffu, sum_d, bit);
+        sum_m += __shfl_xor_sync(0xffffffffu, sum_m, bit);
+    }
+
+    __device__ __forceinline__ float result() const { return sum_d - sum_m; }
+};
+
+/* Q5_K block, 176 bytes (16-byte aligned): f16 d at +0, f16 dmin at +2, 12 packed factor bytes
+ * at +4, 32 high-bit bytes qh at +16 (bit l of qh[m] is bit 4 of sub-block l, value m), and
+ * 128 nibble code bytes qs at +48 (same nibble layout as Q4_K). */
+struct Q5kSide {
+    static const bool kOffsetSum = true;
+    static const int kBlockBytes = 176;
+    float sum_d;
+    float sum_m;
+
+    __device__ __forceinline__ void start() {
+        sum_d = 0.0f;
+        sum_m = 0.0f;
+    }
+
+    __device__ __forceinline__ void add(const unsigned char *raw, int l, const Run &x, float sx) {
+        const uint4 *qhp = reinterpret_cast<const uint4 *>(raw + 16);
+        const uint4 h0 = qhp[0];
+        const uint4 h1 = qhp[1];
+        const unsigned qh[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+        const uint4 *unit = reinterpret_cast<const uint4 *>(raw + 48 + 32 * (l >> 1));
+        const uint4 u0 = unit[0];
+        const uint4 u1 = unit[1];
+        const unsigned codes[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+        const unsigned nib = 4u * (unsigned)(l & 1);
+        const unsigned bit = (unsigned)l;
+        float sd_a = 0.0f;
+        float sd_b = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const unsigned low = (codes[i] >> nib) & 0x0F0F0F0Fu;
+            const unsigned hi = ((qh[i] >> bit) & 0x01010101u) << 4;
+            const unsigned packed = low | hi;
+            const float4 xv = x.v[i];
+            sd_a = fmaf(code_at(packed, 0) - 8388608.0f, xv.x, sd_a);
+            sd_b = fmaf(code_at(packed, 1) - 8388608.0f, xv.y, sd_b);
+            sd_a = fmaf(code_at(packed, 2) - 8388608.0f, xv.z, sd_a);
+            sd_b = fmaf(code_at(packed, 3) - 8388608.0f, xv.w, sd_b);
+        }
+        const uint4 head = load_line(raw);
+        float mult;
+        float offs;
+        k4_factors(head, l, &mult, &offs);
+        const float d = __half2float(__ushort_as_half((unsigned short)head.x));
+        const float dmin = __half2float(__ushort_as_half((unsigned short)(head.x >> 16)));
+        sum_d = fmaf(d * mult, sd_a + sd_b, sum_d);
         sum_m = fmaf(dmin * offs, sx, sum_m);
     }
 
@@ -226,21 +282,23 @@ struct Q6kSide {
         const unsigned left = (4u - pair) & 31u;
         const unsigned right = (pair - 4u) & 31u;
         const unsigned short sc = load_half(raw + 192 + 8 * h + 2 * q);
-        float sd[2] = {0.0f, 0.0f};
+        float sd_a[2] = {0.0f, 0.0f};
+        float sd_b[2] = {0.0f, 0.0f};
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const unsigned low = (lo.w[i] >> nib) & 0x0F0F0F0Fu;
             const unsigned high = ((hi.w[i] << left) | (hi.w[i] >> right)) & 0x30303030u;
             const unsigned packed = low | high;
             const float4 xv = x.v[i];
-            sd[i >> 2] = fmaf(code_at(packed, 0) - 8388640.0f, xv.x, sd[i >> 2]);
-            sd[i >> 2] = fmaf(code_at(packed, 1) - 8388640.0f, xv.y, sd[i >> 2]);
-            sd[i >> 2] = fmaf(code_at(packed, 2) - 8388640.0f, xv.z, sd[i >> 2]);
-            sd[i >> 2] = fmaf(code_at(packed, 3) - 8388640.0f, xv.w, sd[i >> 2]);
+            const int half = i >> 2;
+            sd_a[half] = fmaf(code_at(packed, 0) - 8388640.0f, xv.x, sd_a[half]);
+            sd_b[half] = fmaf(code_at(packed, 1) - 8388640.0f, xv.y, sd_b[half]);
+            sd_a[half] = fmaf(code_at(packed, 2) - 8388640.0f, xv.z, sd_a[half]);
+            sd_b[half] = fmaf(code_at(packed, 3) - 8388640.0f, xv.w, sd_b[half]);
         }
         const float d = __half2float(__ushort_as_half(load_half(raw + 208)));
-        sum = fmaf(d * signed_f(sc & 0xFFu), sd[0], sum);
-        sum = fmaf(d * signed_f(sc >> 8), sd[1], sum);
+        sum = fmaf(d * signed_f(sc & 0xFFu), sd_a[0] + sd_b[0], sum);
+        sum = fmaf(d * signed_f(sc >> 8), sd_a[1] + sd_b[1], sum);
     }
 
     __device__ __forceinline__ void reduce(int bit) {
@@ -348,34 +406,54 @@ __global__ void __launch_bounds__(kQ80Warps * 32, 2) matvec_dq_q80_kernel(
     }
 }
 
+/* Coalesced K-quant decode dq matvec (Q4_K, Q5_K, Q6_K): one warp serves kKRowsPerWarp weight
+ * rows (8 warps / 256 threads per CTA, zero shared memory, zero barriers). Inside a warp,
+ * lanes (blk = lane >> 3, l = lane & 7) stream 4 contiguous K-blocks of each row in lockstep
+ * while reusing one float4x8 activation load and offset sum across all rows of the warp. */
 template <class Side>
-__global__ void __launch_bounds__(kWarps * 32) matvec_dq_kernel(const unsigned char *w,
-                                                                const float *x, float *y, int rows,
-                                                                int blocks) {
+__global__ void __launch_bounds__(kKWarps * 32, 2) matvec_dq_kernel(
+    const unsigned char *w, const float *x, float *y, int rows, int blocks) {
+    const int warp = (int)(threadIdx.x >> 5);
     const int lane = (int)(threadIdx.x & 31u);
-    const int row = (int)blockIdx.x * (kWarps * kRowsPerWarp) +
-                    (int)(threadIdx.x >> 5) * kRowsPerWarp + lane / kLanesPerRow;
-    const int l = lane % kLanesPerRow;
-    /* The last block of a row count below a multiple of 16 has rows that are not there: their
-     * lanes read x and join the reduction but read no weight and write nothing. */
-    const bool live = row < rows;
-    const unsigned char *wrow = live ? w + (size_t)row * blocks * Side::kBlockBytes : w;
-    Side side;
-    side.start();
-    for (int b = 0; b < blocks; ++b) {
+    const int row0 = ((int)blockIdx.x * kKWarps + warp) * kKRowsPerWarp;
+    if (row0 >= rows) {
+        return;
+    }
+    const int blk = lane >> 3;
+    const int l = lane & 7;
+    const size_t row_bytes = (size_t)blocks * Side::kBlockBytes;
+    const unsigned char *wrow0 = w + (size_t)row0 * row_bytes;
+
+    Side sides[kKRowsPerWarp];
+    #pragma unroll
+    for (int r = 0; r < kKRowsPerWarp; ++r) {
+        sides[r].start();
+    }
+    for (int b = blk; b < blocks; b += 4) {
         const Run xv = load_run(x + (size_t)b * kQK + 32 * l);
         const float sx = Side::kOffsetSum ? run_sum(xv) : 0.0f;
-        if (live) {
-            side.add(wrow + (size_t)b * Side::kBlockBytes, l, xv, sx);
+        const size_t off = (size_t)b * Side::kBlockBytes;
+        #pragma unroll
+        for (int r = 0; r < kKRowsPerWarp; ++r) {
+            if (row0 + r < rows) {
+                sides[r].add(wrow0 + (size_t)r * row_bytes + off, l, xv, sx);
+            }
         }
     }
-    /* Eight lanes hold one row: fold the lane index's low three bits. Every lane joins. */
     #pragma unroll
-    for (int bit = 1; bit < kLanesPerRow; bit <<= 1) {
-        side.reduce(bit);
+    for (int bit = 16; bit > 0; bit >>= 1) {
+        #pragma unroll
+        for (int r = 0; r < kKRowsPerWarp; ++r) {
+            sides[r].reduce(bit);
+        }
     }
-    if (live && l == 0) {
-        y[row] = side.result();
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < kKRowsPerWarp; ++r) {
+            if (row0 + r < rows) {
+                y[row0 + r] = sides[r].result();
+            }
+        }
     }
 }
 
@@ -397,15 +475,18 @@ extern "C" int inference_cuda_matvec_dq_launch(const inference_cuda_matvec_dq_ar
         const int k = args->k;
         const int rows = args->rows;
         const bool q4k = args->type == INFERENCE_CUDA_TYPE_Q4_K;
+        const bool q5k = args->type == INFERENCE_CUDA_TYPE_Q5_K;
         const bool q6k = args->type == INFERENCE_CUDA_TYPE_Q6_K;
         const bool q80 = args->type == INFERENCE_CUDA_TYPE_Q8_0;
         if (args->w == NULL || args->x == NULL || args->y == NULL || k <= 0 || k % kQK != 0 ||
-            rows <= 0 || !(q4k || q6k || q80)) {
+            rows <= 0 || !(q4k || q5k || q6k || q80)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const size_t blocks = (size_t)k / kQK;
-        const int block_bytes =
-            q4k ? Q4kSide::kBlockBytes : (q6k ? Q6kSide::kBlockBytes : 8 * kQ80BlockBytes);
+        const int block_bytes = q4k ? Q4kSide::kBlockBytes
+                              : q5k ? Q5kSide::kBlockBytes
+                              : q6k ? Q6kSide::kBlockBytes
+                                    : 8 * kQ80BlockBytes;
         const size_t w_bytes = (size_t)rows * blocks * (size_t)block_bytes;
         const size_t x_bytes = (size_t)k * sizeof(float);
         const size_t y_bytes = (size_t)rows * sizeof(float);
@@ -421,13 +502,18 @@ extern "C" int inference_cuda_matvec_dq_launch(const inference_cuda_matvec_dq_ar
             matvec_dq_q80_kernel<<<q80_grid, kQ80Warps * 32, 0, (cudaStream_t)stream>>>(
                 (const unsigned char *)args->w, (const float *)args->x, args->y, rows, w_blocks);
         } else {
-            const unsigned int grid = (unsigned int)(((size_t)rows + 15) / 16);
+            const unsigned int grid = (unsigned int)(((size_t)rows + kKRowsPerWarp * kKWarps - 1) /
+                                                     (kKRowsPerWarp * kKWarps));
             if (q4k) {
-                matvec_dq_kernel<Q4kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
+                matvec_dq_kernel<Q4kSide><<<grid, kKWarps * 32, 0, (cudaStream_t)stream>>>(
+                    (const unsigned char *)args->w, (const float *)args->x, args->y, rows,
+                    (int)blocks);
+            } else if (q5k) {
+                matvec_dq_kernel<Q5kSide><<<grid, kKWarps * 32, 0, (cudaStream_t)stream>>>(
                     (const unsigned char *)args->w, (const float *)args->x, args->y, rows,
                     (int)blocks);
             } else {
-                matvec_dq_kernel<Q6kSide><<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(
+                matvec_dq_kernel<Q6kSide><<<grid, kKWarps * 32, 0, (cudaStream_t)stream>>>(
                     (const unsigned char *)args->w, (const float *)args->x, args->y, rows,
                     (int)blocks);
             }

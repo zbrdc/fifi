@@ -61,6 +61,11 @@ int inference_cuda_add_rmsnorm_q8_launch(const inference_cuda_add_rmsnorm_q8_arg
 int inference_cuda_add_rmsnorm_q8_rounded_launch(const inference_cuda_add_rmsnorm_q8_args *args,
                                                  void *stream, int *out_stage);
 
+/* F32-only variant: updates h += delta and writes bit-identical norm_out, skipping q8_1 quantize
+ * and stores when downstream consumers read norm_out directly (e.g. matvec_dq or QK-norm). */
+int inference_cuda_add_rmsnorm_f32_launch(const inference_cuda_add_rmsnorm_q8_args *args,
+                                          void *stream, int *out_stage);
+
 #ifdef __cplusplus
 }
 #endif

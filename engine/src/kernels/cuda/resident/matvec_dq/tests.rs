@@ -11,7 +11,12 @@ use crate::kernels::cuda::resident::matvec_q::tests::{assert_bad_request, refere
 use crate::kernels::cuda::resident::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::kernels::cuda::{DeviceBuffer, DeviceRange, testkit};
 
-const TYPES: [QuantType; 3] = [QuantType::Q4K, QuantType::Q6K, QuantType::Q80];
+const TYPES: [QuantType; 4] = [
+    QuantType::Q4K,
+    QuantType::Q5K,
+    QuantType::Q6K,
+    QuantType::Q80,
+];
 /// k on the kernel's grid, from one K block to the largest decode shape.
 const KS: [usize; 5] = [256, 512, 2048, 4096, 12288];
 /// Rows: one warp, one warp and a lane group, two blocks and a partly served third, 62 blocks
@@ -234,7 +239,7 @@ fn matvec_dq_refuses_bad_arguments_before_the_adapter() {
     c.rows = 0;
     refused(c, "rows 0", shape);
     let mut c = call(&rig, w, x, y_ok);
-    c.ty = QuantType::Q5K;
+    c.ty = QuantType::Q3K;
     refused(c, "a type the kernel does not serve", shape);
 
     let mut c = call(&rig, w, x, y_ok);
@@ -311,7 +316,7 @@ fn matvec_dq_native_refuses_a_weight_the_kernel_does_not_serve() {
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
     let (k, rows) = (256, 4);
-    let ty = QuantType::Q5K;
+    let ty = QuantType::Q3K;
     let mut rng = testkit::Rng::new(0xD3_0002);
     let w = testkit::upload_bytes(&ctx, &reference::build_weight(ty, rows, k, &mut rng));
     let x = testkit::upload_f32(&ctx, &vec![0.0; k]);
@@ -325,7 +330,7 @@ fn matvec_dq_native_refuses_a_weight_the_kernel_does_not_serve() {
             y.range(0, rows * F32).expect("y range"),
         ),
         "a resident weight of a type the kernel does not serve",
-        "matvec_dq needs a Q4_K, Q6_K or Q8_0 weight",
+        "matvec_dq needs a Q4_K, Q5_K, Q6_K or Q8_0 weight",
     );
     stream.synchronize().expect("drain");
     let y = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * F32));
@@ -345,9 +350,14 @@ fn matvec_dq_first_shape_against_the_matvec_bench() {
     if !testkit::device_present("matvec_dq_first_shape_against_the_matvec_bench") {
         return;
     }
-    for (ti, ty) in [QuantType::Q6K, QuantType::Q4K, QuantType::Q80]
-        .into_iter()
-        .enumerate()
+    for (ti, ty) in [
+        QuantType::Q6K,
+        QuantType::Q4K,
+        QuantType::Q5K,
+        QuantType::Q80,
+    ]
+    .into_iter()
+    .enumerate()
     {
         first_shape_against_the_matvec(ty, ti as u64);
     }

@@ -34,6 +34,12 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_add_rmsnorm_f32_launch"]
+    fn add_rmsnorm_f32_launch_raw(
+        args: *const AddNormQ8ArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
 }
 
 /// Mirror of `inference_cuda_add_rmsnorm_q8_args` (`add_rmsnorm_q8.h`), field for field.
@@ -151,6 +157,21 @@ pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
     stream: &RawStream,
     call: &AddNormQ8Raw<'_>,
 ) -> Result<(), DeviceFailure> {
+    add_rmsnorm_q8_launch_mode(stream, call, true)
+}
+
+pub(in crate::kernels::cuda) fn add_rmsnorm_f32_launch(
+    stream: &RawStream,
+    call: &AddNormQ8Raw<'_>,
+) -> Result<(), DeviceFailure> {
+    add_rmsnorm_q8_launch_mode(stream, call, false)
+}
+
+fn add_rmsnorm_q8_launch_mode(
+    stream: &RawStream,
+    call: &AddNormQ8Raw<'_>,
+    write_q8: bool,
+) -> Result<(), DeviceFailure> {
     check_add_norm_q8(call)?;
     let args = AddNormQ8ArgsRepr {
         h: call.h.address(),
@@ -160,7 +181,11 @@ pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
             .map_or(std::ptr::null(), |r| r.address().cast_const()),
         w: call.weight.address().cast_const(),
         norm_out: call.norm_out.address(),
-        q8: call.q8.address(),
+        q8: if write_q8 {
+            call.q8.address()
+        } else {
+            std::ptr::null_mut()
+        },
         n: c_int::try_from(call.n).map_err(|_| invalid_argument())?,
         eps: call.eps,
         rows: c_int::try_from(call.rows).map_err(|_| invalid_argument())?,
@@ -174,7 +199,9 @@ pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
     // because `inference_cuda_free` synchronizes the device first. `stream` is live for the call
     // and `args` is a plain value the entry reads.
     let status = unsafe {
-        if super::rounded_q8_1() {
+        if !write_q8 {
+            add_rmsnorm_f32_launch_raw(&args, stream.0.as_ptr(), &mut stage)
+        } else if super::rounded_q8_1() {
             add_rmsnorm_q8_rounded_launch_raw(&args, stream.0.as_ptr(), &mut stage)
         } else {
             add_rmsnorm_q8_launch_raw(&args, stream.0.as_ptr(), &mut stage)

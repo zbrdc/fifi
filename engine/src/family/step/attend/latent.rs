@@ -140,7 +140,7 @@ pub(crate) fn mix(
         d.key_dim + d.rot_dims,
         d.heads * d.head_dim,
     );
-    io.mv(&names.query_low, rows.input, rows.query_low, n)?;
+    io.mv_role("attn_q", &names.query_low, rows.input, rows.query_low, n)?;
     io.norm_rows(
         n,
         d.query_rank,
@@ -150,13 +150,14 @@ pub(crate) fn mix(
         rows.out,
         rows.query_low_q8,
     )?;
-    io.mv(
+    io.mv_role(
+        "attn_q",
         &names.query,
         Rows::both(rows.query_low_q8, rows.out),
         rows.query,
         n,
     )?;
-    io.mv(&names.latent, rows.input, rows.latent, n)?;
+    io.mv_role("attn_k", &names.latent, rows.input, rows.latent, n)?;
     if let Some(pos_word) = rows.step_pos {
         if n != 1 || io.exact || !(MLA_GROUP..=256).contains(&d.heads) {
             return Err(EngError::BadRequest(format!(
@@ -294,9 +295,9 @@ pub(crate) fn mix(
             rows.attended.range(0, n * width * 4)?,
         )?)?;
     }
-    io.mv(&names.gate, rows.input, rows.gate, n)?;
+    io.mv_role("attn_gate", &names.gate, rows.input, rows.gate, n)?;
     io.quantize(n, width, rows.attended, Some(rows.gate), rows.gated)?;
-    io.mv(&names.out, rows.gated, rows.out, n)
+    io.mv_role("attn_output", &names.out, rows.gated, rows.out, n)
 }
 
 /// Bytes of the partials of `n` rows over `splits` key splits.

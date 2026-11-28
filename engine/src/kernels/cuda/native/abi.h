@@ -145,6 +145,7 @@ int inference_cuda_drop_page_cache(int fd, long long offset, long long len,
 #define INFERENCE_CUDA_TYPE_Q5_0 6
 #define INFERENCE_CUDA_TYPE_Q8_0 8
 #define INFERENCE_CUDA_TYPE_Q4_K 12
+#define INFERENCE_CUDA_TYPE_Q5_K 13
 #define INFERENCE_CUDA_TYPE_Q6_K 14
 
 /* Host only, no CUDA call: rearranges n_rows rows of k values in GGUF

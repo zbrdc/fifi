@@ -31,10 +31,33 @@ use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 
 const F32: usize = size_of::<f32>();
 
-/// Whether `matvec_dq` serves `ty` (`Q4_K`, `Q6_K`, or `Q8_0`). Single source of truth for the
-/// kernel, its wrappers, and callers in `family/step`.
+/// Whether `matvec_dq` serves `ty` (`Q4_K`, `Q5_K`, `Q6_K`, or `Q8_0`). Single source of truth for
+/// the kernel, its wrappers, and callers in `family/step`.
 pub(crate) fn serves(ty: QuantType) -> bool {
-    matches!(ty, QuantType::Q4K | QuantType::Q6K | QuantType::Q80)
+    matches!(
+        ty,
+        QuantType::Q4K | QuantType::Q5K | QuantType::Q6K | QuantType::Q80
+    )
+}
+
+/// True when at least one mixer-input role (`attn_q/k/v/qkv/gate`, `ssm_alpha/beta`) is present
+/// and every such role bypasses `q8_1` via `matvec_dq` under the active `FIFI_CUDA_DECODE_DQ_ROLES`.
+pub(crate) fn all_mix_roles_dq<'a>(
+    roles: impl IntoIterator<Item = (&'a str, &'a NativeWeight)>,
+) -> bool {
+    let mut saw = false;
+    for (tag, w) in roles {
+        if matches!(
+            tag,
+            "attn_q" | "attn_k" | "attn_v" | "attn_qkv" | "attn_gate" | "ssm_alpha" | "ssm_beta"
+        ) {
+            saw = true;
+            if !(decode_dq_role_enabled(tag) && serves(w.quant()) && w.k().is_multiple_of(256)) {
+                return false;
+            }
+        }
+    }
+    saw
 }
 
 /// Comma-separated role list (`FIFI_CUDA_DECODE_DQ_ROLES`, default
@@ -129,6 +152,55 @@ impl CudaContext {
         )
     }
 
+    /// One-row projection for HuggingFace-style tensor prefixes (e.g. `flash_next`):
+    /// runs `matvec_dq_native` when the mapped role is enabled and served; otherwise validates,
+    /// quantizes `x` into `scratch`, and runs `matvec_native`.
+    pub(crate) fn project_1row_prefix(
+        &self,
+        stream: &DeviceStream,
+        prefix: &str,
+        weight: &NativeWeight,
+        x: DeviceRange<'_>,
+        scratch: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        if weight.experts().is_some() {
+            return Err(EngError::BadRequest(
+                "native projection requires a matrix, not an expert stack".into(),
+            ));
+        }
+        let role = prefix
+            .rsplit_once('.')
+            .map(|(_, tail)| match tail {
+                "in_proj_qkv" => "attn_qkv",
+                "in_proj_z" => "attn_gate",
+                "in_proj_a" => "ssm_alpha",
+                "in_proj_b" => "ssm_beta",
+                "q_proj" => "attn_q",
+                "k_proj" => "attn_k",
+                "v_proj" => "attn_v",
+                "out_proj" => "ssm_out",
+                "o_proj" => "attn_output",
+                _ => "",
+            })
+            .unwrap_or("");
+        if decode_dq_role_enabled(role) && serves(weight.quant()) && weight.k().is_multiple_of(256)
+        {
+            return self.matvec_dq_native(stream, weight, x.slice(0, weight.k() * F32)?, y);
+        }
+        self.validate_native_projection(weight, x, scratch, y)?;
+        self.quantize_q8_1(
+            stream,
+            crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall {
+                x,
+                y: scratch,
+                k: weight.k(),
+                ncols: 1,
+            },
+        )?;
+        self.matvec_native(stream, weight, scratch, y, 1)
+    }
+
     /// One-row projection helper shared by `qwen36/cuda`: uses `matvec_dq_native` on `x_f32` when
     /// `FIFI_CUDA_DECODE_DQ_ROLES` enables `role_tag` and the weight is served by `matvec_dq`;
     /// otherwise runs the unchanged `matvec_q` path over `x_q8`.
@@ -167,7 +239,7 @@ impl CudaContext {
         let (k, rows) = (call.k, call.rows);
         let shape = || {
             EngError::BadRequest(
-                "matvec_dq needs a Q4_K, Q6_K or Q8_0 weight, k a positive multiple of 256 and rows above zero"
+                "matvec_dq needs a Q4_K, Q5_K, Q6_K or Q8_0 weight, k a positive multiple of 256 and rows above zero"
                     .to_owned(),
             )
         };

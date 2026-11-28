@@ -243,16 +243,18 @@ impl<'a> StepIo<'a> {
         self.norm(n, norm, y.range(0, n * d * 4)?, q8_out.range(0, q8(d, n))?)
     }
 
-    /// `y[t] = W x[t]` for `n` rows of the tensor `name`: [`Self::project`] on the resident
-    /// weight.
-    pub(crate) fn mv(
+    /// `y[t] = W x[t]` for `n` rows of the tensor `name`, tagged with a role for
+    /// `FIFI_CUDA_DECODE_DQ_ROLES` routing.
+    pub(crate) fn mv_role(
         &self,
+        role: &str,
         name: &str,
         x: Rows<'_>,
         y: &DeviceBuffer,
         n: usize,
     ) -> Result<(), EngError> {
-        self.project(self.native(name)?, x, y, n)
+        let weight = self.native(name)?;
+        self.project_role_into(role, weight, x, n, Out::packed(y, n, weight.n_rows())?)
     }
 
     /// `y[t] = W x[t]` for `n` rows, written back to back into `y`.

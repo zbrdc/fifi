@@ -40,41 +40,42 @@ pub(super) struct LayerWeights<'w> {
 }
 
 impl<'w> LayerWeights<'w> {
-    /// The tiles of `role` for a `matmul` launch (the Tiled blocks; a Native entry is a typed
-    /// refusal naming the role, so the two layouts cannot cross inside a launch).
     pub(super) fn dense(&self, role: Role) -> Result<&'w TiledWeight, EngError> {
         match self.entry(role)? {
-            DenseWeight::Tiled(weight) => Ok(weight),
-            DenseWeight::Native(_) => Err(EngError::BadRequest(format!(
-                "mixer: {role:?} is loaded in the native layout; the tiled matmul reads tiles"
-            ))),
+            DenseWeight::Tiled(w) => Ok(w),
+            DenseWeight::Native(_) => Err(EngError::BadRequest(format!("mixer: {role:?} native"))),
         }
     }
 
-    /// The native blocks of `role` for a `matvec_q` launch (the Tiled entry refuses the same way).
     pub(super) fn native(&self, role: Role) -> Result<&'w NativeWeight, EngError> {
         match self.entry(role)? {
-            DenseWeight::Native(weight) => Ok(weight),
-            DenseWeight::Tiled(_) => Err(EngError::BadRequest(format!(
-                "mixer: {role:?} is loaded in the tiled layout; the native matvec reads blocks"
-            ))),
+            DenseWeight::Native(w) => Ok(w),
+            DenseWeight::Tiled(_) => Err(EngError::BadRequest(format!("mixer: {role:?} tiled"))),
         }
+    }
+
+    pub(super) fn q8_mix_unused(&self) -> bool {
+        let mut it = self.dense.iter().filter_map(|(r, w)| match w {
+            DenseWeight::Native(w) => Some((r.dq_tag(), *w)),
+            DenseWeight::Tiled(_) => None,
+        });
+        crate::kernels::cuda::resident::matvec_dq::all_mix_roles_dq(&mut it)
     }
 
     fn entry(&self, role: Role) -> Result<&DenseWeight<'w>, EngError> {
         self.dense
             .iter()
-            .find(|(known, _)| *known == role)
-            .map(|(_, weight)| weight)
-            .ok_or_else(|| EngError::BadRequest(format!("mixer: no dense weight for {role:?}")))
+            .find(|(k, _)| *k == role)
+            .map(|(_, w)| w)
+            .ok_or_else(|| EngError::BadRequest(format!("mixer: missing {role:?}")))
     }
 
     pub(super) fn raw(&self, role: Role) -> Result<DeviceRange<'w>, EngError> {
         self.raw
             .iter()
-            .find(|(known, _)| *known == role)
-            .map(|(_, range)| *range)
-            .ok_or_else(|| EngError::BadRequest(format!("mixer: no raw weight for {role:?}")))
+            .find(|(k, _)| *k == role)
+            .map(|(_, r)| *r)
+            .ok_or_else(|| EngError::BadRequest(format!("mixer: missing {role:?}")))
     }
 }
 

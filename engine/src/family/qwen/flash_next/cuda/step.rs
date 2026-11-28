@@ -876,7 +876,14 @@ impl<'a> FlashStep<'a> {
                     );
                 }
                 return match self.gguf_decode {
-                    GgufDecodePrecision::Q8 => project_native(&self.ctx, &self.stream, call),
+                    GgufDecodePrecision::Q8 => self.ctx.project_1row_prefix(
+                        &self.stream,
+                        prefix,
+                        weight,
+                        x,
+                        call.scratch,
+                        out,
+                    ),
                     GgufDecodePrecision::Exact => {
                         project_exact(&self.ctx, &self.stream, weight, x, out)
                     }

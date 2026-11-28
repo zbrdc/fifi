@@ -25,7 +25,9 @@ use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
-use crate::kernels::cuda::native::resident::add_rmsnorm_q8::{AddNormQ8Raw, add_rmsnorm_q8_launch};
+use crate::kernels::cuda::native::resident::add_rmsnorm_q8::{
+    AddNormQ8Raw, add_rmsnorm_f32_launch, add_rmsnorm_q8_launch,
+};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
 /// The unit of the row width: one q8_1 block of 32 values.
@@ -83,7 +85,27 @@ impl CudaContext {
         stream: &DeviceStream,
         call: AddNormQ8Call<'_>,
     ) -> Result<(), EngError> {
-        self.add_rmsnorm_q8_sized(stream, call, 0, 0)
+        self.add_rmsnorm_q8_sized(stream, call, 0, 0, true)
+    }
+
+    /// [`Self::add_rmsnorm_q8`] that skips the `q8` quantization and writes only `h` (when `delta`
+    /// is given) and `norm_out` when `skip_q8` is true.
+    pub(crate) fn add_rmsnorm_maybe_q8(
+        &self,
+        stream: &DeviceStream,
+        call: AddNormQ8Call<'_>,
+        skip_q8: bool,
+    ) -> Result<(), EngError> {
+        self.add_rmsnorm_q8_sized(stream, call, 0, 0, !skip_q8)
+    }
+
+    /// [`Self::add_rmsnorm_q8`] without q8_1 quantization (writes `h` and `norm_out` only).
+    pub(crate) fn add_rmsnorm_f32(
+        &self,
+        stream: &DeviceStream,
+        call: AddNormQ8Call<'_>,
+    ) -> Result<(), EngError> {
+        self.add_rmsnorm_q8_sized(stream, call, 0, 0, false)
     }
 
     /// [`Self::add_rmsnorm_q8`] over rows of `h` that sit `h_stride` f32 elements apart (0 is `n`,
@@ -95,7 +117,7 @@ impl CudaContext {
         call: AddNormQ8Call<'_>,
         h_stride: usize,
     ) -> Result<(), EngError> {
-        self.add_rmsnorm_q8_sized(stream, call, h_stride, 0)
+        self.add_rmsnorm_q8_sized(stream, call, h_stride, 0, true)
     }
 
     /// [`Self::add_rmsnorm_q8`] with 1024 threads in each row's block: a quarter of the
@@ -107,7 +129,7 @@ impl CudaContext {
         stream: &DeviceStream,
         call: AddNormQ8Call<'_>,
     ) -> Result<(), EngError> {
-        self.add_rmsnorm_q8_sized(stream, call, 0, 1024)
+        self.add_rmsnorm_q8_sized(stream, call, 0, 1024, true)
     }
 
     fn add_rmsnorm_q8_sized(
@@ -116,10 +138,17 @@ impl CudaContext {
         call: AddNormQ8Call<'_>,
         h_stride: usize,
         threads: usize,
+        write_q8: bool,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let raw = self.plan_add_rmsnorm_q8(&call, h_stride, threads)?;
-        self.launch_on(stream, |stream_raw| add_rmsnorm_q8_launch(stream_raw, &raw))
+        self.launch_on(stream, |stream_raw| {
+            if write_q8 {
+                add_rmsnorm_q8_launch(stream_raw, &raw)
+            } else {
+                add_rmsnorm_f32_launch(stream_raw, &raw)
+            }
+        })
     }
 
     fn plan_add_rmsnorm_q8<'b>(

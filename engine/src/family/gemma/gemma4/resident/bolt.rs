@@ -1705,25 +1705,36 @@ impl Bolt {
     /// activation serves one layout; any other group runs each weight through the matvec.
     fn project_group(
         &self,
-        group: &[(&NativeWeight, &Vector)],
+        group: &[(&str, &NativeWeight, &Vector)],
         x: &Vector,
         x_q8: &DeviceBuffer,
         m: usize,
     ) -> Result<(), EngError> {
-        let first = group[0].0;
-        let wide = on_tensor_cores(group.iter().map(|(weight, _)| weight.quant()), m);
+        let first = group[0].1;
+        let wide = on_tensor_cores(group.iter().map(|(_, weight, _)| weight.quant()), m);
         match self.mmq.as_ref().filter(|_| wide) {
             Some(gemm) => {
                 let rows = x.buf.range(0, m * first.k() * 4)?;
                 gemm.input(&self.ctx, &self.stream, first, rows, m)?;
-                group.iter().try_for_each(|(weight, y)| {
+                group.iter().try_for_each(|(_, weight, y)| {
                     let y = y.buf.range(0, m * weight.n_rows() * 4)?;
                     gemm.project(&self.ctx, &self.stream, weight, m, y)
                 })
             }
+            None if m == 1 => group.iter().try_for_each(|&(role, w, y)| {
+                let q8_len = q8_1_bytes(w.k(), 1).expect("q8 row size");
+                self.ctx.project_1row_native(
+                    &self.stream,
+                    role,
+                    w,
+                    Some(x.buf.range(0, w.k() * 4)?),
+                    x_q8.range(0, q8_len)?,
+                    y.buf.range(0, w.n_rows() * 4)?,
+                )
+            }),
             None => group
                 .iter()
-                .try_for_each(|(weight, y)| self.matvec(weight, weight.n_rows(), x_q8, y, m)),
+                .try_for_each(|(_, weight, y)| self.matvec(weight, weight.n_rows(), x_q8, y, m)),
         }
     }
 
@@ -2302,30 +2313,42 @@ impl Bolt {
         let q_rows = HEADS * head;
         let kv_rows = KV_HEADS * head;
         let shared = !layer.physical();
-        self.norm_rows(
+        let (k_ref, v_ref) = (layer.k.as_ref(), layer.v.as_ref());
+        let skip_q8 = m == 1
+            && crate::kernels::cuda::resident::matvec_dq::all_mix_roles_dq(
+                [("attn_q", &layer.q)]
+                    .into_iter()
+                    .chain(k_ref.map(|k| ("attn_k", k)))
+                    .chain(v_ref.map(|v| ("attn_v", v))),
+            );
+        self.ctx.add_rmsnorm_maybe_q8(
             stream,
-            input.buf.range(0, input.bytes())?,
-            layer.attn_norm.buf.range(0, layer.attn_norm.bytes())?,
-            sc.nrm.buf.range(0, sc.nrm.bytes())?,
-            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
-            m,
+            AddNormQ8Call {
+                n: HIDDEN,
+                eps: self.eps,
+                h: input.buf.range(0, input.bytes())?,
+                delta: None,
+                weight: layer.attn_norm.buf.range(0, layer.attn_norm.bytes())?,
+                norm_out: sc.nrm.buf.range(0, sc.nrm.bytes())?,
+                q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                rows: m,
+            },
+            skip_q8,
         )?;
-        match (&layer.k, &layer.v) {
+        match (k_ref, v_ref) {
             (Some(k), Some(v)) => self.project_group(
-                &[(&layer.q, &sc.q), (k, &sc.k), (v, &sc.v)],
+                &[
+                    ("attn_q", &layer.q, &sc.q),
+                    ("attn_k", k, &sc.k),
+                    ("attn_v", v, &sc.v),
+                ],
                 &sc.nrm,
                 &sc.q8_hidden,
                 m,
             )?,
-            _ => self.project_group(&[(&layer.q, &sc.q)], &sc.nrm, &sc.q8_hidden, m)?,
+            _ => self.project_group(&[("attn_q", &layer.q, &sc.q)], &sc.nrm, &sc.q8_hidden, m)?,
         }
-        // The QK-norm of the reference graph: each head of q and of k is
-        // RMS-normalized and scaled by its own weight before RoPE. Values get the
-        // reference's unweighted per-head RMS norm before their cache write; the
-        // ones vector makes the weighted kernel compute the unweighted norm. The
-        // head rows are contiguous, so each loop is ONE batched launch; the q8
-        // side of the kernel is a dump nobody reads.
-        ctx.add_rmsnorm_q8(
+        ctx.add_rmsnorm_f32(
             stream,
             AddNormQ8Call {
                 n: head,
@@ -2339,7 +2362,7 @@ impl Bolt {
             },
         )?;
         if !shared {
-            ctx.add_rmsnorm_q8(
+            ctx.add_rmsnorm_f32(
                 stream,
                 AddNormQ8Call {
                     n: head,
@@ -2357,7 +2380,7 @@ impl Bolt {
                     rows: m * KV_HEADS,
                 },
             )?;
-            ctx.add_rmsnorm_q8(
+            ctx.add_rmsnorm_f32(
                 stream,
                 AddNormQ8Call {
                     n: head,
@@ -2382,7 +2405,12 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        self.project_group(&[(&layer.out, &sc.proj)], &sc.ctx_out, &sc.q8_ctx, m)?;
+        self.project_group(
+            &[("attn_output", &layer.out, &sc.proj)],
+            &sc.ctx_out,
+            &sc.q8_ctx,
+            m,
+        )?;
         self.trace(pos, &format!("L{index}_proj"), &sc.proj, m * HIDDEN * 4);
         self.norm_rows(
             stream,
@@ -2417,7 +2445,7 @@ impl Bolt {
             m,
         )?;
         self.project_group(
-            &[(&layer.ffn_gate, &sc.gate), (&layer.ffn_up, &sc.up)],
+            &[("", &layer.ffn_gate, &sc.gate), ("", &layer.ffn_up, &sc.up)],
             &sc.nrm,
             &sc.q8_hidden,
             m,
@@ -2441,7 +2469,12 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        self.project_group(&[(&layer.ffn_down, &sc.down)], &sc.mixed, &sc.q8_mixed, m)?;
+        self.project_group(
+            &[("", &layer.ffn_down, &sc.down)],
+            &sc.mixed,
+            &sc.q8_mixed,
+            m,
+        )?;
         self.norm_rows(
             stream,
             sc.down.buf.range(0, m * HIDDEN * 4)?,

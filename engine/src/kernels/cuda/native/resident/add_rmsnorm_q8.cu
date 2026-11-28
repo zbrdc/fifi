@@ -59,7 +59,7 @@ __device__ __forceinline__ float block_sum(float v) {
  * weight — a whole per-head or per-batch norm loop collapses into one launch. With 1024
  * threads the same block code runs a quarter of the strided rounds per row: the q8 blocks are
  * independent, but the sum of squares adds in another float order, so the last bits differ. */
-template <bool RoundedQ8>
+template <bool RoundedQ8, bool WriteQ8 = true>
 __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const float *w, int n,
                                  float eps, float *base_norm_out, block_q8_1 *base_y, int64_t h_stride) {
   const int64_t padded =
@@ -68,7 +68,6 @@ __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const f
   float *h = base_h + r * h_stride;
   const float *delta = base_delta != NULL ? base_delta + r * n : NULL;
   float *norm_out = base_norm_out + r * n;
-  block_q8_1 *y = base_y + r * (padded / kQk8_1);
   float ss = 0.f;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     float v = h[i];
@@ -79,13 +78,20 @@ __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const f
     ss += v * v;
   }
   float rstd = rsqrtf(block_sum(ss) / n + eps);
-  const int nwarps = (int)blockDim.x / 32;
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  for (int64_t b = warp; b < padded / kQk8_1; b += nwarps) {
-    const int i = (int)(b * kQk8_1) + lane;
-    const float xi = i < n ? h[i] * rstd * w[i] : 0.0f;
-    if (i < n) norm_out[i] = xi;
-    store_q8_1_block_mode<RoundedQ8>(&y[b], xi);
+  if constexpr (WriteQ8) {
+    block_q8_1 *y = base_y + r * (padded / kQk8_1);
+    const int nwarps = (int)blockDim.x / 32;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int64_t b = warp; b < padded / kQk8_1; b += nwarps) {
+      const int i = (int)(b * kQk8_1) + lane;
+      const float xi = i < n ? h[i] * rstd * w[i] : 0.0f;
+      if (i < n) norm_out[i] = xi;
+      store_q8_1_block_mode<RoundedQ8>(&y[b], xi);
+    }
+  } else {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      norm_out[i] = h[i] * rstd * w[i];
+    }
   }
 }
 
@@ -100,7 +106,7 @@ struct Extent {
     size_t bytes;
 };
 
-template <bool RoundedQ8>
+template <bool RoundedQ8, bool WriteQ8 = true>
 int launch_add_rmsnorm_q8(const inference_cuda_add_rmsnorm_q8_args *args, void *stream,
                           int *out_stage) {
     try {
@@ -110,28 +116,30 @@ int launch_add_rmsnorm_q8(const inference_cuda_add_rmsnorm_q8_args *args, void *
         }
         const int n = args->n;
         const int64_t rows = args->rows;
-        if (args->h == NULL || args->w == NULL || args->norm_out == NULL || args->q8 == NULL ||
-            n < 32 || n > kMaxWidth || n % 32 != 0 || !std::isfinite(args->eps) ||
-            args->eps <= 0.0f || rows < 1 || rows > kMaxRows || !aligned(args->h, 4) ||
-            (args->delta != NULL && !aligned(args->delta, 4)) || !aligned(args->w, 4) ||
-            !aligned(args->norm_out, 16) || !aligned(args->q8, 4) || args->h_stride < 0 ||
+        if (args->h == NULL || args->w == NULL || args->norm_out == NULL ||
+            (WriteQ8 && args->q8 == NULL) || n < 32 || n > kMaxWidth || n % 32 != 0 ||
+            !std::isfinite(args->eps) || args->eps <= 0.0f || rows < 1 || rows > kMaxRows ||
+            !aligned(args->h, 4) || (args->delta != NULL && !aligned(args->delta, 4)) ||
+            !aligned(args->w, 4) || !aligned(args->norm_out, 16) ||
+            (WriteQ8 && !aligned(args->q8, 4)) || args->h_stride < 0 ||
             (args->h_stride != 0 && args->h_stride < n) ||
             (args->threads != 0 && args->threads != kThreads && args->threads != kWideThreads)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        // The kernel writes h, norm_out and q8 (row-strided over `rows` blocks) while it reads
-        // delta (row-strided) and w (one shared row); the guard needs the byte counts
-        // (pad(n, 512)/32 blocks of 36 bytes) and must not wrap.
+        // The kernel writes h, norm_out and (when WriteQ8) q8 (row-strided over `rows` blocks)
+        // while it reads delta (row-strided) and w (one shared row); the guard needs the byte
+        // counts (pad(n, 512)/32 blocks of 36 bytes) and must not wrap.
         const int64_t padded = ((int64_t)n + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
         const int64_t row = (int64_t)n * (int64_t)sizeof(float);
         const int64_t q8_bytes = padded / kQk8_1 * (int64_t)sizeof(block_q8_1);
         const int64_t h_stride = args->h_stride == 0 ? n : args->h_stride;
+        const int n_written = WriteQ8 ? 3 : 2;
         const Extent written[3] = {{args->h, (size_t)((rows - 1) * h_stride * (int64_t)sizeof(float) + row)},
                                    {args->norm_out, (size_t)(row * rows)},
                                    {args->q8, (size_t)(q8_bytes * rows)}};
         const Extent read[2] = {{args->delta, (size_t)(row * rows)}, {args->w, (size_t)row}};
-        for (int i = 0; i < 3; ++i) {
-            for (int j = i + 1; j < 3; ++j) {
+        for (int i = 0; i < n_written; ++i) {
+            for (int j = i + 1; j < n_written; ++j) {
                 if (!apart(written[i].p, written[i].bytes, written[j].p, written[j].bytes)) {
                     return INFERENCE_CUDA_INVALID_ARGUMENT;
                 }
@@ -143,7 +151,7 @@ int launch_add_rmsnorm_q8(const inference_cuda_add_rmsnorm_q8_args *args, void *
                 }
             }
         }
-        add_rmsnorm_q8_k<RoundedQ8><<<dim3((unsigned)rows), dim3((unsigned)(args->threads ? args->threads : kThreads)), 0, (cudaStream_t)stream>>>(
+        add_rmsnorm_q8_k<RoundedQ8, WriteQ8><<<dim3((unsigned)rows), dim3((unsigned)(args->threads ? args->threads : kThreads)), 0, (cudaStream_t)stream>>>(
             (float *)args->h, (const float *)args->delta, (const float *)args->w, n, args->eps,
             (float *)args->norm_out, (block_q8_1 *)args->q8, h_stride);
         Failure failure;
@@ -159,10 +167,15 @@ int launch_add_rmsnorm_q8(const inference_cuda_add_rmsnorm_q8_args *args, void *
 
 extern "C" int inference_cuda_add_rmsnorm_q8_launch(
     const inference_cuda_add_rmsnorm_q8_args *args, void *stream, int *out_stage) {
-    return launch_add_rmsnorm_q8<false>(args, stream, out_stage);
+    return launch_add_rmsnorm_q8<false, true>(args, stream, out_stage);
 }
 
 extern "C" int inference_cuda_add_rmsnorm_q8_rounded_launch(
     const inference_cuda_add_rmsnorm_q8_args *args, void *stream, int *out_stage) {
-    return launch_add_rmsnorm_q8<true>(args, stream, out_stage);
+    return launch_add_rmsnorm_q8<true, true>(args, stream, out_stage);
+}
+
+extern "C" int inference_cuda_add_rmsnorm_f32_launch(
+    const inference_cuda_add_rmsnorm_q8_args *args, void *stream, int *out_stage) {
+    return launch_add_rmsnorm_q8<false, false>(args, stream, out_stage);
 }
