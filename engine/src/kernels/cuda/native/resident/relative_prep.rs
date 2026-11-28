@@ -187,9 +187,6 @@ pub(in crate::kernels::cuda) fn launch(
     let (floor, alpha) = math
         .log
         .map_or((0, 0.0), |log| (log.floor as c_int, log.alpha));
-    let pos = pos.map_or(std::ptr::null(), |pos| {
-        pos.address().cast_const().cast::<c_int>()
-    });
     if !(1..=128).contains(&shape.queries)
         || !(1..=128).contains(&shape.kv)
         || !(1..=PrepShape::WIDTH).contains(&shape.dims)
@@ -201,6 +198,20 @@ pub(in crate::kernels::cuda) fn launch(
         return Err(invalid_argument());
     }
     validate_f32_ranges(&ranges, shape.direct_words())?;
+    let pos = match pos {
+        None => std::ptr::null(),
+        Some(pos) => {
+            if pos.bytes() < size_of::<c_int>()
+                || !pos.offset.is_multiple_of(size_of::<c_int>())
+                || ranges.iter().any(|other| {
+                    !Span::of(&pos, size_of::<c_int>()).apart(&Span::of(other, other.bytes()))
+                })
+            {
+                return Err(invalid_argument());
+            }
+            pos.address().cast_const().cast::<c_int>()
+        }
+    };
     let pointers = ranges.map(|r| r.address());
     let mut stage = STAGE_NONE;
     // SAFETY: the host pointer array lives for the call, and the CUDA spans are

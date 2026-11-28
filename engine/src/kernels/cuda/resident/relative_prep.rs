@@ -364,6 +364,13 @@ impl CudaContext {
             (None, None) => None,
             (Some(_), Some(pos)) => {
                 require_fit("relative prep position", &pos, WORD, WORD)?;
+                let claim = Claim::of("relative prep position", &pos, WORD);
+                for range in &ranges {
+                    require_apart(
+                        &claim,
+                        &Claim::of("relative prep range", range, range.bytes()),
+                    )?;
+                }
                 Some(self.raw_range(&pos)?)
             }
             _ => {
