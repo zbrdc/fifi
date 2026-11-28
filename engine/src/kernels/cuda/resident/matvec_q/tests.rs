@@ -2957,6 +2957,110 @@ fn matvec_q6k_matches_the_integer_reference() {
     println!("matvec q6k: max tolerance ratio {max_ratio:.3}");
 }
 
+/// The in-house Q4_K, Q5_0 and Q6_K arms against the vendored matvec on the same buffers, as
+/// a test that runs wherever a card is; the benches that compare the two are ignored. Each
+/// route holds its own against the f64 oracle within the tolerance the reference tests use, so
+/// the two are held within twice that. The shapes are those the vendored entry serves (rows a
+/// multiple of 4); the row count of 13 stays with the reference tests. Eight columns is the
+/// width at which the vendored launcher changes its geometry.
+#[test]
+fn in_house_arms_match_the_vendored_matvec() {
+    if !testkit::device_present("in_house_arms_match_the_vendored_matvec") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut max_ratio = 0.0f64;
+    for ty in [QuantType::Q4K, QuantType::Q50, QuantType::Q6K] {
+        for (k, rows) in SHAPES.into_iter().chain([PADDED_SHAPE]) {
+            for ncols in [1usize, 8] {
+                let ratio = two_routes(&ctx, &stream, ty, k, rows, ncols);
+                max_ratio = max_ratio.max(ratio);
+            }
+        }
+    }
+    println!("in-house against vendored: max ratio to one tolerance {max_ratio:.3}");
+}
+
+/// One launch of the vendored entry and one of the invariant entry on the same weight and
+/// activation bytes: the largest ratio of their difference to one reference tolerance.
+fn two_routes(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    ty: QuantType,
+    k: usize,
+    rows: usize,
+    ncols: usize,
+) -> f64 {
+    let seed = 0x5eed_0a0au64 + k as u64 + rows as u64 + ncols as u64;
+    let (w, x_q8, row_bytes) = rig(ctx, stream, ty, k, rows, ncols, seed);
+    let w_bytes = ty.weight_bytes(rows, k).expect("size");
+    let x_bytes = q8_1_bytes(k, ncols).expect("size");
+    let y_bytes = rows * ncols * 4;
+    let (w_r, x_r) = (
+        w.range(0, w_bytes).expect("w"),
+        x_q8.range(0, x_bytes).expect("x"),
+    );
+    let (y_v, y_p) = (nan_filled(ctx, y_bytes), nan_filled(ctx, y_bytes));
+    ctx.matvec_q(
+        stream,
+        MatvecCall {
+            ty,
+            w: w_r,
+            x_q8: x_r,
+            y: y_v.range(0, y_bytes).expect("y"),
+            k,
+            rows,
+            ncols,
+        },
+    )
+    .expect("vendored matvec");
+    ctx.matvec_q_invariant(
+        stream,
+        MatvecCall {
+            ty,
+            w: w_r,
+            x_q8: x_r,
+            y: y_p.range(0, y_bytes).expect("y"),
+            k,
+            rows,
+            ncols,
+        },
+    )
+    .expect("in-house matvec");
+    stream.synchronize().expect("drain");
+    let (vendored, in_house) = (read_f32(ctx, &y_v, y_bytes), read_f32(ctx, &y_p, y_bytes));
+    let w_host = testkit::read_bytes(ctx, &w, w_bytes);
+    let x_host = testkit::read_bytes(ctx, &x_q8, row_bytes * ncols);
+    let row_stride = ty.weight_bytes(1, k).expect("row size");
+    let mut max_ratio = 0.0f64;
+    for col in 0..ncols {
+        for row in 0..rows {
+            let (_, abs) = reference::reference_dot(
+                ty,
+                &w_host[row * row_stride..],
+                &x_host[col * row_bytes..],
+                k,
+            );
+            let tolerance = 64.0 * 2f64.powi(-24) * abs;
+            let error =
+                (in_house[col * rows + row] as f64 - vendored[col * rows + row] as f64).abs();
+            let ratio = if tolerance > 0.0 {
+                error / tolerance
+            } else {
+                error
+            };
+            max_ratio = max_ratio.max(ratio);
+            assert!(
+                error <= 2.0 * tolerance,
+                "{ty:?} k {k} rows {rows} col {col} row {row}: in-house and vendored \
+                 {error} apart, over twice the tolerance {tolerance}"
+            );
+        }
+    }
+    max_ratio
+}
+
 /// The fused arithmetic contract, pinned without a card: the host mirror of the
 /// kernel (exact dp4a integers, one fmaf per block, the b&32 split, the lane
 /// xor tree) must produce these exact f32 bits on the fixed rig below. Any
