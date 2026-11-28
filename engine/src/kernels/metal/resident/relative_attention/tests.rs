@@ -952,9 +952,11 @@ fn the_f16_and_int8_rings_match_the_rule_and_the_reference() {
 }
 
 /// An Int8 row with a group of zeros, a group with a NaN, a group with infinities and a group
-/// of tiny values, whose scale is a subnormal half: the commit stores the rule's bytes. A NaN
-/// group and an infinite group decode to values that are not finite, since a code of zero
-/// over an infinite scale is not a number, and mark the status, as they do on CUDA.
+/// whose scale is a subnormal half, 5·2^-24, over which the greatest quotient is 127.84: the
+/// commit stores the rule's bytes. The value row gets a group of tiny values, whose scale
+/// rounds to zero: its codes are zero. A NaN group and an infinite group decode to values that
+/// are not finite, since a code of zero over an infinite scale is not a number, and mark the
+/// status, as they do on CUDA.
 #[test]
 fn the_int8_commit_stores_zero_nan_and_infinite_groups_by_the_rule() {
     let rig = Rig::new();
@@ -963,17 +965,20 @@ fn the_int8_commit_stores_zero_nan_and_infinite_groups_by_the_rule() {
         format: RelativeKvFormat::Int8,
         ..shape(2, 1, 4, 16, 1)
     };
-    let mut head = vec![0.5f32; HEAD_DIM];
+    let mut head = vec![0f32; HEAD_DIM];
     head[INT8_GROUP] = f32::NAN;
     for x in &mut head[2 * INT8_GROUP..2 * INT8_GROUP + 3] {
         *x = f32::INFINITY;
     }
     for (i, x) in head[3 * INT8_GROUP..].iter_mut().enumerate() {
-        *x = if i % 2 == 0 { 3e-9 } else { -2e-9 };
+        *x = if i % 2 == 0 { 3.81e-5 } else { -2e-5 };
     }
     for (with_nan, with_infinite) in [(true, false), (false, true), (false, false)] {
         let mut c = Case::new(&mut rng, s, 0);
         c.k = head.clone();
+        for (i, x) in c.v[3 * INT8_GROUP..].iter_mut().enumerate() {
+            *x = if i % 2 == 0 { 3e-9 } else { -2e-9 };
+        }
         if !with_nan {
             c.k[INT8_GROUP] = 0.5;
         }
