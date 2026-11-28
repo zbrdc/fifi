@@ -70,11 +70,13 @@ inline float4 load4(const device half *row, uint lane) {
 }
 
 // The same four columns of an Int8 row: the lane's four codes over its group's scale, a product
-// that is exact. A row starts at a multiple of four bytes, so the four codes are one load.
+// that is exact. Four scalar loads through `int8_t`: it is signed, and the signedness of a plain
+// `char`, the element of `char4`, is the compiler's choice.
 inline float4 load4(const device int8_t *row, uint lane) {
-    const device char4 *packed = reinterpret_cast<const device char4 *>(row);
+    const size_t i = size_t(lane) * 4;
     const device half *scales = reinterpret_cast<const device half *>(row + kHeadDim);
-    return float4(packed[lane]) * float(scales[lane / (kInt8Group / 4)]);
+    return float4(float(row[i]), float(row[i + 1]), float(row[i + 2]), float(row[i + 3])) *
+           float(scales[i / kInt8Group]);
 }
 
 // The elements a row of a ring takes: an F32 or F16 row its 128 values, an Int8 row its 136 bytes.
